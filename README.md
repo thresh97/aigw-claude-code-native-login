@@ -286,7 +286,7 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
 
 Tested 2026-10-24 against:
 - Claude Code 2.1.286 and aigw-claude-auth 1.0.0, on Linux with Python 3.10 to 3.12; aigw-claude-auth 1.1.0 (the precheck's sign-in, finding 10) in the offline scenarios;
-- the offline scenarios also on macOS 26.6 (Apple silicon) with Claude Code 2.1.308 and Python 3.13, plus by hand there: device code sign-in against Entra ID, the launchd agent, the hooks in an interactive session and the Notification Center notice;
+- the offline scenarios also on macOS 26.6 (Apple silicon) with Claude Code 2.1.308 and Python 3.13, plus by hand there: device code and browser (PKCE) sign-in against Entra ID, with 1.1.0 the precheck's sign-in against Entra ID, the launchd agent, the hooks in an interactive session and the Notification Center notice;
 - a hybrid AI Gateway (`gateway_enterprise` 2.29.0) with JWT auth: Mode A, with Entra ID and a token broker, behind an AWS ALB with the guard rules.
 
 Behavior may change in later releases.
@@ -302,9 +302,9 @@ Behavior may change in later releases.
 | 7 | A running Claude Code session picks up a rewritten `settings.json` (atomic rename) about 1 s later. With no wait, the next request still carries the old JWT | `headers`, `precheck` |
 | 8 | UserPromptSubmit hooks: a hook running past the default 30 s timeout is killed and the prompt is sent (fail-open); the entry's `timeout` field is honored; `{"decision":"block","reason":...}` blocks the prompt and shows the reason | `precheck` |
 | 9 | The client renews an expired JWT in the precheck before the turn, and the turn succeeds on the first request (live: Entra ID → broker → gateway → Anthropic). It blocks in time when the IdP hangs, and writes the sentinel when blocking is off | `precheck`, `client_live` |
-| 10 | Signed out, the precheck starts a device code sign-in in a detached process and blocks the prompt with the URL and code; Claude Code shows the reason as "UserPromptSubmit operation blocked by hook: AI gateway sign-in needed: ...". A second prompt before the sign-in is done gets the same code (one device flow). Once the user signs in, the JWT is written and the next prompt goes through on its first request. Against the fake IdP | `precheck` (`hooklogin`), `unit` |
+| 10 | Signed out, the precheck starts a device code sign-in in a detached process and blocks the prompt with the URL and code; Claude Code shows the reason as "UserPromptSubmit operation blocked by hook: AI gateway sign-in needed: ...". A second prompt before the sign-in is done gets the same code (one device flow). Once the user signs in, the JWT is written and the next prompt goes through on its first request. If the user declines at the IdP, the detached process logs and notifies the error (Entra: `authorization_declined AADSTS700171`) and the next prompt gets a new code. Repro against the fake IdP; also by hand against Entra ID on macOS | `precheck` (`hooklogin`), `unit` |
 
-Run by hand, not by the repro: device code and browser (PKCE) sign-in with `aigw-claude-auth login` against Entra ID on macOS. The browser sign-in needed the loopback redirect URI on the app registration first (see What you need). The precheck's sign-in (finding 10) was tested only against the fake IdP. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
+Run by hand, not by the repro: device code and browser (PKCE) sign-in with `aigw-claude-auth login` against Entra ID on macOS. The browser sign-in needed the loopback redirect URI on the app registration first (see What you need). The precheck's sign-in (finding 10) against Entra ID on macOS: blocked at once with the code, the same code on a second prompt, signed in in the background, the resent prompt answered, and the decline case; code expiry and `claude -p` weren't tried. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
 
 ## License
 
