@@ -112,6 +112,16 @@ Known risk: on macOS, Claude Code may keep a stored login in the Keychain instea
 
 Ask the operator. To remove: README "4. Teardown", plus `rm -r ~/.claude-aigw` (after the operator agrees). If the trial stays, keep the launchd agent and stay in the trial config dir.
 
+## Next round (not now): Claude desktop app and Cowork
+
+After the CLI path works on macOS, the operator wants to test the Claude desktop app (its Claude Code) and Cowork, as far as they allow. Open questions to answer then, not assumptions:
+
+- Does the app's Claude Code read `settings.json` `env` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`) and run the hooks (UserPromptSubmit, StopFailure)?
+- Which config dir does it use? A GUI app doesn't inherit the shell's `CLAUDE_CONFIG_DIR`, so the trial dir may not apply; testing may need `launchctl setenv` or the real `~/.claude` (operator's call).
+- Where does it keep the Anthropic login (Keychain?), and does a gateway 401 cause the same retry loop there?
+- How does a hook's block message show up in the app (matters for an in-hook device sign-in prompt)?
+- Cowork: does it allow a custom base URL, headers or hooks at all, or does it bypass them?
+
 ## Report
 
 Write `~/aigw-claude-code-native-login-macos-report.md`, outside the repo:

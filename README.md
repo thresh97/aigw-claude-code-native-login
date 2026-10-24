@@ -120,6 +120,16 @@ claude        # then /login
 
 `install` keeps everything else in the settings file, including other headers in `ANTHROPIC_CUSTOM_HEADERS`, other hooks and other keys. It's safe to run again: it replaces only its own entries.
 
+**The background refresher (step 5).** The systemd unit or launchd agent runs `aigw-claude-auth daemon` from login onward:
+- About once a minute it runs `sync`. That's a local check of the JWT's expiry in the settings file, with no network traffic until a renewal is due.
+- Within `refresh_before` (5 min) of expiry, it renews through the IdP (and broker) and rewrites the settings. Running Claude Code sessions pick that up about 1 s later.
+- After sleep, it catches up within a minute of waking.
+- On failures (IdP unreachable, signed out) it retries with backoff from 30 s to 5 min, keeps a JWT that still works, and writes the sentinel only when the JWT is about to run out. After `aigw-claude-auth login` it carries on by itself.
+- It logs renewals and failures only: `journalctl --user -u aigw-claude-auth` on Linux, `~/Library/Logs/aigw-claude-auth.log` on macOS (never rotated; it grows slowly).
+- The service manager restarts it if it crashes, but not after a clean stop.
+
+It's optional. Without it, the precheck hook renews before the prompt that needs it, at the cost of a pause of about 3 s. To check it's working: `systemctl --user status aigw-claude-auth` or `launchctl print gui/$(id -u)/aigw-claude-auth | head`, and `aigw-claude-auth status` shows a new fingerprint and expiry after each renewal. On macOS the agent runs `/usr/bin/python3`, which works only with the Xcode Command Line Tools installed (`xcode-select --install`). With a different Python, change the path in the plist.
+
 **Trial install (your everyday Claude Code untouched).** Claude Code re-reads its settings about a second after they change. So `install` on `~/.claude/settings.json` reroutes every running Claude Code session, including an agent doing the install. To try it first, use a separate Claude Code config dir. That dir needs its own `/login`:
 
 ```bash
