@@ -19,7 +19,7 @@ Shown with Entra ID and a token broker (Mode A), as tested. With Mode B there is
 | `aigw-claude-auth` | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings | [client/aigw_claude_auth.py](client/aigw_claude_auth.py) |
 | Precheck hook (UserPromptSubmit) | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message | `aigw-claude-auth hook precheck` |
 | StopFailure hook | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works | `aigw-claude-auth hook stop-failure` |
-| LB guard (optional) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) |
+| LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) |
 
 ## Why the extra parts are needed
 
@@ -47,20 +47,20 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 - **An AI Gateway that accepts a JWT** in `x-portkey-api-key`, in one of two ways:
   - your IdP's tokens directly (Portkey JWT auth, "Mode B");
   - tokens signed by a broker that exchanges an IdP token for a gateway JWT ("Mode A"; for Entra ID see article `aigw-entra-jwt-broker`).
-- **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' JWT selects (`defaults.config_slug` in the JWT, or the workspace default). Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
+- **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' requests get: `defaults.config_slug` in the JWT, or the workspace default. Reading `config_slug` from the JWT is specific to the hybrid gateway at the moment (reported 2026-10-24, not tested here on SaaS); on the SaaS gateway, use the workspace default. Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
 - **An IdP public client** (no secret) for the client to sign in with:
   - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra: platform "Mobile and desktop applications"; it accepts any port on loopback). Without it, the browser sign-in fails with `AADSTS500113` (no reply address registered);
   - `offline_access` granted, so the IdP issues a refresh token;
   - for Mode A, permission for the broker's API scope (Entra: `api://<broker app>/access_as_user`).
 - **Users with an Anthropic login** in Claude Code (`claude`, then `/login`).
 - **Python 3.8+** on the users' machines. macOS or Linux only, since the client uses `fcntl`. No packages.
-- **Optional, for the LB guard:** an AWS ALB in front of the gateway. Any L7 load balancer that can match headers and return a fixed response works the same way. An L4/TLS passthrough load balancer can't do it; in that case rely on the hooks alone.
+- **Optional, for the LB guard:** an AWS ALB in front of a hybrid gateway. Any L7 load balancer that can match headers and return a fixed response works the same way. With the SaaS gateway there's no load balancer of yours in front of it, and an L4/TLS passthrough load balancer can't match headers; in both cases rely on the hooks alone (a refused or missing JWT is then the gateway's 401).
 
 ## 1. Build
 
 ### 1.1 Gateway
 
-1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their JWTs select.
+1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get (the JWT's `defaults.config_slug` on a hybrid gateway, or the workspace default).
 2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens.
 
 ### 1.2 Optional: answer token problems at the load balancer
@@ -227,7 +227,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `sentinel` | `expired` | Written when no usable JWT can be had. Must match the LB rule, and can't be empty |
 | `refresh_before` | `300` | Renew when fewer seconds than this are left |
 | `hook_wait` | `3` | Seconds the precheck hook waits after a write, so the request carries the new value |
-| `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard |
+| `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard (never with the SaaS gateway, where the sentinel gets a 401 and the OAuth loop) |
 | `hook_login` | `device` | When signed out, the precheck starts a device code sign-in and puts the URL and code into the block message. `off`: the message only says to run `aigw-claude-auth login`. Use `off` if your IdP doesn't allow the device code flow for this client (Entra can block it through Conditional Access) |
 | `notify` | `auto` | Desktop notification after a StopFailure renewal and when the precheck's background sign-in succeeds or fails: `auto` (macOS Notification Center, `notify-send` on Linux), `off`, or a command that gets the message as `$1` |
 | `redirect_uri`, `redirect_port` | `http://127.0.0.1:{port}/`, `0` | PKCE loopback redirect; port `0` picks a free port |

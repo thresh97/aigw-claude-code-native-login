@@ -121,7 +121,7 @@
   <!-- ALB guard (slate, dashed = optional) -->
   <rect x="540" y="400" width="175" height="160" rx="10" ry="10" fill="#f1f5f9" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4" />
   <text x="555" y="426" font-size="14" font-weight="700" fill="#334155">ALB guard</text>
-  <text x="555" y="443" font-size="10" font-weight="600" fill="#64748b">optional</text>
+  <text x="555" y="443" font-size="10" font-weight="600" fill="#64748b">optional, hybrid only</text>
   <text x="555" y="464" font-size="10" fill="#475569">Sentinel, or no</text>
   <text x="555" y="479" font-size="10" fill="#475569">x-portkey-api-key:</text>
   <text x="555" y="494" font-size="10" font-weight="600" fill="#dc2626">498, before the gateway</text>
@@ -133,8 +133,8 @@
   <text x="780" y="426" font-size="14" font-weight="700" fill="#6b21a8">Portkey AI Gateway</text>
   <text x="780" y="445" font-size="10" fill="#7c3aed">JWT auth (Mode A)</text>
   <text x="780" y="466" font-size="10" fill="#334155">• verifies the JWT (JWKS)</text>
-  <text x="780" y="482" font-size="10" fill="#334155">• JWT selects the</text>
-  <text x="790" y="497" font-size="10" fill="#334155">passthrough config</text>
+  <text x="780" y="482" font-size="10" fill="#334155">• passthrough config from</text>
+  <text x="790" y="497" font-size="10" fill="#334155">JWT (hybrid) or workspace</text>
   <text x="780" y="513" font-size="10" fill="#334155">• forward_headers:</text>
   <text x="790" y="528" font-size="10" font-family="monospace" fill="#334155">authorization,</text>
   <text x="790" y="543" font-size="10" font-family="monospace" fill="#334155">anthropic-beta</text>
