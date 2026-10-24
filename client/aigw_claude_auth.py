@@ -73,7 +73,7 @@ DEFAULTS = {
     "hook_wait": 3,                    # seconds the precheck hook waits after a refresh (Claude Code reloads ~1 s later)
     "block_on_failure": True,          # precheck blocks the prompt when there is no usable JWT
     "hook_login": "device",            # when signed out, the precheck starts a device code sign-in: device | off
-    "notify": "auto",                  # stop-failure notification: auto | off | a command (gets the message as $1)
+    "notify": "auto",                  # desktop notification (StopFailure renewal, hook sign-in result): auto | off | a command (gets the message as $1)
     "redirect_uri": "http://127.0.0.1:{port}/",  # PKCE loopback redirect; {port} is filled in
     "redirect_port": 0,                # 0 = any free port (fine for Entra and most IdPs); set if the IdP pins the port
     "http_timeout": 30,

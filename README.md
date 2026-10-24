@@ -99,7 +99,8 @@ With a plain ALB listener (no Kubernetes), create the same three rules with `aws
 mkdir -p ~/.local/bin ~/.config/aigw-claude-auth
 cp client/aigw_claude_auth.py ~/.local/bin/aigw-claude-auth && chmod +x ~/.local/bin/aigw-claude-auth
 
-# 2. Configure (see "Client reference" below; the example is Mode A with Entra ID)
+# 2. Configure (see "Client reference" below; the example is Mode A with Entra ID).
+#    Desktop notifications are on by default ("notify": "auto"); set "notify" to "off" or a command to change that.
 cp client/config.example.json ~/.config/aigw-claude-auth/config.json && ${EDITOR:-vi} ~/.config/aigw-claude-auth/config.json
 
 # 3. Sign in to the IdP once: browser flow on a desktop, device code over ssh or without a display (--device forces it)
@@ -241,7 +242,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `hook_wait` | `3` | Seconds the precheck hook waits after a write, so the request carries the new value |
 | `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard |
 | `hook_login` | `device` | When signed out, the precheck starts a device code sign-in and puts the URL and code into the block message. `off`: the message only says to run `aigw-claude-auth login`. Use `off` if your IdP doesn't allow the device code flow for this client (Entra can block it through Conditional Access) |
-| `notify` | `auto` | StopFailure notification: `auto` (macOS Notification Center, `notify-send` on Linux), `off`, or a command that gets the message as `$1` |
+| `notify` | `auto` | Desktop notification after a StopFailure renewal and when the precheck's background sign-in succeeds or fails: `auto` (macOS Notification Center, `notify-send` on Linux), `off`, or a command that gets the message as `$1` |
 | `redirect_uri`, `redirect_port` | `http://127.0.0.1:{port}/`, `0` | PKCE loopback redirect; port `0` picks a free port |
 | `http_timeout` | `30` | Seconds per IdP or broker request, outside hooks |
 | `hook_http_timeout` | `5` | Seconds per request inside hooks (see "Hook time budget" below) |
