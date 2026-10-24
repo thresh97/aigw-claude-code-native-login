@@ -10,16 +10,16 @@ Use it when the users' Anthropic plan stays the billing and policy anchor, and t
 
 ![How it fits together: the client keeps a gateway JWT in Claude Code's settings; every request carries the user's Anthropic login and the JWT; the gateway checks the JWT and forwards the login to Anthropic](docs/flow.svg)
 
-Shown with Entra ID and a token broker (Mode A), as tested. With Mode B there is no broker: the client puts the IdP's own token into the header.
+Shown with Entra ID and a token broker (Mode A), as tested. Without a broker (Mode B, or Mode A from an IdP that can emit Portkey's claims), the client puts the IdP's own token into the header.
 
-| Piece | What it does | Where |
-|---|---|---|
-| Gateway passthrough config | Sends the request to Anthropic with the caller's own `Authorization` and `anthropic-beta` headers instead of a provider key | [gateway/passthrough-config.json](gateway/passthrough-config.json) |
-| Gateway JWT auth | The gateway accepts a JWT from your IdP ("Mode B") or from a broker that signs one ("Mode A") | Your gateway (prerequisite) |
-| `aigw-claude-auth` | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings | [client/aigw_claude_auth.py](client/aigw_claude_auth.py) |
-| Precheck hook (UserPromptSubmit) | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message | `aigw-claude-auth hook precheck` |
-| StopFailure hook | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works | `aigw-claude-auth hook stop-failure` |
-| LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) |
+| Piece                                    | What it does                                                                                                                  | Where                                                              |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Gateway passthrough config               | Sends the request to Anthropic with the caller's own `Authorization` and `anthropic-beta` headers instead of a provider key   | [gateway/passthrough-config.json](gateway/passthrough-config.json) |
+| Gateway JWT auth                         | The gateway accepts a JWT: "Mode A" carries Portkey's own claims, from your IdP or a broker; "Mode B" is a plain IdP token    | Your gateway (prerequisite)                                        |
+| `aigw-claude-auth`                       | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings                  | [client/aigw_claude_auth.py](client/aigw_claude_auth.py)           |
+| Precheck hook (UserPromptSubmit)         | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message | `aigw-claude-auth hook precheck`                                   |
+| StopFailure hook                         | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works                         | `aigw-claude-auth hook stop-failure`                               |
+| LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once                                        | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml)   |
 
 ## Without a JWT: gateway API keys
 
@@ -58,13 +58,13 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 ## What you need
 
 - **An AI Gateway that accepts a JWT** in `x-portkey-api-key` (for gateway API keys instead, see [Without a JWT](#without-a-jwt-gateway-api-keys)), in one of two ways:
-  - your IdP's tokens directly (Portkey JWT auth, "Mode B");
-  - tokens signed by a broker that exchanges an IdP token for a gateway JWT ("Mode A"; for Entra ID see article `aigw-entra-jwt-broker`).
+  - **"Mode A":** the JWT carries Portkey's own claims (`portkey_oid`, `portkey_workspace`, a nested `defaults` object) and is signed by a key the gateway trusts. Your IdP can issue it directly if it can emit nested JSON claims. IdPs that can't, such as Entra ID, need a broker that exchanges the IdP token for one (for Entra ID see article `aigw-entra-jwt-broker`);
+  - **"Mode B":** your IdP's ordinary token; the gateway works out the organisation and workspace from its own settings.
 - **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' requests get: `defaults.config_slug` in the JWT, or the workspace default. Reading `config_slug` from the JWT is specific to the hybrid gateway at the moment (reported 2026-10-24, not tested here on SaaS); on the SaaS gateway, use the workspace default. Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
 - **An IdP public client** (no secret) for the client to sign in with:
   - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra: platform "Mobile and desktop applications"; it accepts any port on loopback). Without it, the browser sign-in fails with `AADSTS500113` (no reply address registered);
   - `offline_access` granted, so the IdP issues a refresh token;
-  - for Mode A, permission for the broker's API scope (Entra: `api://<broker app>/access_as_user`).
+  - with a broker, permission for its API scope (Entra: `api://<broker app>/access_as_user`).
 - **Users with an Anthropic login** in Claude Code (`claude`, then `/login`).
 - **Python 3.8+** on the users' machines. macOS or Linux only, since the client uses `fcntl`. No packages.
 - **Optional, for the LB guard:** an AWS ALB in front of a hybrid gateway. Any L7 load balancer that can match headers and return a fixed response works the same way. With the SaaS gateway there's no load balancer of yours in front of it, and an L4/TLS passthrough load balancer can't match headers; in both cases rely on the hooks alone (a refused or missing JWT is then the gateway's 401).
@@ -99,7 +99,7 @@ With a plain ALB listener (no Kubernetes), create the same three rules with `aws
 mkdir -p ~/.local/bin ~/.config/aigw-claude-auth
 cp client/aigw_claude_auth.py ~/.local/bin/aigw-claude-auth && chmod +x ~/.local/bin/aigw-claude-auth
 
-# 2. Configure (see "Client reference" below; the example is Mode A with Entra ID).
+# 2. Configure (see "Client reference" below; the example is Mode A with Entra ID and a broker).
 #    Desktop notifications are on by default ("notify": "auto"); set "notify" to "off" or a command to change that.
 cp client/config.example.json ~/.config/aigw-claude-auth/config.json && ${EDITOR:-vi} ~/.config/aigw-claude-auth/config.json
 
@@ -234,7 +234,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `client_id` | | The IdP public client |
 | `scope` | `openid offline_access` | Add the gateway's or broker's scope. `offline_access` is what gets a refresh token |
 | `idp_token` | `access_token` | Which IdP token to use: `access_token` or `id_token` |
-| `broker_url` | | Full exchange URL (Mode A). The IdP token is sent as `Authorization: Bearer`, and the response's `token` (or `access_token`) is the gateway JWT. Empty: the IdP token itself is the JWT (Mode B) |
+| `broker_url` | | Full exchange URL (Mode A through a broker). The IdP token is sent as `Authorization: Bearer`, and the response's `token` (or `access_token`) is the gateway JWT. Empty: the IdP token itself is the JWT (Mode B, or Mode A from an IdP that emits Portkey's claims) |
 | `token_command` | | Instead of an IdP: a command that prints a JWT, for example a corporate token tool. `login` doesn't apply then |
 | `header` | `x-portkey-api-key` | The header the gateway reads the JWT from |
 | `sentinel` | `expired` | Written when no usable JWT can be had. Must match the LB rule, and can't be empty |
