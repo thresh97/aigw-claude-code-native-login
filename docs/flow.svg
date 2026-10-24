@@ -134,7 +134,7 @@
   <text x="780" y="445" font-size="10" fill="#7c3aed">JWT auth (Mode A)</text>
   <text x="780" y="466" font-size="10" fill="#334155">• verifies the JWT (JWKS)</text>
   <text x="780" y="482" font-size="10" fill="#334155">• passthrough config from</text>
-  <text x="790" y="497" font-size="10" fill="#334155">JWT (hybrid) or workspace</text>
+  <text x="790" y="497" font-size="10" fill="#334155">JWT or workspace default</text>
   <text x="780" y="513" font-size="10" fill="#334155">• forward_headers:</text>
   <text x="790" y="528" font-size="10" font-family="monospace" fill="#334155">authorization,</text>
   <text x="790" y="543" font-size="10" font-family="monospace" fill="#334155">anthropic-beta</text>

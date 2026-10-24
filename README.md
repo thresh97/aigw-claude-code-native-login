@@ -12,14 +12,14 @@ Use it when the users' Anthropic plan stays the billing and policy anchor, and t
 
 Shown with Entra ID and a token broker (Mode A), as tested. Without a broker (Mode B, or Mode A from an IdP that can emit Portkey's claims), the client puts the IdP's own token into the header.
 
-| Piece                                    | What it does                                                                                                                  | Where                                                              |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| Gateway passthrough config               | Sends the request to Anthropic with the caller's own `Authorization` and `anthropic-beta` headers instead of a provider key   | [gateway/passthrough-config.json](gateway/passthrough-config.json) |
-| Gateway JWT auth                         | The gateway accepts a JWT: "Mode A" carries Portkey's own claims, from your IdP or a broker; "Mode B" is a plain IdP token    | Your gateway (prerequisite)                                        |
-| `aigw-claude-auth`                       | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings                  | [client/aigw_claude_auth.py](client/aigw_claude_auth.py)           |
-| Precheck hook (UserPromptSubmit)         | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message | `aigw-claude-auth hook precheck`                                   |
-| StopFailure hook                         | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works                         | `aigw-claude-auth hook stop-failure`                               |
-| LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once                                        | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml)   |
+| Piece                                    | What it does                                                                                                                                     | Where                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Gateway passthrough config               | Sends the request to Anthropic with the caller's own `Authorization` and `anthropic-beta` headers instead of a provider key                      | [gateway/passthrough-config.json](gateway/passthrough-config.json) |
+| Gateway JWT auth                         | The gateway accepts a JWT: "Mode A" carries Portkey's own claims, from your IdP or a broker; "Mode B" is a plain IdP token (hybrid gateway only) | Your gateway (prerequisite)                                        |
+| `aigw-claude-auth`                       | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings                                     | [client/aigw_claude_auth.py](client/aigw_claude_auth.py)           |
+| Precheck hook (UserPromptSubmit)         | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message                    | `aigw-claude-auth hook precheck`                                   |
+| StopFailure hook                         | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works                                            | `aigw-claude-auth hook stop-failure`                               |
+| LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once                                                           | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml)   |
 
 ## Without a JWT: gateway API keys
 
@@ -59,8 +59,8 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 
 - **An AI Gateway that accepts a JWT** in `x-portkey-api-key` (for gateway API keys instead, see [Without a JWT](#without-a-jwt-gateway-api-keys)), in one of two ways:
   - **"Mode A":** the JWT carries Portkey's own claims (`portkey_oid`, `portkey_workspace`, a nested `defaults` object) and is signed by a key the gateway trusts. Your IdP can issue it directly if it can emit nested JSON claims. IdPs that can't, such as Entra ID, need a broker that exchanges the IdP token for one (for Entra ID see article `aigw-entra-jwt-broker`);
-  - **"Mode B":** your IdP's ordinary token; the gateway works out the organisation and workspace from its own settings.
-- **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' requests get: `defaults.config_slug` in the JWT, or the workspace default. Reading `config_slug` from the JWT is specific to the hybrid gateway at the moment (reported 2026-10-24, not tested here on SaaS); on the SaaS gateway, use the workspace default. Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
+  - **"Mode B":** your IdP's ordinary token; the gateway works out the organisation and workspace from its own settings. Hybrid gateway only: the SaaS gateway takes Mode A only.
+- **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' requests get: named in the JWT, or the workspace default. The hybrid gateway reads `defaults.config_slug` and ignores `defaults.config_id`; the SaaS gateway reads `defaults.config_id` (reported 2026-10-24, SaaS not tested here). Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
 - **An IdP public client** (no secret) for the client to sign in with:
   - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra: platform "Mobile and desktop applications"; it accepts any port on loopback). Without it, the browser sign-in fails with `AADSTS500113` (no reply address registered);
   - `offline_access` granted, so the IdP issues a refresh token;
@@ -73,7 +73,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 
 ### 1.1 Gateway
 
-1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get (the JWT's `defaults.config_slug` on a hybrid gateway, or the workspace default).
+1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get (the JWT's `defaults.config_slug` on a hybrid gateway or `defaults.config_id` on SaaS, or the workspace default).
 2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens.
 
 ### 1.2 Optional: answer token problems at the load balancer
