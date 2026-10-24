@@ -49,7 +49,9 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 1. **The daemon** renews the JWT 5 minutes before it expires. Normally that's all that runs.
 2. **The precheck hook** covers the gaps, such as a laptop that slept through the expiry or a daemon that isn't running.
    - If the JWT is expired or nearly expired, the hook renews it and then waits 3 s, because Claude Code picks up the change about 1 s after the write.
-   - If no JWT can be had (signed out, IdP unreachable), it **blocks the prompt** with "AI gateway: ... run `aigw-claude-auth login`". Nothing reaches the gateway, so there is no 401 and no OAuth loop.
+   - If no JWT can be had, it **blocks the prompt**. Nothing reaches the gateway, so there is no 401 and no OAuth loop.
+   - When the reason is that the user is signed out, the hook also starts a device code sign-in in the background, and the block message says what to do: "AI gateway sign-in needed: open <the IdP's device page> and enter the code ABCD-EFGH (within 15 min), then send your prompt again." Once the user has signed in, in any browser on any device, a background process stores the refresh token, writes a JWT and sends a notification. The resent prompt goes through. A prompt sent too early gets the same code again. So nobody has to leave the session for a terminal, and it works over ssh as well as on a desktop.
+   - For other failures (IdP unreachable, broker refusing) the message is the error, e.g. "AI gateway: cannot reach ...".
 3. **The sentinel.** When the client can't get a JWT and the current one is unusable, it writes `x-portkey-api-key: expired` instead of an old or empty value. With the optional LB guard, that request gets a 498 at once, also on machines where the hooks are off.
 4. **The StopFailure hook** handles the rest: the gateway refused a JWT that still looked valid (revoked, or the signing key rotated). By then Claude Code has already failed the turn, so the hook renews the JWT and tells the user to retry.
 
@@ -176,7 +178,7 @@ If the curl shows `Portkey Error: ...` (for example `Invalid API Key. Error Code
 | `unit` | The client's 30 unit tests: settings edits, refresh, sentinel, device and PKCE sign-in, hooks, daemon | Python |
 | `headers` | `install`; Claude Code sends both credentials; a running session picks up a renewed JWT | Claude Code |
 | `errors` | How Claude Code treats 401 (gateway and Anthropic), 403, 407 and 498 with an env-token login | Claude Code |
-| `precheck` | Renew before the request; no-op while valid; why `hook_wait` matters; block when no JWT can be had (signed out, IdP hanging); the LB guard path with blocking off | Claude Code |
+| `precheck` | Renew before the request; no-op while valid; why `hook_wait` matters; block when no JWT can be had (signed out, IdP hanging); the device code sign-in offered in the block message and the resent prompt going through; the LB guard path with blocking off | Claude Code |
 | `stopfailure` | Renew and notify after a refused JWT; Anthropic-side failures left alone | Claude Code |
 | `stored_login` | Stored login against the mock: 498 fails once; a gateway 401 runs the OAuth loop | a stored login |
 | `gateway` | The real gateway, request by request: which failures are the gateway's, and passthrough works | gateway, JWT |
@@ -212,10 +214,12 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `token [--force]` | Print a valid JWT on stdout (for curl and scripts); also updates the settings |
 | `status` | Settings file, token source, sign-in state, JWT fingerprint, expiry and the `iss`/`sub`/`portkey_workspace` claims |
 | `hook precheck`, `hook stop-failure` | The two Claude Code hooks. They read the hook payload on stdin and always exit 0 |
+| `hook-login-wait` | Internal: the precheck's background sign-in. It reads the device authorization response on stdin, waits for the user, writes the JWT, notifies and exits |
 | `logout` | Forget the refresh token, write the sentinel |
 
 **Files and locking:**
 - `~/.config/aigw-claude-auth/config.json` holds your config. `state.json` holds the refresh token and discovered endpoints, never the JWT, with mode 600. Override the directory with `AIGW_CLAUDE_AUTH_DIR`.
+- While a sign-in started by the precheck is pending, `hook-login.json` (mode 600) next to `state.json` holds its user code, URL, expiry and the waiting process's pid. The device code itself is passed to that process on stdin and never written. The process logs to `hook-login.log` there. `status` shows a pending sign-in.
 - The settings file is the first of: `--settings`, `AIGW_CLAUDE_SETTINGS`, `$CLAUDE_CONFIG_DIR/settings.json`, `~/.claude/settings.json`.
 - Every write is atomic (temp file, fsync, rename, mode 600).
 - A lock serializes the daemon and the hooks. The interactive part of `login` runs outside it, so a slow sign-in doesn't stall the hooks.
@@ -236,6 +240,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `refresh_before` | `300` | Renew when fewer seconds than this are left |
 | `hook_wait` | `3` | Seconds the precheck hook waits after a write, so the request carries the new value |
 | `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard |
+| `hook_login` | `device` | When signed out, the precheck starts a device code sign-in and puts the URL and code into the block message. `off`: the message only says to run `aigw-claude-auth login`. Use `off` if your IdP doesn't allow the device code flow for this client (Entra can block it through Conditional Access) |
 | `notify` | `auto` | StopFailure notification: `auto` (macOS Notification Center, `notify-send` on Linux), `off`, or a command that gets the message as `$1` |
 | `redirect_uri`, `redirect_port` | `http://127.0.0.1:{port}/`, `0` | PKCE loopback redirect; port `0` picks a free port |
 | `http_timeout` | `30` | Seconds per IdP or broker request, outside hooks |
@@ -280,7 +285,7 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
 ## Findings
 
 Tested 2026-10-24 against:
-- Claude Code 2.1.286 and aigw-claude-auth 1.0.0, on Linux with Python 3.10 to 3.12;
+- Claude Code 2.1.286 and aigw-claude-auth 1.0.0, on Linux with Python 3.10 to 3.12; aigw-claude-auth 1.1.0 (the precheck's sign-in, finding 10) in the offline scenarios;
 - the offline scenarios also on macOS 26.6 (Apple silicon) with Claude Code 2.1.308 and Python 3.13, plus by hand there: device code sign-in against Entra ID, the launchd agent, the hooks in an interactive session and the Notification Center notice;
 - a hybrid AI Gateway (`gateway_enterprise` 2.29.0) with JWT auth: Mode A, with Entra ID and a token broker, behind an AWS ALB with the guard rules.
 
@@ -297,8 +302,9 @@ Behavior may change in later releases.
 | 7 | A running Claude Code session picks up a rewritten `settings.json` (atomic rename) about 1 s later. With no wait, the next request still carries the old JWT | `headers`, `precheck` |
 | 8 | UserPromptSubmit hooks: a hook running past the default 30 s timeout is killed and the prompt is sent (fail-open); the entry's `timeout` field is honored; `{"decision":"block","reason":...}` blocks the prompt and shows the reason | `precheck` |
 | 9 | The client renews an expired JWT in the precheck before the turn, and the turn succeeds on the first request (live: Entra ID → broker → gateway → Anthropic). It blocks in time when the IdP hangs, and writes the sentinel when blocking is off | `precheck`, `client_live` |
+| 10 | Signed out, the precheck starts a device code sign-in in a detached process and blocks the prompt with the URL and code; Claude Code shows the reason as "UserPromptSubmit operation blocked by hook: AI gateway sign-in needed: ...". A second prompt before the sign-in is done gets the same code (one device flow). Once the user signs in, the JWT is written and the next prompt goes through on its first request. Against the fake IdP | `precheck` (`hooklogin`), `unit` |
 
-Not covered by a live run: the browser (PKCE) sign-in against a real IdP; it was tested only against the fake IdP (`unit`). The device code sign-in was run by hand against Entra ID on macOS. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
+Run by hand, not by the repro: device code and browser (PKCE) sign-in with `aigw-claude-auth login` against Entra ID on macOS. The browser sign-in needed the loopback redirect URI on the app registration first (see What you need). The precheck's sign-in (finding 10) was tested only against the fake IdP. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
 
 ## License
 

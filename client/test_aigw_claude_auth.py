@@ -356,12 +356,54 @@ class HookTests(Base):
         self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
 
     def test_precheck_blocks_when_no_token(self):
+        self.write_config(hook_login="off")
         self.put_header(jwt(time.time() - 10))
         code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
         self.assertEqual(code, 0)
         d = json.loads(out)
         self.assertEqual(d["decision"], "block")
         self.assertIn("aigw-claude-auth login", d["reason"])
+        self.assertNotIn(("POST", "/device", None), self.idp.calls)
+
+    def wait_for(self, cond, timeout=15):
+        end = time.time() + timeout
+        while not cond():
+            self.assertLess(time.time(), end, "timed out")
+            time.sleep(0.2)
+
+    def test_precheck_starts_device_sign_in_when_signed_out(self):
+        self.idp.device_pending = 10**6                    # the user hasn't signed in yet
+        self.put_header("expired")
+        t0 = time.time()
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        self.assertLess(time.time() - t0, 5, "the hook must not wait for the user")
+        reason = json.loads(out)["reason"]
+        self.assertIn("ABCD-EFGH", reason)
+        self.assertIn("/activate", reason)
+        self.assertNotIn("dev-1", reason + self.state_dir.joinpath("hook-login.json").read_text())   # device code stays secret
+        _, out2, _ = self.run_cli("hook", "precheck", stdin="{}")      # sent again too early: same code, no second flow
+        self.assertIn("ABCD-EFGH", json.loads(out2)["reason"])
+        self.assertEqual(sum(1 for c in self.idp.calls if c[1] == "/device"), 1)
+        self.assertIn("pending", self.run_cli("status")[1])
+        self.idp.device_pending = 0                        # the user signs in
+        self.wait_for(lambda: A.jwt_claims(self.header()).get("kind") == "gateway")
+        self.wait_for(lambda: not self.state_dir.joinpath("hook-login.json").exists())
+        self.assertTrue(A.State(self.state_dir).load().get("refresh_token"))
+        self.assertEqual(self.run_cli("hook", "precheck", stdin="{}")[:2], (0, ""))   # the resent prompt goes through
+
+    def test_hook_sign_in_failure_clears_pending(self):
+        self.idp.device_pending = 10**6
+        self.put_header("expired")
+        self.run_cli("hook", "precheck", stdin="{}")
+        pending = json.loads(self.state_dir.joinpath("hook-login.json").read_text())
+        os.kill(pending["pid"], 15)                         # the waiting process dies
+        os.waitpid(pending["pid"], 0)                       # reap it (the hook ran in this process, so it's our child)
+        self.assertEqual(A.State(self.state_dir).pending(), {})
+        self.idp.calls.clear()
+        _, out, _ = self.run_cli("hook", "precheck", stdin="{}")        # a fresh sign-in is started
+        self.assertIn("ABCD-EFGH", json.loads(out)["reason"])
+        self.assertEqual(sum(1 for c in self.idp.calls if c[1] == "/device"), 1)
+        os.kill(json.loads(self.state_dir.joinpath("hook-login.json").read_text())["pid"], 15)
 
     def test_precheck_blocks_in_time_when_idp_hangs(self):
         import socket

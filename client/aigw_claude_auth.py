@@ -10,7 +10,8 @@ keeps it fresh:
   sync          make sure the settings hold a JWT that is valid for more than `refresh_before` seconds
   daemon        run `sync` ahead of every expiry (the background refresher)
   hook precheck UserPromptSubmit hook: refresh if the JWT is (nearly) expired, wait for Claude Code to reload, or
-                block the prompt with a sign-in message when no JWT can be had
+                block the prompt when no JWT can be had. When signed out, it starts a device code sign-in in the
+                background and puts the URL and code into the block message, so the user can sign in from the session
   hook stop-failure  StopFailure hook: after a gateway auth failure, force a refresh so the retry works, and notify
   token         print a valid JWT on stdout (for scripts and curl)
   status        show where the JWT comes from and when it expires (never the token itself)
@@ -52,7 +53,7 @@ import webbrowser
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -71,6 +72,7 @@ DEFAULTS = {
     "refresh_before": 300,             # seconds: renew when less than this is left
     "hook_wait": 3,                    # seconds the precheck hook waits after a refresh (Claude Code reloads ~1 s later)
     "block_on_failure": True,          # precheck blocks the prompt when there is no usable JWT
+    "hook_login": "device",            # when signed out, the precheck starts a device code sign-in: device | off
     "notify": "auto",                  # stop-failure notification: auto | off | a command (gets the message as $1)
     "redirect_uri": "http://127.0.0.1:{port}/",  # PKCE loopback redirect; {port} is filled in
     "redirect_port": 0,                # 0 = any free port (fine for Entra and most IdPs); set if the IdP pins the port
@@ -111,6 +113,8 @@ def load_config(path):
         raise AuthError(f"no token source configured: set client_id (and issuer) or token_command in {path}")
     if cfg["idp_token"] not in ("access_token", "id_token"):
         raise AuthError("idp_token must be access_token or id_token")
+    if cfg["hook_login"] not in ("device", "off"):
+        raise AuthError("hook_login must be device or off")
     if not cfg["sentinel"]:
         raise AuthError("sentinel must not be empty (an empty header can't be told apart from a missing one)")
     return cfg
@@ -163,6 +167,18 @@ def write_private(path, text):
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def http_json(url, data=None, headers=None, timeout=30):
@@ -240,11 +256,24 @@ class Settings:
 # --------------------------------------------------------------------------------------------- state
 
 class State:
-    """state.json (mode 600) in the config dir: the IdP refresh token and discovered endpoints. Never the JWT."""
+    """state.json (mode 600) in the config dir: the IdP refresh token and discovered endpoints. Never the JWT.
+
+    hook-login.json (mode 600) is there while a sign-in started by the precheck hook is pending: the user code, the
+    verification URL, the expiry and the waiting process's pid. Never the device code.
+    """
 
     def __init__(self, directory):
         self.dir = Path(directory)
         self.file = self.dir / "state.json"
+        self.pending_file = self.dir / "hook-login.json"
+
+    def pending(self):
+        """The pending hook sign-in, or {} if there is none or it is over (expired, or its process is gone)."""
+        try:
+            p = json.loads(self.pending_file.read_text())
+        except (OSError, ValueError):
+            return {}
+        return p if p.get("expires_at", 0) > time.time() + 10 and pid_alive(p.get("pid")) else {}
 
     def load(self):
         return json.loads(self.file.read_text()) if self.file.exists() else {}
@@ -352,18 +381,32 @@ class TokenSource:
         return self.exchange(idp) if self.cfg["broker_url"] else idp
 
     # -- interactive sign-in
-    def login_device(self, out=None):
-        out = out or sys.stderr
+    def device_start(self):
+        """Ask the IdP for a device code. Adds `deadline` (epoch seconds) to the IdP's answer."""
         ep = self.endpoints().get("device_authorization_endpoint")
         if not ep:
             raise AuthError("the IdP has no device authorization endpoint; use --pkce")
         status, d = http_json(ep, {"client_id": self.cfg["client_id"], "scope": self.cfg["scope"]}, timeout=self.cfg["http_timeout"])
         if status != 200 or "device_code" not in d:
             raise AuthError(f"device authorization failed: HTTP {status} {d.get('error', '')} {d.get('error_description', '')[:160]}".strip())
-        uri = d.get("verification_uri_complete") or d.get("verification_uri") or d.get("verification_url")
-        print(f"To sign in to the gateway, open {uri}" + ("" if "verification_uri_complete" in d else f" and enter the code {d['user_code']}"),
-              file=out, flush=True)
-        interval, deadline = int(d.get("interval", 5)), time.time() + int(d.get("expires_in", 900))
+        d["deadline"] = int(time.time()) + int(d.get("expires_in", 900))
+        return d
+
+    @staticmethod
+    def device_prompt(d):
+        """'open <url> and enter the code <code>' (or just the URL when the IdP gives one with the code in it)."""
+        if d.get("verification_uri_complete"):
+            return f"open {d['verification_uri_complete']}"
+        return f"open {d.get('verification_uri') or d.get('verification_url')} and enter the code {d['user_code']}"
+
+    def login_device(self, out=None):
+        d = self.device_start()
+        print(f"To sign in to the gateway, {self.device_prompt(d)}", file=out or sys.stderr, flush=True)
+        return self.device_poll(d)
+
+    def device_poll(self, d):
+        """Wait for the user to finish the device sign-in; returns the IdP token."""
+        interval, deadline = int(d.get("interval", 5)), d["deadline"]
         while time.time() < deadline:
             time.sleep(interval)
             status, body = self._token_request({"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
@@ -479,13 +522,18 @@ def cmd_login(a, cfg, state, settings):
     # No lock while the user signs in (that can take minutes and would stall the hooks); the old refresh token stays
     # usable until the new sign-in succeeds.
     idp = src.login_device() if method == "device" else src.login_pkce(open_browser=not a.no_browser)
+    r = finish_login(cfg, state, settings, src, idp)
+    log(r.message)
+    return 0 if r.ok else 1
+
+
+def finish_login(cfg, state, settings, src, idp):
+    """After a sign-in: drop a stale refresh token if the IdP sent none, then write a JWT from the new IdP token."""
     if not src.got_refresh_token:
         with state.lock():
             state.save({k: v for k, v in state.load().items() if k != "refresh_token"})
         log("warning: the IdP returned no refresh token (is offline_access in scope?); you will have to sign in again when the JWT expires")
-    r = sync(cfg, state, settings, force=True, idp=idp)
-    log(r.message)
-    return 0 if r.ok else 1
+    return sync(cfg, state, settings, force=True, idp=idp)
 
 
 def browser_available():
@@ -527,6 +575,9 @@ def cmd_status(a, cfg, state, settings):
     for k in ("iss", "sub", "portkey_workspace"):
         if k in claims:
             rows.append((f"jwt {k}", str(claims[k])))
+    p = state.pending()
+    if p:
+        rows.append(("pending", f"hook sign-in: open {p['uri']} and enter {p['user_code']} (until {time.strftime('%H:%M', time.localtime(p['expires_at']))})"))
     for k, v in rows:
         print(f"{k:12} {v}")
     return 0
@@ -585,11 +636,64 @@ def hook_precheck(cfg, state, settings):
         log(r.message)
         return 0
     if cfg["block_on_failure"]:
-        print(json.dumps({"decision": "block", "reason": f"AI gateway: {r.message}"}))
+        reason = f"AI gateway: {r.message}"
+        if cfg["hook_login"] == "device" and not cfg["token_command"] and not state.load().get("refresh_token"):
+            try:
+                reason = hook_login_reason(cfg, state, settings)
+            except Exception as e:                          # fall back to the plain message
+                log(f"could not start a sign-in from the hook: {e}")
+        print(json.dumps({"decision": "block", "reason": reason}))
     else:
         log(r.message)
         if r.changed:          # we just wrote the sentinel: let the request carry it, so a load balancer rule answers 498
             time.sleep(cfg["hook_wait"])
+    return 0
+
+
+def hook_login_reason(cfg, state, settings):
+    """Start a device sign-in in the background (or reuse the pending one) and return the block message for it.
+
+    The waiting is done by a detached `hook-login-wait` process, so the hook returns at once. It gets the device code
+    on stdin (never on the command line or on disk) and its output goes to hook-login.log, not to the hook's stdout,
+    which Claude Code reads until it closes. Prompts sent before the sign-in is done get the same code again.
+    """
+    with state.lock():                                      # two sessions prompting at once start one sign-in
+        p = state.pending()
+        if not p:
+            d = TokenSource(cfg, state).device_start()
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--config", cfg["_config_path"], "--state-dir", str(state.dir),
+                   "--settings", str(settings.path), "hook-login-wait"]
+            with open(state.dir / "hook-login.log", "a") as logf:
+                child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            child.stdin.write(json.dumps(d).encode())
+            child.stdin.close()
+            p = {"prompt": TokenSource.device_prompt(d), "uri": d.get("verification_uri_complete") or d.get("verification_uri") or d.get("verification_url"),
+                 "user_code": d.get("user_code", ""), "expires_at": d["deadline"], "pid": child.pid}
+            write_private(state.pending_file, json.dumps(p) + "\n")
+    minutes = max(1, int(p["expires_at"] - time.time()) // 60)
+    return (f"AI gateway sign-in needed: {p['prompt']} (within {minutes} min), then send your prompt again. "
+            f"Or run `aigw-claude-auth login` in a terminal.")
+
+
+def cmd_hook_login_wait(a, cfg, state, settings):
+    """The background half of the hook sign-in: wait for the user, write the JWT, notify, clean up."""
+    d = json.loads(sys.stdin.read())
+    log(f"waiting for the device sign-in (code {d.get('user_code', '?')})")
+    try:
+        src = TokenSource(cfg, state)
+        r = finish_login(cfg, state, settings, src, src.device_poll(d))
+        msg = "Signed in to the AI gateway; send your prompt again." if r.ok else f"AI gateway: {r.message}"
+    except AuthError as e:
+        msg = f"AI gateway sign-in: {e}"
+    finally:
+        with state.lock():                                  # remove the pending file only if it is still ours
+            try:
+                if json.loads(state.pending_file.read_text()).get("pid") == os.getpid():
+                    state.pending_file.unlink()
+            except (OSError, ValueError):
+                pass
+    log(msg)
+    notify(cfg, msg)
     return 0
 
 
@@ -665,6 +769,7 @@ def main(argv=None):
     p.add_argument("--max-sleep", type=int, default=60, help="longest nap in seconds (bounds the catch-up after sleep)")
     p = sub.add_parser("hook", help="for Claude Code hooks; reads the hook JSON on stdin")
     p.add_argument("event", choices=["precheck", "stop-failure"])
+    sub.add_parser("hook-login-wait", help="internal: the precheck hook's background sign-in (device code JSON on stdin)")
     p = sub.add_parser("install", help="add ANTHROPIC_BASE_URL and the hooks to the settings file")
     p.add_argument("--base-url", help="the gateway URL for ANTHROPIC_BASE_URL")
     p.add_argument("--no-hooks", action="store_true", help="only the base URL (for example when IT ships the hooks)")
@@ -675,10 +780,11 @@ def main(argv=None):
     cdir = a.state_dir or config_dir()
     try:
         cfg = load_config(a.config or cdir / "config.json")
+        cfg["_config_path"] = str((a.config or cdir / "config.json").resolve())   # for the hook's background sign-in
         state = State(cdir)
         settings = Settings(a.settings or default_settings_path(), cfg["header"])
         handler = {"login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "token": cmd_token, "status": cmd_status,
-                   "daemon": cmd_daemon, "hook": cmd_hook, "install": cmd_install}[a.cmd]
+                   "daemon": cmd_daemon, "hook": cmd_hook, "hook-login-wait": cmd_hook_login_wait, "install": cmd_install}[a.cmd]
         return handler(a, cfg, state, settings)
     except AuthError as e:
         if a.cmd == "hook":                                  # hooks must never fail Claude Code's turn

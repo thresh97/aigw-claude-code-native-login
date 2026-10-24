@@ -349,11 +349,13 @@ def scenario_errors(out):
         claude.cleanup(), gw.close()
 
 
-def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="expired", block=True, guard=False):
-    """One persistent session with the client installed as the hooks; returns the observations of two turns."""
+def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="expired", block=True, guard=False, hook_login="off"):
+    """One persistent session with the client installed as the hooks; returns the observations of two turns.
+    hook_login="device": the hook starts a device sign-in on turn 1; the "user" finishes it before turn 2."""
     gw, idp = Gateway(out, guard=guard), FakeIdP()
+    idp.device_pending = 10**6 if hook_login == "device" else idp.device_pending   # nobody has signed in yet
     claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
-    client = Client(claude.tmp, idp, hook_wait=hook_wait, block_on_failure=block)
+    client = Client(claude.tmp, idp, hook_wait=hook_wait, block_on_failure=block, hook_login=hook_login)
     claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
     obs = {}
     try:
@@ -376,9 +378,17 @@ def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="exp
             obs[f"turn{i}_jwt"] = ("none" if not reqs else "initial" if sent == mock_gateway.fingerprint(start_jwt)
                                    else "sentinel" if sent == mock_gateway.fingerprint(SENTINEL) else "renewed")
             obs[f"turn{i}_seconds"] = t["seconds"]
+            if hook_login == "device" and i == 1:
+                stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+                obs["code_in_message"] = "yes" if "ABCD-EFGH" in stream and "/activate" in stream else "no"
+                obs["device_flows"] = sum(1 for c in idp.calls if c[1] == "/device")
+                idp.device_pending = 0                     # the user enters the code; the background process finishes
+                done = wait_until(lambda: header_of(claude.settings()) not in (SENTINEL, start_jwt, ""))
+                obs["signed_in_in_background"] = "yes" if done else "no"
+                time.sleep(2)                              # Claude Code reloads the settings about 1 s after the write
         obs["settings_value"] = "sentinel" if header_of(claude.settings()) == SENTINEL else "jwt"
         stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
-        obs["block_message"] = "yes" if "blocked by hook" in stream and "AI gateway:" in stream else "no"
+        obs["block_message"] = "yes" if "blocked by hook" in stream and "AI gateway" in stream else "no"
     finally:
         claude.cleanup(), gw.close()
         if idp_up:
@@ -388,9 +398,12 @@ def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="exp
 
 def scenario_precheck(out):
     """The UserPromptSubmit hook renews an expired JWT before the request (and waits for the reload), does nothing
-    while the JWT is valid, and blocks the prompt with a sign-in message when no JWT can be had."""
+    while the JWT is valid, and blocks the prompt with a sign-in message when no JWT can be had. hooklogin: signed out,
+    the block message carries a device code from a sign-in the hook started; once the user finishes it, the next
+    prompt goes through."""
     cases = {"expired": dict(), "valid": dict(initial="valid"), "nowait": dict(hook_wait=0),
              "idphang": dict(idp_up=False), "signedout": dict(signed_in=False),
+             "hooklogin": dict(signed_in=False, hook_login="device"),
              "lbguard": dict(signed_in=False, block=False, guard=True)}
     for name, kw in cases.items():
         sub = out / name

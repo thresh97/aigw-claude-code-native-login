@@ -129,7 +129,7 @@ recovery ok
 EOF
   finish; }
 
-describe_precheck() { echo "precheck: the UserPromptSubmit hook renews an expired JWT before the request, does nothing while it is valid, blocks the prompt when no JWT can be had (also with a hanging IdP), and with block_on_failure off lets a load balancer guard answer 498. Mock gateway, fake IdP. Changes: nothing. About 3 min."; }
+describe_precheck() { echo "precheck: the UserPromptSubmit hook renews an expired JWT before the request, does nothing while it is valid, blocks the prompt when no JWT can be had (also with a hanging IdP), offers a device code sign-in in the block message when signed out, and with block_on_failure off lets a load balancer guard answer 498. Mock gateway, fake IdP. Changes: nothing. About 3 min."; }
 scenario_precheck() {
   start precheck; harness precheck
   expect_seen <<'EOF'
@@ -165,6 +165,20 @@ signedout_turn1_fast yes
 signedout_turn2 blocked
 signedout_settings_value sentinel
 signedout_block_message yes
+# not signed in, hook_login device: the block message carries a device code from a sign-in the hook started in the
+# background; once the user finishes it, the next prompt goes through with the new JWT
+hooklogin_turn1 blocked
+hooklogin_turn1_requests 0
+hooklogin_turn1_fast yes
+hooklogin_code_in_message yes
+hooklogin_device_flows 1
+hooklogin_signed_in_in_background yes
+hooklogin_turn2 ok
+hooklogin_turn2_requests 1
+hooklogin_turn2_jwt renewed
+hooklogin_turn2_fast yes
+hooklogin_settings_value jwt
+hooklogin_block_message yes
 # block_on_failure off, LB guard on: the request carries the sentinel and gets 498 at once
 lbguard_turn1 gateway-token
 lbguard_turn1_requests 1

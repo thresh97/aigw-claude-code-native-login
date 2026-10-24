@@ -5,7 +5,8 @@ Guidance for coding agents running or changing this repo. Read README.md first.
 ## What running this touches
 
 - **Client install** (README 1.3, on a user's machine): `~/.local/bin/aigw-claude-auth`, `~/.config/aigw-claude-auth/`
-  (`config.json`, `state.json` with the IdP refresh token, mode 600), and edits to Claude Code's `settings.json`
+  (`config.json`, `state.json` with the IdP refresh token, mode 600; while a hook-started sign-in is pending,
+  `hook-login.json` and its `hook-login.log`), and edits to Claude Code's `settings.json`
   (`ANTHROPIC_BASE_URL`, the JWT in `env.ANTHROPIC_CUSTOM_HEADERS`, two hook entries). Optionally a systemd user unit or
   launchd agent.
 - **Gateway** (README 1.1, 1.2, manual): a passthrough config in a workspace, and optionally ALB listener rules in front
@@ -55,6 +56,7 @@ Guidance for coding agents running or changing this repo. Read README.md first.
     `repro/mock_gateway.py`, `SENTINEL` in `repro/env.example`;
   - hook entries: `hook_entry()` (used by `install` and `install --print`).
 - Hooks must finish well inside Claude Code's 30 s hook timeout, or Claude Code ignores their decision. Anything
-  that does network I/O in a hook uses `hook_http_timeout`.
+  that does network I/O in a hook uses `hook_http_timeout`. Anything that waits for the user (the precheck's sign-in)
+  runs in a detached process whose stdout is not the hook's: Claude Code reads the hook's stdout until it closes.
 - `repro/harness.py` drives Claude Code and prints `key=value` observations; `repro/run.sh` compares them with the
   expected values. Changing an expectation means the Findings in the README change too.
