@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""Runs Claude Code against the mock (or relayed real) gateway and prints observations; run.sh judges them.
+
+Usage:  harness.py <scenario> --out DIR          (run.sh calls this; see `run.sh list`)
+
+Output on stdout: one `key=value` line per observation, nothing else. Details (request logs with credential
+fingerprints, Claude Code's stream output, hook payloads) go to DIR. No token or secret is ever printed or written:
+the mock and the relay log fingerprints, and stored-login state is reduced to hashes.
+
+Every Claude Code run gets a throwaway HOME, cwd and (except the stored-login scenarios) CLAUDE_CONFIG_DIR, and an
+environment with no Anthropic, Vertex or Bedrock variables from the caller, so nothing of the user's setup is used
+or touched. The client (client/aigw_claude_auth.py) runs as the hooks, exactly as `install` sets them up, against a
+fake IdP and token broker (from the client's tests).
+"""
+import argparse
+import hashlib
+import json
+import os
+import queue
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+sys.path[:0] = [str(HERE), str(ROOT / "client")]
+import mock_gateway  # noqa: E402
+from test_aigw_claude_auth import FakeIdP, jwt  # noqa: E402
+
+CLIENT = ROOT / "client" / "aigw_claude_auth.py"
+CLAUDE = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
+MODEL = os.environ.get("MODEL") or "claude-haiku-4-5"
+OAUTH = "sk-ant-oat01-mock"     # a dummy; what the mock gateway expects as the Anthropic login in Authorization
+PK = "x-portkey-api-key"
+SENTINEL = os.environ.get("SENTINEL") or "expired"
+
+
+def observe(key, value):
+    print(f"{key}={value}", flush=True)
+
+
+def secs(t0):
+    return round(time.time() - t0, 1)
+
+
+# --------------------------------------------------------------------------------------------- the pieces
+
+class Gateway:
+    """mock_gateway in this process: control file, request log, helpers to read it."""
+
+    def __init__(self, out, upstream=None, **control):
+        self.log = out / "gateway.log.jsonl"
+        self.control_file = out / "gateway.control.json"
+        self.log.touch()
+        self.control = {"sentinel": SENTINEL, "oauth": OAUTH, "guard": False, "revoked": []}
+        self.set(**control)
+        self.srv = mock_gateway.serve(str(self.log), str(self.control_file), upstream)
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def set(self, **kw):
+        self.control.update(kw)
+        self.control_file.write_text(json.dumps(self.control))
+
+    def messages(self, since=0):
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [r for r in rows if r["path"].split("?")[0].endswith("/v1/messages")][since:]
+
+    def mark(self):
+        return len(self.messages())
+
+    def close(self):
+        self.srv.shutdown()
+
+
+class Client:
+    """The client's config and state in a throwaway dir, pointed at a fake IdP and broker."""
+
+    def __init__(self, base, idp, **cfg):
+        self.dir = base / "aigw-claude-auth"
+        self.dir.mkdir(parents=True)
+        self.idp = idp
+        self.cfg = {"issuer": idp.url, "client_id": "cli", "scope": "openid offline_access", "broker_url": idp.url + "/exchange",
+                    "notify": "off", "hook_wait": 3}
+        self.configure(**cfg)
+
+    def configure(self, **kw):
+        self.cfg.update(kw)
+        (self.dir / "config.json").write_text(json.dumps(self.cfg))
+
+    def sign_in(self):
+        """What a finished `aigw-claude-auth login` leaves behind: a refresh token the IdP knows."""
+        (self.dir / "state.json").write_text(json.dumps({"refresh_token": self.idp.tokens()["refresh_token"]}))
+        os.chmod(self.dir / "state.json", 0o600)
+
+    def sign_out(self):
+        (self.dir / "state.json").write_text("{}")
+
+    def run(self, *args, settings):
+        env = dict(os.environ, AIGW_CLAUDE_AUTH_DIR=str(self.dir), AIGW_CLAUDE_SETTINGS=str(settings))
+        return subprocess.run([sys.executable, str(CLIENT), *args], env=env, capture_output=True, text=True, timeout=60)
+
+
+class Claude:
+    """Claude Code in a throwaway HOME/cwd. persistent(): one session fed turns over stream-json; oneshot(): `claude -p`."""
+
+    CLEAN = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy")
+
+    def __init__(self, out, base_url, config_dir=None, env=None):
+        self.out = out
+        self.tmp = Path(tempfile.mkdtemp(prefix="aigw-repro-"))
+        self.config_dir = Path(config_dir) if config_dir else self.tmp / "claude"
+        self.config_dir.mkdir(exist_ok=True)
+        (self.tmp / "cwd").mkdir()
+        self.settings_file = self.config_dir / "settings.json"
+        self.env = {k: os.environ[k] for k in self.CLEAN if k in os.environ}
+        self.env.update(HOME=str(self.tmp), CLAUDE_CONFIG_DIR=str(self.config_dir), TERM="dumb", ANTHROPIC_MODEL=MODEL,
+                        ANTHROPIC_BASE_URL=base_url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1",
+                        DISABLE_TELEMETRY="1")
+        self.env.update(env or {})
+        self.proc = None
+        self.lines = queue.Queue()
+
+    def settings(self):
+        return json.loads(self.settings_file.read_text()) if self.settings_file.exists() else {}
+
+    def write_settings(self, d):
+        self.settings_file.write_text(json.dumps(d, indent=2))
+
+    def oneshot(self, prompt, timeout=420):
+        t0 = time.time()
+        try:
+            p = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "json"], cwd=self.tmp / "cwd", env=self.env,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+            with open(self.out / "claude.oneshot.jsonl", "a") as f:
+                f.write(p.stdout.strip() + "\n")
+            j = json.loads(p.stdout or "{}")
+        except (subprocess.TimeoutExpired, ValueError) as e:
+            j = {"is_error": True, "result": type(e).__name__}
+        return {"seconds": secs(t0), "is_error": bool(j.get("is_error")), "text": str(j.get("result") or "")}
+
+    def start(self):
+        cmd = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+        self.proc = subprocess.Popen(cmd, cwd=self.tmp / "cwd", env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=open(self.out / "claude.stderr.txt", "a"), text=True)
+        threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout] and self.lines.put(None), daemon=True).start()
+
+    def turn(self, prompt, timeout=420):
+        """Send one user message, wait for its result. Returns seconds, is_error and the result text."""
+        t0 = time.time()
+        self.proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
+        self.proc.stdin.flush()
+        result = None
+        with open(self.out / "claude.stream.jsonl", "a") as f:
+            while time.time() - t0 < timeout:
+                try:
+                    line = self.lines.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    result = {"is_error": True, "result": "claude exited"}
+                    break
+                f.write(line)
+                try:
+                    j = json.loads(line)
+                except ValueError:
+                    continue
+                if j.get("type") == "result":
+                    result = j
+                    break
+        result = result or {"is_error": True, "result": "TIMEOUT"}
+        time.sleep(0.5)          # let the gateway log the last request
+        return {"seconds": secs(t0), "is_error": bool(result.get("is_error")), "text": str(result.get("result") or "")}
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=20)
+            except Exception:
+                self.proc.kill()
+
+    def cleanup(self):
+        self.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def fresh_jwt(lifetime=3600, **claims):
+    return jwt(time.time() + lifetime, kind="gateway", **claims)
+
+
+def header_of(settings_dict):
+    """Our header's value from a settings dict ('' if absent)."""
+    for line in (settings_dict.get("env", {}).get("ANTHROPIC_CUSTOM_HEADERS") or "").splitlines():
+        k, _, v = line.partition(":")
+        if k.strip().lower() == PK:
+            return v.strip()
+    return ""
+
+
+def fp(value):
+    return hashlib.sha256(value.encode()).hexdigest()[:10] if value else "none"
+
+
+def classify(text):
+    """Which side a failure message names: portkey, anthropic, gateway-token (LB guard), other or ok."""
+    if "Portkey Error" in text:
+        return "portkey"
+    if "anthropic error" in text:
+        return "anthropic"
+    if "AI gateway token" in text:
+        return "gateway-token"
+    return "ok" if "MOCK-OK" in text or "LIVE-OK" in text else "other"
+
+
+def capture_hook(out, label):
+    """A hook command that appends its stdin (the hook payload) to out/hook.<label>.jsonl."""
+    script = out / "capture_hook.py"
+    script.write_text("import sys\nwith open(sys.argv[1], 'a') as f:\n    f.write(sys.stdin.read().strip() + '\\n')\n")
+    return {"hooks": [{"type": "command", "command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(out / f'hook.{label}.jsonl'))}"}]}
+
+
+def payloads(out, label):
+    f = out / f"hook.{label}.jsonl"
+    return [json.loads(line) for line in f.read_text().splitlines() if line.strip()] if f.exists() else []
+
+
+def borrow_settings(settings_file):
+    """Before a scenario replaces the settings.json of the user's LOGIN_CONFIG_DIR: keep a copy on disk
+    (settings.json.repro-backup), so a killed run can still be undone. A backup left by a killed run is the original."""
+    backup = settings_file.with_name(settings_file.name + ".repro-backup")
+    if not backup.exists():
+        data = {"existed": settings_file.exists(), "text": settings_file.read_text() if settings_file.exists() else ""}
+        with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:   # may hold a JWT
+            json.dump(data, f)
+    return backup
+
+
+def return_settings(settings_file, backup):
+    saved = json.loads(backup.read_text())
+    if saved["existed"]:
+        settings_file.write_text(saved["text"])
+    else:
+        settings_file.unlink(missing_ok=True)
+    backup.unlink()
+
+
+def cred_state(config_dir):
+    """A stored `claude login`, reduced to hashes and the expiry (never the tokens)."""
+    f = Path(config_dir) / ".credentials.json"
+    if not f.exists():
+        return {"exists": False}
+    o = json.loads(f.read_text()).get("claudeAiOauth", {})
+    return {"exists": True, "expiresAt": o.get("expiresAt"), "access": fp(o.get("accessToken", "")), "refresh": fp(o.get("refreshToken", ""))}
+
+
+def login_valid(state):
+    return state.get("exists") and (state.get("expiresAt") or 0) / 1000 > time.time()
+
+
+# --------------------------------------------------------------------------------------------- scenarios
+
+def scenario_headers(out):
+    """`install` writes the gateway URL, the JWT header and the hooks; a running session picks up a JWT the client
+    renews (atomic rename of settings.json) without a restart; the Anthropic login travels untouched in Authorization."""
+    gw, idp = Gateway(out), FakeIdP()
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+    client = Client(claude.tmp, idp)
+    claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
+    try:
+        client.sign_in()
+        r = client.run("install", "--base-url", gw.url, settings=claude.settings_file)
+        observe("install_exit", r.returncode)
+        s = claude.settings()
+        observe("settings_base_url", "gateway" if s.get("env", {}).get("ANTHROPIC_BASE_URL") == gw.url else "other")
+        observe("settings_hooks", ",".join(sorted(s.get("hooks", {}))))
+        jwt1 = header_of(s)
+        claude.start()
+        mark = gw.mark()
+        t = claude.turn("turn 1")
+        reqs = gw.messages(mark)
+        observe("turn1", classify(t["text"]))
+        observe("turn1_authorization", "oauth" if reqs and reqs[0]["headers"].get("authorization") == mock_gateway.fingerprint(f"Bearer {OAUTH}") else "other")
+        observe("turn1_gateway_header", "jwt1" if reqs and reqs[0]["headers"].get(PK) == mock_gateway.fingerprint(jwt1) else "other")
+        ino = claude.settings_file.stat().st_ino
+        r = client.run("sync", "--force", settings=claude.settings_file)
+        jwt2 = header_of(claude.settings())
+        observe("renewed_by_rename", "yes" if r.returncode == 0 and claude.settings_file.stat().st_ino != ino and jwt2 != jwt1 else "no")
+        time.sleep(3)
+        mark = gw.mark()
+        t = claude.turn("turn 2, after the client renewed the JWT")
+        reqs = gw.messages(mark)
+        observe("turn2", classify(t["text"]))
+        observe("turn2_gateway_header", {mock_gateway.fingerprint(jwt2): "jwt2", mock_gateway.fingerprint(jwt1): "jwt1"}.get(
+            reqs[0]["headers"].get(PK) if reqs else "", "other"))
+        observe("turn2_hook_refreshed", "no" if header_of(claude.settings()) == jwt2 else "yes")
+    finally:
+        claude.cleanup(), gw.close(), idp.close()
+
+
+def scenario_errors(out):
+    """How Claude Code (logged in with CLAUDE_CODE_OAUTH_TOKEN) handles each gateway failure: attempts, time, message,
+    and the StopFailure `error` value."""
+    gw = Gateway(out)
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+    good = fresh_jwt()
+    claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {good}"}, "hooks": {"StopFailure": [capture_hook(out, "stopfailure")]}})
+    cases = [
+        ("portkey401", dict(revoked=[mock_gateway.fingerprint(good)])),
+        ("anthropic401", dict(oauth="some-other-login")),
+        ("403", dict(force=403)),
+        ("407", dict(force=407)),
+        ("498", dict(force=498)),
+    ]
+    try:
+        claude.start()
+        for name, ctl in cases:
+            gw.set(revoked=[], oauth=OAUTH, force=None)
+            gw.set(**ctl)
+            seen = len(payloads(out, "stopfailure"))
+            mark = gw.mark()
+            t = claude.turn(f"case {name}")
+            time.sleep(1)
+            observe(f"{name}_attempts", len(gw.messages(mark)))
+            observe(f"{name}_fast", "yes" if t["seconds"] < 15 else f"no ({t['seconds']}s)")
+            observe(f"{name}_message", classify(t["text"]) if name.endswith("401") else ("status-shown" if name in t["text"] else "other"))
+            p = payloads(out, "stopfailure")[seen:]
+            observe(f"{name}_stopfailure_error", p[0].get("error") if p else "none")
+        gw.set(revoked=[], oauth=OAUTH, force=None)
+        observe("recovery", classify(claude.turn("recovery")["text"]))
+    finally:
+        claude.cleanup(), gw.close()
+
+
+def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="expired", block=True, guard=False):
+    """One persistent session with the client installed as the hooks; returns the observations of two turns."""
+    gw, idp = Gateway(out, guard=guard), FakeIdP()
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+    client = Client(claude.tmp, idp, hook_wait=hook_wait, block_on_failure=block)
+    claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
+    obs = {}
+    try:
+        client.sign_in() if signed_in else client.sign_out()
+        client.run("install", "--base-url", gw.url, settings=claude.settings_file)
+        start_jwt = {"expired": jwt(time.time() - 60, kind="gateway"), "valid": fresh_jwt()}[initial]
+        s = claude.settings()
+        s["env"]["ANTHROPIC_CUSTOM_HEADERS"] = f"{PK}: {start_jwt}"
+        claude.write_settings(s)
+        if not idp_up:
+            idp.close()           # stops answering, but the socket stays bound: connections hang like a dead IdP's
+        claude.start()
+        for i in (1, 2):
+            mark = gw.mark()
+            t = claude.turn(f"precheck turn {i}")
+            reqs = gw.messages(mark)
+            sent = reqs[0]["headers"].get(PK) if reqs else ""
+            obs[f"turn{i}"] = classify(t["text"]) if reqs else ("blocked" if "AI gateway" in t["text"] or t["is_error"] else "no-request")
+            obs[f"turn{i}_requests"] = len(reqs)
+            obs[f"turn{i}_jwt"] = ("none" if not reqs else "initial" if sent == mock_gateway.fingerprint(start_jwt)
+                                   else "sentinel" if sent == mock_gateway.fingerprint(SENTINEL) else "renewed")
+            obs[f"turn{i}_seconds"] = t["seconds"]
+        obs["settings_value"] = "sentinel" if header_of(claude.settings()) == SENTINEL else "jwt"
+        stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+        obs["block_message"] = "yes" if "blocked by hook" in stream and "AI gateway:" in stream else "no"
+    finally:
+        claude.cleanup(), gw.close()
+        if idp_up:
+            idp.close()
+    return obs
+
+
+def scenario_precheck(out):
+    """The UserPromptSubmit hook renews an expired JWT before the request (and waits for the reload), does nothing
+    while the JWT is valid, and blocks the prompt with a sign-in message when no JWT can be had."""
+    cases = {"expired": dict(), "valid": dict(initial="valid"), "nowait": dict(hook_wait=0),
+             "idphang": dict(idp_up=False), "signedout": dict(signed_in=False),
+             "lbguard": dict(signed_in=False, block=False, guard=True)}
+    for name, kw in cases.items():
+        sub = out / name
+        sub.mkdir()
+        for k, v in precheck_session(sub, **kw).items():
+            if k.endswith("_seconds"):
+                k, v = k.replace("_seconds", "_fast"), "yes" if v < {"expired": 8, "nowait": 8, "idphang": 20, "lbguard": 8}.get(name, 4) else f"no ({v}s)"
+            observe(f"{name}_{k}", v)
+
+
+def scenario_stopfailure(out):
+    """After the gateway refuses a JWT that still looks valid (revoked, key rotated), the StopFailure hook renews it
+    and notifies, so the user's retry works. An Anthropic-side failure is left alone."""
+    gw, idp = Gateway(out), FakeIdP()
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+    note = out / "notifications.txt"
+    notify = out / "notify.sh"
+    notify.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> {shlex.quote(str(note))}\n')
+    notify.chmod(0o755)
+    client = Client(claude.tmp, idp, notify=str(notify))
+    claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
+    try:
+        client.sign_in()
+        client.run("install", "--base-url", gw.url, settings=claude.settings_file)
+        claude.start()
+        observe("baseline", classify(claude.turn("baseline")["text"]))
+        bad = header_of(claude.settings())
+        gw.set(revoked=[mock_gateway.fingerprint(bad)])
+        t = claude.turn("the gateway now refuses this JWT")
+        observe("refused_turn", classify(t["text"]))
+        time.sleep(2)
+        observe("jwt_replaced", "yes" if header_of(claude.settings()) not in (bad, "") else "no")
+        observe("notified", "renewed" if note.exists() and "renewed" in note.read_text() else "no")
+        time.sleep(2)
+        observe("retry_turn", classify(claude.turn("retry")["text"]))
+        cur = header_of(claude.settings())
+        gw.set(oauth="some-other-login")
+        observe("anthropic_turn", classify(claude.turn("Anthropic refuses the login")["text"]))
+        time.sleep(2)
+        observe("anthropic_jwt_kept", "yes" if header_of(claude.settings()) == cur else "no")
+    finally:
+        claude.cleanup(), gw.close(), idp.close()
+
+
+def scenario_stored_login(out):
+    """A stored `claude login` (LOGIN_CONFIG_DIR) against the mock: a gateway 401 sends Claude Code into its OAuth
+    refresh-and-retry loop (rotating the real login at Anthropic); 498 is shown at once and leaves the login alone."""
+    cfg = Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser()
+    gw = Gateway(out, oauth=None)          # the mock can't check a real login; Authorization is only logged
+    claude = Claude(out, gw.url, config_dir=cfg)
+    backup = borrow_settings(claude.settings_file)
+    good = fresh_jwt()
+    try:
+        before = cred_state(cfg)
+        observe("login_present", "yes" if before.get("exists") else "no")
+        claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {good}"}})
+        claude.start()
+        observe("baseline", classify(claude.turn("baseline")["text"]))
+        for name, ctl in (("498", dict(force=498)), ("portkey401", dict(revoked=[mock_gateway.fingerprint(good)]))):
+            gw.set(force=None, revoked=[])
+            gw.set(**ctl)
+            b = cred_state(cfg)
+            mark = gw.mark()
+            t = claude.turn(f"case {name}")
+            time.sleep(2)
+            a = cred_state(cfg)
+            observe(f"{name}_attempts", "1" if len(gw.messages(mark)) == 1 else "many" if len(gw.messages(mark)) > 5 else len(gw.messages(mark)))
+            observe(f"{name}_long", "yes" if t["seconds"] > 60 else "no")
+            observe(f"{name}_login_rotated", "yes" if a.get("refresh") != b.get("refresh") else "no")
+            observe(f"{name}_login_still_valid", "yes" if login_valid(a) else "no")
+        gw.set(force=None, revoked=[])
+        observe("recovery", classify(claude.turn("recovery")["text"]))
+    finally:
+        claude.stop()
+        return_settings(claude.settings_file, backup)
+        shutil.rmtree(claude.tmp, ignore_errors=True)
+        gw.close()
+
+
+def tamper(token):
+    """Flip a character in the middle of the signature (the last base64url character of an RS256 signature carries
+    only 2 bits, so changing it may leave the signature valid)."""
+    i = len(token) - 20
+    return token[:i] + ("B" if token[i] != "B" else "C") + token[i + 1:]
+
+
+def live_token():
+    """A valid gateway JWT from TOKEN_COMMAND (default: the client's `token`)."""
+    cmd = os.environ.get("TOKEN_COMMAND") or f"{shlex.quote(sys.executable)} {shlex.quote(str(CLIENT))} token"
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0 or p.stdout.count(".") != 2:
+        sys.exit(f"TOKEN_COMMAND failed (exit {p.returncode}): {p.stderr.strip()[:200]}")
+    return p.stdout.strip()
+
+
+def gateway_request(token, oauth=None, extra=None):
+    """One Messages call to GATEWAY_URL; returns (status, body text, headers)."""
+    h = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
+    if token is not None:
+        h[PK] = token
+    if oauth:
+        h["authorization"] = f"Bearer {oauth}"
+        h["anthropic-beta"] = "oauth-2025-04-20"
+    h.update(extra or {})
+    body = json.dumps({"model": MODEL, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with exactly: LIVE-OK"}]}).encode()
+    req = urllib.request.Request(os.environ["GATEWAY_URL"].rstrip("/") + "/v1/messages", data=body, headers=h, method="POST")
+    try:
+        r = urllib.request.urlopen(req, timeout=90)
+        return r.status, r.read().decode(errors="replace"), r.headers
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace"), e.headers
+
+
+def stored_access_token():
+    o = json.loads((Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser() / ".credentials.json").read_text()).get("claudeAiOauth", {})
+    return o.get("accessToken", "")
+
+
+def scenario_gateway(out):
+    """The real gateway with curl-like requests: which failures are the gateway's (Portkey 401 / LB 498) and which
+    are Anthropic's (relayed 401), and that a valid JWT plus the user's own login gets a reply (passthrough)."""
+    tok = live_token()
+    guard = os.environ.get("LB_GUARD", "off") == "on"
+    oauth = stored_access_token() if os.environ.get("LOGIN_CONFIG_DIR") else ""
+    cases = [("missing", None, "x"), ("garbage", "not-a-jwt", "x"), ("tampered", tamper(tok), "x"),
+             ("bearer_prefixed", f"Bearer {tok}", "x"), ("sentinel", SENTINEL, "x"),
+             ("valid_bad_login", tok, "sk-ant-oat01-invalid"), ("valid_no_login", tok, None)]
+    if oauth:
+        cases.append(("valid_real_login", tok, oauth))
+    for name, t, o in cases:
+        status, body, hdrs = gateway_request(t, o if o != "x" else "sk-ant-oat01-invalid")
+        (out / f"gateway.{name}.txt").write_text(f"{status}\n{body[:600]}\n")
+        who = classify(body)
+        if status == 200:
+            who = "reply"
+        elif '"provider":"anthropic"' in body.replace(" ", "") or "anthropic error" in body:
+            who = "anthropic"
+        observe(f"{name}", f"{status} {who}")
+    observe("lb_guard", "on" if guard else "off")
+
+
+def scenario_live_login(out):
+    """The real gateway with a stored `claude login` (LOGIN_CONFIG_DIR), through the logging relay: a refused JWT
+    costs the OAuth retry loop (about 4 min); with the LB guard, the sentinel and a missing header fail at once."""
+    cfg = Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser()
+    tok = live_token()
+    gw = Gateway(out, upstream=os.environ["GATEWAY_URL"])
+    claude = Claude(out, gw.url, config_dir=cfg)
+    backup = borrow_settings(claude.settings_file)
+    cases = [("ok", tok), ("tampered", tamper(tok))]
+    if os.environ.get("LB_GUARD", "off") == "on":
+        cases += [("sentinel", SENTINEL), ("missing", None)]
+    try:
+        for name, t in cases:
+            s = {k: v for k, v in json.loads(json.loads(backup.read_text())["text"] or "{}").items() if k not in ("env", "hooks")}
+            s["env"] = {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {t}"} if t is not None else {}
+            claude.write_settings(s)
+            b = cred_state(cfg)
+            mark = gw.mark()
+            r = claude.oneshot("Reply with exactly: LIVE-OK")
+            reqs = gw.messages(mark)
+            a = cred_state(cfg)
+            observe(f"{name}_result", classify(r["text"]))
+            observe(f"{name}_attempts", "1" if len(reqs) == 1 else "many" if len(reqs) > 5 else len(reqs))
+            observe(f"{name}_statuses", ",".join(sorted({str(x["status"]) for x in reqs})) or "none")
+            observe(f"{name}_long", "yes" if r["seconds"] > 60 else "no")
+            observe(f"{name}_login_rotated", "yes" if a.get("refresh") != b.get("refresh") else "no")
+            observe(f"{name}_login_still_valid", "yes" if login_valid(a) else "no")
+    finally:
+        return_settings(claude.settings_file, backup)
+        shutil.rmtree(claude.tmp, ignore_errors=True)
+        gw.close()
+
+
+def scenario_client_live(out):
+    """The whole thing for real: the client gets a JWT from the IdP (and broker), installs itself into a stored-login
+    Claude Code (LOGIN_CONFIG_DIR, restored afterwards), and the precheck hook replaces an expired JWT before the turn."""
+    cfg = Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser()
+    settings_file = cfg / "settings.json"
+    backup = borrow_settings(settings_file)
+    env = dict(os.environ, AIGW_CLAUDE_SETTINGS=str(settings_file))
+    # Claude Code runs with a throwaway HOME, so tell the hooks where the client's config and sign-in live.
+    env.setdefault("AIGW_CLAUDE_AUTH_DIR", str(Path.home() / ".config" / "aigw-claude-auth"))
+    run = lambda *a: subprocess.run([sys.executable, str(CLIENT), *a], env=env, capture_output=True, text=True, timeout=120)
+    gw = Gateway(out, upstream=os.environ["GATEWAY_URL"])
+    claude = Claude(out, gw.url, config_dir=cfg, env={"AIGW_CLAUDE_AUTH_DIR": env["AIGW_CLAUDE_AUTH_DIR"]})
+    try:
+        st = run("status")
+        (out / "client.status.txt").write_text(st.stdout + st.stderr)
+        observe("signed_in", "yes" if any(l.split()[:3] == ["signed", "in", "yes"] for l in st.stdout.splitlines()) else "no")
+        r = run("install", "--base-url", gw.url)
+        observe("install_exit", r.returncode)
+        r = run("sync", "--force")
+        observe("sync_exit", r.returncode)
+        tok = header_of(claude.settings())
+        status, body, _ = gateway_request(tok, "sk-ant-oat01-invalid")
+        observe("gateway_accepts_jwt", "yes" if status != 401 or "anthropic" in body else f"no ({status})")
+        observe("turn_fresh", classify(claude.oneshot("Reply with exactly: LIVE-OK")["text"]))
+        s = claude.settings()
+        s["env"]["ANTHROPIC_CUSTOM_HEADERS"] = f"{PK}: {jwt(time.time() - 60, kind='gateway')}"   # an expired JWT
+        claude.write_settings(s)
+        mark = gw.mark()
+        t = claude.oneshot("Reply with exactly: LIVE-OK")
+        reqs = gw.messages(mark)
+        observe("turn_after_expiry", classify(t["text"]))
+        observe("turn_after_expiry_statuses", ",".join(sorted({str(x["status"]) for x in reqs})) or "none")
+        observe("turn_after_expiry_fast", "yes" if t["seconds"] < 30 else f"no ({t['seconds']}s)")
+    finally:
+        return_settings(settings_file, backup)
+        shutil.rmtree(claude.tmp, ignore_errors=True)
+        gw.close()
+
+
+SCENARIOS = {name[len("scenario_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("scenario_")}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("scenario", choices=sorted(SCENARIOS))
+    ap.add_argument("--out", type=Path, required=True)
+    a = ap.parse_args()
+    a.out.mkdir(parents=True, exist_ok=True)
+    SCENARIOS[a.scenario](a.out)
+
+
+if __name__ == "__main__":
+    main()

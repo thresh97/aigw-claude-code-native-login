@@ -1,0 +1,51 @@
+# Optional load balancer guard (AWS Load Balancer Controller): answer gateway-token problems with 498 at the ALB,
+# so Claude Code with a native login shows the message at once instead of treating the gateway's 401 as its own
+# OAuth failure (about 3 minutes of refresh and retry).
+#
+# Rules are evaluated in path order:
+#   1. x-portkey-api-key == "expired" (the client's sentinel)                  -> 498 "expired"
+#   2. x-portkey-api-key present (any value, also empty)                         -> forward to the gateway
+#   3. no x-portkey-api-key and anthropic-beta contains oauth-2025-04-20         -> 498 "missing"
+#   4. everything else (API key callers, health checks)                          -> forward to the gateway
+# A present but invalid JWT still reaches the gateway, which answers 401 (the precheck and StopFailure hooks handle that).
+# An ALB condition can't match an absent or empty header, so the client writes the sentinel, never an empty value.
+#
+# Merge these annotations and paths into your gateway's existing Ingress (same group, TLS, inbound-cidrs, etc.).
+# Placeholders: <gateway host>, <gateway service>, <port>.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-gateway
+  annotations:
+    alb.ingress.kubernetes.io/actions.gw-key-expired: >-
+      {"type":"fixed-response","fixedResponseConfig":{"contentType":"application/json","statusCode":"498",
+      "messageBody":"{\"type\":\"error\",\"error\":{\"type\":\"gateway_token_error\",\"message\":\"AI gateway token expired and could not be refreshed. Sign in to the gateway again, then retry.\"}}"}}
+    alb.ingress.kubernetes.io/conditions.gw-key-expired: >-
+      [{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"x-portkey-api-key","values":["expired"]}}]
+    alb.ingress.kubernetes.io/actions.gw-key-present: >-
+      {"type":"forward","forwardConfig":{"targetGroups":[{"serviceName":"<gateway service>","servicePort":"<port>"}]}}
+    alb.ingress.kubernetes.io/conditions.gw-key-present: >-
+      [{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"x-portkey-api-key","values":["*"]}}]
+    alb.ingress.kubernetes.io/actions.gw-key-missing: >-
+      {"type":"fixed-response","fixedResponseConfig":{"contentType":"application/json","statusCode":"498",
+      "messageBody":"{\"type\":\"error\",\"error\":{\"type\":\"gateway_token_error\",\"message\":\"AI gateway token missing (no x-portkey-api-key). Sign in to the gateway, then retry.\"}}"}}
+    alb.ingress.kubernetes.io/conditions.gw-key-missing: >-
+      [{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"anthropic-beta","values":["*oauth-2025-04-20*"]}}]
+spec:
+  ingressClassName: alb
+  rules:
+    - host: <gateway host>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: gw-key-expired, port: { name: use-annotation } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: gw-key-present, port: { name: use-annotation } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: gw-key-missing, port: { name: use-annotation } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: <gateway service>, port: { number: <port> } } }

@@ -1,0 +1,18 @@
+# systemd user unit: keeps the gateway JWT in Claude Code's settings fresh in the background.
+# Install:  cp aigw-claude-auth.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#           systemctl --user enable --now aigw-claude-auth
+# Logs:     journalctl --user -u aigw-claude-auth
+# Assumes the client is at ~/.local/bin/aigw-claude-auth (see the README). If Claude Code uses a CLAUDE_CONFIG_DIR,
+# set it below so the daemon edits the same settings file.
+[Unit]
+Description=Gateway JWT refresher for Claude Code (aigw-claude-auth)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/env python3 %h/.local/bin/aigw-claude-auth daemon
+# Environment=CLAUDE_CONFIG_DIR=%h/.claude
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

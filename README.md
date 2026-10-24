@@ -1,0 +1,282 @@
+# aigw-claude-code-native-login
+
+Claude Code users who sign in with their own Anthropic account (`claude login`, for example a Claude Enterprise seat) can still go through the AI Gateway, so the gateway sees, logs, guards and attributes every request. Claude Code keeps sending its Anthropic login in `Authorization: Bearer`, and the gateway passes it through to Anthropic. The gateway identifies the user by a short-lived JWT in a second header, `x-portkey-api-key`.
+
+This article ships a small client, `aigw-claude-auth` (one Python file, standard library only). It gets that JWT from your IdP, directly or through a token broker, and keeps it fresh in Claude Code's settings. It also makes gateway auth failures fail fast. Without that, a gateway 401 sends a logged-in Claude Code into its own Anthropic OAuth refresh-and-retry loop for several minutes.
+
+Use it when the users' Anthropic plan stays the billing and policy anchor, and the gateway adds identity, logging and guardrails on top.
+
+> **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
+
+```
+                    ┌──────────────── user's machine ────────────────┐
+  IdP  ◀── sign-in, │ aigw-claude-auth (daemon + 2 Claude Code hooks)│
+  (and broker) ───▶ │   keeps a fresh JWT in ~/.claude/settings.json │
+       refresh      │                                                │
+                    │ Claude Code sends                              │
+                    │   Authorization: Bearer <its Anthropic login>  │
+                    │   x-portkey-api-key: <gateway JWT>             │
+                    └───────────────────────┬────────────────────────┘
+                                            ▼
+                 [optional LB guard: sentinel or missing JWT → 498]
+                                            ▼
+                 AI Gateway: verifies the JWT → workspace, config, limits, logs, guardrails
+                                            ▼  passthrough config forwards Authorization, anthropic-beta
+                 Anthropic API: checks the user's own login
+```
+
+| Piece | What it does | Where |
+|---|---|---|
+| Gateway passthrough config | Sends the request to Anthropic with the caller's own `Authorization` and `anthropic-beta` headers instead of a provider key | [gateway/passthrough-config.json](gateway/passthrough-config.json) |
+| Gateway JWT auth | The gateway accepts a JWT from your IdP ("Mode B") or from a broker that signs one ("Mode A") | Your gateway (prerequisite) |
+| `aigw-claude-auth` | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings | [client/aigw_claude_auth.py](client/aigw_claude_auth.py) |
+| Precheck hook (UserPromptSubmit) | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message | `aigw-claude-auth hook precheck` |
+| StopFailure hook | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works | `aigw-claude-auth hook stop-failure` |
+| LB guard (optional) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) |
+
+## Why the extra parts are needed
+
+Claude Code sends whatever is in `ANTHROPIC_CUSTOM_HEADERS` and reloads the settings file when it changes, so a JWT in that header works. The hard part is what happens when the JWT is missing, expired or refused, because Claude Code can't tell a gateway 401 from an Anthropic 401:
+
+| The gateway answers | Stored `claude login` | Login from `CLAUDE_CODE_OAUTH_TOKEN` |
+|---|---|---|
+| 401 (gateway refused the JWT, or Anthropic refused the login) | Treated as an expired Anthropic login: refresh at Anthropic and retry, 13 attempts over about 4 minutes, then "Failed to authenticate". Each refresh rotates the Anthropic login (it stays valid) | 2 attempts within seconds, then the message |
+| 498 | 1 attempt; the status and message show at once; the login is untouched | 1 attempt, shown at once |
+| 403, 407 | not tested | 1 attempt, shown at once |
+
+So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no JWT available" into something other than a 401:
+
+1. **The daemon** renews the JWT 5 minutes before it expires. Normally that's all that runs.
+2. **The precheck hook** covers the gaps, such as a laptop that slept through the expiry or a daemon that isn't running.
+   - If the JWT is expired or nearly expired, the hook renews it and then waits 3 s, because Claude Code picks up the change about 1 s after the write.
+   - If no JWT can be had (signed out, IdP unreachable), it **blocks the prompt** with "AI gateway: ... run `aigw-claude-auth login`". Nothing reaches the gateway, so there is no 401 and no OAuth loop.
+3. **The sentinel.** When the client can't get a JWT and the current one is unusable, it writes `x-portkey-api-key: expired` instead of an old or empty value. With the optional LB guard, that request gets a 498 at once, also on machines where the hooks are off.
+4. **The StopFailure hook** handles the rest: the gateway refused a JWT that still looked valid (revoked, or the signing key rotated). By then Claude Code has already failed the turn, so the hook renews the JWT and tells the user to retry.
+
+## What you need
+
+- **An AI Gateway that accepts a JWT** in `x-portkey-api-key`, in one of two ways:
+  - your IdP's tokens directly (Portkey JWT auth, "Mode B");
+  - tokens signed by a broker that exchanges an IdP token for a gateway JWT ("Mode A"; for Entra ID see article `aigw-entra-jwt-broker`).
+- **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' JWT selects (`defaults.config_slug` in the JWT, or the workspace default). Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
+- **An IdP public client** (no secret) for the client to sign in with:
+  - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra accepts any port on loopback);
+  - `offline_access` granted, so the IdP issues a refresh token;
+  - for Mode A, permission for the broker's API scope (Entra: `api://<broker app>/access_as_user`).
+- **Users with an Anthropic login** in Claude Code (`claude`, then `/login`).
+- **Python 3.8+** on the users' machines. macOS or Linux only, since the client uses `fcntl`. No packages.
+- **Optional, for the LB guard:** an AWS ALB in front of the gateway. Any L7 load balancer that can match headers and return a fixed response works the same way. An L4/TLS passthrough load balancer can't do it; in that case rely on the hooks alone.
+
+## 1. Build
+
+### 1.1 Gateway
+
+1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their JWTs select.
+2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens.
+
+### 1.2 Optional: answer token problems at the load balancer
+
+[gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) has the rules as AWS Load Balancer Controller annotations. They are evaluated in this order:
+
+1. `x-portkey-api-key: expired` (the client's sentinel) → 498 `gateway_token_error` "expired".
+2. Any other `x-portkey-api-key` → forward to the gateway.
+3. No `x-portkey-api-key`, and `anthropic-beta` contains `oauth-2025-04-20` (a native-login Claude Code request) → 498 "missing".
+4. Everything else → forward.
+
+How the rules behave:
+- Only requests without a usable JWT get a fixed response. Everything else is forwarded unchanged, at no extra cost.
+- A present but invalid JWT still gets the gateway's 401. The hooks handle that case.
+- An ALB condition can't single out an empty header value: `*` matches it too, and rule values can't be empty. That's why the client writes the sentinel and never an empty header.
+
+With a plain ALB listener (no Kubernetes), create the same three rules with `aws elbv2 create-rule`, at priorities ahead of the default forward.
+
+### 1.3 Client, per user
+
+```bash
+# 1. Install (one file). Keep "aigw-claude-auth" in the name: install uses it to find its own hook entries.
+mkdir -p ~/.local/bin ~/.config/aigw-claude-auth
+cp client/aigw_claude_auth.py ~/.local/bin/aigw-claude-auth && chmod +x ~/.local/bin/aigw-claude-auth
+
+# 2. Configure (see "Client reference" below; the example is Mode A with Entra ID)
+cp client/config.example.json ~/.config/aigw-claude-auth/config.json && ${EDITOR:-vi} ~/.config/aigw-claude-auth/config.json
+
+# 3. Sign in to the IdP once: browser flow on a desktop, device code over ssh or without a display (--device forces it)
+aigw-claude-auth login
+
+# 4. Point Claude Code at the gateway and add the hooks (edits ~/.claude/settings.json, or $CLAUDE_CONFIG_DIR/settings.json)
+aigw-claude-auth install --base-url https://<gateway host>
+
+# 5. Keep the JWT fresh in the background
+#    Linux (systemd user unit):
+mkdir -p ~/.config/systemd/user && cp client/service/aigw-claude-auth.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now aigw-claude-auth
+#    macOS (launchd):
+#    sed "s#HOME_DIR#$HOME#g" client/service/aigw-claude-auth.plist > ~/Library/LaunchAgents/aigw-claude-auth.plist
+#    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/aigw-claude-auth.plist
+
+# 6. Sign in to Anthropic in Claude Code as usual, if not done yet
+claude        # then /login
+```
+
+`install` keeps everything else in the settings file, including other headers in `ANTHROPIC_CUSTOM_HEADERS`, other hooks and other keys. It's safe to run again: it replaces only its own entries.
+
+**Fleet rollout (managed settings).** IT can ship the hooks and `ANTHROPIC_BASE_URL` in Claude Code's managed settings:
+1. Print the snippet with `aigw-claude-auth install --print --base-url https://<gateway host> --hook-command /usr/local/bin/aigw-claude-auth`.
+2. For each user, run `aigw-claude-auth install --no-hooks`, which only writes the JWT.
+
+Two constraints:
+- Managed settings must **not** set `ANTHROPIC_CUSTOM_HEADERS`. The JWT has to live in the user's settings file, which the client rewrites. How a managed value would combine with the user's value wasn't tested.
+- With `allowManagedHooksOnly`, user hooks don't run, so the hooks must come from managed settings.
+
+## 2. Quick check
+
+```bash
+aigw-claude-auth status          # signed in? JWT fingerprint, expiry, iss/sub/portkey_workspace (never the token)
+
+# The gateway accepts the JWT and passes a (deliberately invalid) Anthropic login through:
+curl -s https://<gateway host>/v1/messages -H "x-portkey-api-key: $(aigw-claude-auth token)" \
+  -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -H 'authorization: Bearer sk-ant-oat01-invalid' -H 'anthropic-beta: oauth-2025-04-20' \
+  -d '{"model":"claude-haiku-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}'
+# expect: 401 ... "anthropic error: OAuth access token is invalid." ... "provider":"anthropic"
+
+# A real turn with the user's own login:
+claude -p "Reply with exactly: OK" < /dev/null
+```
+
+If the curl shows `Portkey Error: ...` (for example `Invalid API Key. Error Code: 03` or `JWT verification failed`), the gateway refused the JWT. Check the gateway's JWT validation and the claims in `aigw-claude-auth status`.
+
+## 3. End-to-end test
+
+`repro/run.sh` tests the whole design (how to run it: [Re-run](#re-run)). The offline scenarios run the real Claude Code against a mock gateway and a fake IdP, so they need no accounts. The live ones use your gateway, IdP and Anthropic login.
+
+| Scenario | Shows | Needs |
+|---|---|---|
+| `unit` | The client's 30 unit tests: settings edits, refresh, sentinel, device and PKCE sign-in, hooks, daemon | Python |
+| `headers` | `install`; Claude Code sends both credentials; a running session picks up a renewed JWT | Claude Code |
+| `errors` | How Claude Code treats 401 (gateway and Anthropic), 403, 407 and 498 with an env-token login | Claude Code |
+| `precheck` | Renew before the request; no-op while valid; why `hook_wait` matters; block when no JWT can be had (signed out, IdP hanging); the LB guard path with blocking off | Claude Code |
+| `stopfailure` | Renew and notify after a refused JWT; Anthropic-side failures left alone | Claude Code |
+| `stored_login` | Stored login against the mock: 498 fails once; a gateway 401 runs the OAuth loop | a stored login |
+| `gateway` | The real gateway, request by request: which failures are the gateway's, and passthrough works | gateway, JWT |
+| `live_login` | Real gateway and stored login: a refused JWT costs the OAuth loop; with the LB guard, sentinel and missing header fail at once | gateway, JWT, stored login |
+| `client_live` | The client for real: IdP (and broker) → JWT → gateway → Anthropic; the precheck replaces an expired JWT before the turn | everything, after `aigw-claude-auth login` |
+
+## 4. Teardown
+
+Per user:
+
+```bash
+systemctl --user disable --now aigw-claude-auth && rm ~/.config/systemd/user/aigw-claude-auth.service   # Linux
+launchctl bootout gui/$(id -u)/aigw-claude-auth && rm ~/Library/LaunchAgents/aigw-claude-auth.plist      # macOS
+aigw-claude-auth logout          # forgets the refresh token, writes the sentinel
+```
+
+Then:
+1. In `~/.claude/settings.json`, remove `ANTHROPIC_BASE_URL`, the `x-portkey-api-key` line in `ANTHROPIC_CUSTOM_HEADERS`, and the two hook entries whose command contains `aigw-claude-auth`.
+2. Delete `~/.config/aigw-claude-auth` and `~/.local/bin/aigw-claude-auth`.
+
+On the gateway side, remove the passthrough config and the LB rules if nothing else uses them.
+
+## Client reference
+
+Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-dir DIR`, `--settings FILE`, `--version`.
+
+| Command | What it does |
+|---|---|
+| `login [--device \| --pkce] [--no-browser]` | Sign in to the IdP. Default: PKCE in a browser on a desktop session, device code over ssh or without a display. `--no-browser` prints the PKCE URL instead of opening it. Stores the refresh token, then writes a JWT |
+| `install [--base-url URL] [--no-hooks] [--hook-command CMD] [--print]` | Add `ANTHROPIC_BASE_URL` and the hooks to the settings file (or print the snippet), then `sync` |
+| `sync [--force] [--quiet]` | Make sure the settings hold a JWT valid for more than `refresh_before` seconds |
+| `daemon [--max-sleep 60]` | Run `sync` ahead of every expiry. It naps at most `--max-sleep` seconds, so it catches up within a minute after a laptop wakes. On failures it backs off from 30 s to 5 min |
+| `token [--force]` | Print a valid JWT on stdout (for curl and scripts); also updates the settings |
+| `status` | Settings file, token source, sign-in state, JWT fingerprint, expiry and the `iss`/`sub`/`portkey_workspace` claims |
+| `hook precheck`, `hook stop-failure` | The two Claude Code hooks. They read the hook payload on stdin and always exit 0 |
+| `logout` | Forget the refresh token, write the sentinel |
+
+**Files and locking:**
+- `~/.config/aigw-claude-auth/config.json` holds your config. `state.json` holds the refresh token and discovered endpoints, never the JWT, with mode 600. Override the directory with `AIGW_CLAUDE_AUTH_DIR`.
+- The settings file is the first of: `--settings`, `AIGW_CLAUDE_SETTINGS`, `$CLAUDE_CONFIG_DIR/settings.json`, `~/.claude/settings.json`.
+- Every write is atomic (temp file, fsync, rename, mode 600).
+- A lock serializes the daemon and the hooks. The interactive part of `login` runs outside it, so a slow sign-in doesn't stall the hooks.
+
+**Config keys** (unknown keys are an error):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `issuer` | | OIDC issuer; endpoints come from its discovery document |
+| `token_endpoint`, `device_authorization_endpoint`, `authorization_endpoint` | | Set explicitly to override discovery |
+| `client_id` | | The IdP public client |
+| `scope` | `openid offline_access` | Add the gateway's or broker's scope. `offline_access` is what gets a refresh token |
+| `idp_token` | `access_token` | Which IdP token to use: `access_token` or `id_token` |
+| `broker_url` | | Full exchange URL (Mode A). The IdP token is sent as `Authorization: Bearer`, and the response's `token` (or `access_token`) is the gateway JWT. Empty: the IdP token itself is the JWT (Mode B) |
+| `token_command` | | Instead of an IdP: a command that prints a JWT, for example a corporate token tool. `login` doesn't apply then |
+| `header` | `x-portkey-api-key` | The header the gateway reads the JWT from |
+| `sentinel` | `expired` | Written when no usable JWT can be had. Must match the LB rule, and can't be empty |
+| `refresh_before` | `300` | Renew when fewer seconds than this are left |
+| `hook_wait` | `3` | Seconds the precheck hook waits after a write, so the request carries the new value |
+| `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard |
+| `notify` | `auto` | StopFailure notification: `auto` (macOS Notification Center, `notify-send` on Linux), `off`, or a command that gets the message as `$1` |
+| `redirect_uri`, `redirect_port` | `http://127.0.0.1:{port}/`, `0` | PKCE loopback redirect; port `0` picks a free port |
+| `http_timeout` | `30` | Seconds per IdP or broker request, outside hooks |
+| `hook_http_timeout` | `5` | Seconds per request inside hooks (see "Hook time budget" below) |
+
+**When `sync` can't get a new JWT:**
+- It keeps the current JWT while more than 30 s are left, so a short IdP outage doesn't throw away a JWT that works. After that it writes the sentinel.
+- It refuses a new JWT that has no `exp` or has less than 60 s left.
+- `invalid_grant`, `interaction_required` and `login_required` from the IdP mean the sign-in is over (refresh token expired or revoked, password changed, policy). The client drops the refresh token and asks for `aigw-claude-auth login`.
+
+## Operating notes
+
+- **Hook time budget.** By default Claude Code waits 30 s for a UserPromptSubmit hook. After that it kills the hook and sends the prompt anyway, ignoring a block. Claude Code honors a hook entry's `"timeout"`, and `install` writes `"timeout": 30`. Inside hooks the client caps each request at `hook_http_timeout` (5 s), so discovery, refresh, broker and `hook_wait` together stay well inside the budget, even when the IdP hangs.
+- **Reload delay.** Claude Code picks up a changed settings file, including one replaced by atomic rename, about 1 s after the write. A request sent sooner carries the old value. The `precheck` scenario's `hook_wait 0` case shows this.
+- **Scripts and CI.** `claude -p` runs the same hooks. Give it stdin (`< /dev/null` when there is no input), as the repro does.
+- **Several Claude Code config dirs.** A daemon serves one settings file. Run one daemon per `CLAUDE_CONFIG_DIR` (set it in the unit), or let the hooks alone handle the others.
+- **The JWT at rest** sits in the settings file with mode 600, like Claude Code's own credentials file. It's short-lived. The long-lived secret is the refresh token in `state.json`.
+- **`Bearer ` prefix.** The gateway also accepts `x-portkey-api-key: Bearer <jwt>`. The client writes the JWT bare.
+- **Telling the 401s apart by hand.** The gateway's own refusals say `Portkey Error: ...`. Anthropic's, relayed, say `anthropic error: ...` and carry `"provider":"anthropic"`. Claude Code doesn't distinguish them, but the StopFailure hook does (it acts only on the gateway's).
+
+## Re-run
+
+The offline scenarios take about 10 minutes and the live ones about 15, because two live scenarios wait out the OAuth loop.
+
+1. Prerequisites: Python 3.8+, curl, Claude Code. For the live scenarios you also need:
+   - everything in [What you need](#what-you-need);
+   - a dedicated Claude Code config dir with a stored login;
+   - a prior `aigw-claude-auth login`, or a `TOKEN_COMMAND`.
+2. `cp repro/env.example repro/env` and fill it in. The offline scenarios need nothing in it.
+3. `repro/run.sh check` (read-only preflight).
+4. `repro/run.sh all --yes` (or one scenario from `repro/run.sh list`). `stored_login`, `live_login` and `client_live` require `--yes` because they:
+   - rotate the stored login at Anthropic (it stays valid);
+   - replace the `settings.json` in `LOGIN_CONFIG_DIR` for the run, restoring it afterwards. Until then the original sits in `settings.json.repro-backup`, so if a run is killed, the next one restores it.
+5. Read `repro/results/<date>-<scenario>/summary.txt`:
+   - `PASS`: matches Findings.
+   - `CHANGED`: Claude Code or the gateway now behaves differently. For example, if a 401 no longer loops for a stored login, the LB guard and the StopFailure hook matter less. If hook timeouts or the settings reload changed, the client needs updating.
+   - `ERROR`: the run broke; fix the environment, not the scripts.
+
+   Details are in `detail/`: request logs with credential fingerprints, and Claude Code's output.
+
+## Findings
+
+Tested 2026-10-24 against:
+- Claude Code 2.1.286 and aigw-claude-auth 1.0.0, on Linux with Python 3.10 to 3.12;
+- a hybrid AI Gateway (`gateway_enterprise` 2.29.0) with JWT auth: Mode A, with Entra ID and a token broker, behind an AWS ALB with the guard rules.
+
+Behavior may change in later releases.
+
+| # | Finding | Scenario |
+|---|---|---|
+| 1 | With the passthrough config, Claude Code's own login in `Authorization` plus a gateway JWT in `x-portkey-api-key` (from `ANTHROPIC_CUSTOM_HEADERS`) gets a normal reply through the gateway | `headers`, `gateway`, `client_live` |
+| 2 | The gateway's own refusals (missing, garbage or tampered JWT) are 401 `Portkey Error: ...`. With a valid JWT, Anthropic's refusal of the login is relayed as 401 `anthropic error: ...` with `"provider":"anthropic"`. A `Bearer `-prefixed JWT is accepted | `gateway` |
+| 3 | With a stored login, Claude Code treats a gateway 401 as its own expired login: 13 attempts over about 4 minutes (the same against the mock), refreshing and rotating the Anthropic login each time; the login stays valid | `live_login`, `stored_login` |
+| 4 | With a stored login, a 498 is one attempt, shown at once, with the login untouched | `live_login`, `stored_login` |
+| 5 | With a `CLAUDE_CODE_OAUTH_TOKEN` login: 401 is 2 attempts; 403, 407 and 498 are 1 attempt each. The StopFailure hook gets `error: authentication_failed` for 401 and 403, `unknown` for 407 and 498 | `errors`, `stopfailure` |
+| 6 | The ALB rules answer the sentinel and a missing header (on OAuth requests) with 498 before the gateway | `gateway`, `live_login` |
+| 7 | A running Claude Code session picks up a rewritten `settings.json` (atomic rename) about 1 s later. With no wait, the next request still carries the old JWT | `headers`, `precheck` |
+| 8 | UserPromptSubmit hooks: a hook running past the default 30 s timeout is killed and the prompt is sent (fail-open); the entry's `timeout` field is honored; `{"decision":"block","reason":...}` blocks the prompt and shows the reason | `precheck` |
+| 9 | The client renews an expired JWT in the precheck before the turn, and the turn succeeds on the first request (live: Entra ID → broker → gateway → Anthropic). It blocks in time when the IdP hangs, and writes the sentinel when blocking is off | `precheck`, `client_live` |
+
+Not covered by a live run: the interactive sign-in. In the lab the client's refresh token was seeded from a test user's direct sign-in. The device code and PKCE flows were tested only against the fake IdP (`unit`). Run `aigw-claude-auth login` once against your IdP to confirm them.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

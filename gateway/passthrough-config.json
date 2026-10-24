@@ -1,0 +1,10 @@
+{
+  "strategy": { "mode": "single" },
+  "targets": [
+    {
+      "provider": "anthropic",
+      "api_key": "unused",
+      "forward_headers": ["authorization", "x-api-key", "anthropic-beta", "anthropic-version"]
+    }
+  ]
+}

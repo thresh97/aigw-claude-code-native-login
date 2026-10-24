@@ -1,0 +1,10 @@
+.DS_Store
+*.swp
+# Local-only files (secrets tend to hide here)
+*.local
+*.local.*
+.env
+# Repro: your environment and run output (copy results into the private evidence tree)
+repro/env
+repro/results/
+__pycache__/
