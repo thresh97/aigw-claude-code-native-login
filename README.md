@@ -307,6 +307,36 @@ Behavior may change in later releases.
 
 Run by hand, not by the repro: device code and browser (PKCE) sign-in with `aigw-claude-auth login` against Entra ID on macOS. The browser sign-in needed the loopback redirect URI on the app registration first (see What you need). The precheck's sign-in (finding 10) against Entra ID on macOS: blocked at once with the code, the same code on a second prompt, signed in in the background, the resent prompt answered, and the decline case; code expiry and `claude -p` weren't tried. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
 
+## Not covered yet
+
+Open questions and gaps, not tested here:
+
+- **Claude desktop app and Cowork.** Does the app's Claude Code read `env` in `settings.json` and run the hooks? Which config dir does it use (a GUI app doesn't inherit the shell's `CLAUDE_CONFIG_DIR`)? Where does it keep the Anthropic login, and does a gateway 401 cause the same OAuth loop? How does a hook's block message show up? Does Cowork allow a custom base URL, headers or hooks at all?
+- **Native Windows** (WSL works: it's Linux). The client needs changes:
+  - file locking without `fcntl`;
+  - a process check that doesn't use `os.kill(pid, 0)`, which terminates the process on Windows;
+  - a detached sign-in worker;
+  - a retry when another process holds the settings file open;
+  - notifications;
+  - hook command quoting for the shell Claude Code uses there;
+  - a scheduled task instead of systemd or launchd;
+  - a non-bash repro.
+- **SaaS gateway.** Per the notes above: Mode A only, `defaults.config_id`, no load balancer for the guard, so hooks only and `block_on_failure` stays `true`. No scenario has run against it.
+- **Gateway API keys** instead of a JWT (see [Without a JWT](#without-a-jwt-gateway-api-keys)): service and user keys, a revoked key's 401, and per-user attribution of user keys.
+- **Also untested:**
+  - Mode B;
+  - the hooks delivered through managed settings, and `allowManagedHooksOnly`;
+  - 403 and 407 with a stored login;
+  - on macOS: the live scenarios, where Claude Code keeps a stored login, `claude -p` while signed out, and device code expiry.
+- **Protecting the JWT and the refresh token at rest.** Both sit in files with mode 600 today. Options not built yet:
+  - the refresh token in the OS keychain (macOS Keychain, libsecret, Windows Credential Manager);
+  - a local injecting proxy, which keeps the JWT in memory;
+  - Claude Code permission rules that deny reading the files;
+  - sender-constrained tokens, if the gateway ever supports them.
+
+  Claude Code has no documented helper that supplies headers for model requests (as of 2.1.286). `apiKeyHelper` doesn't fit, since its value replaces the Anthropic login.
+- **Token lifetime guidance.** The broker default is 1 h, renewed 5 min before expiry. A shorter JWT narrows the window for a stolen token or an offboarded user, because a Mode A JWT can't be revoked before it expires. A longer one means fewer IdP and broker calls and fewer renewals at prompt time. There's no recommendation yet. Also untested: how renewals behave across sleep, and the gateway's clock-skew tolerance on `exp`.
+
 ## License
 
 MIT; see [LICENSE](LICENSE).
