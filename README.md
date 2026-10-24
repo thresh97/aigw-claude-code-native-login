@@ -8,22 +8,9 @@ Use it when the users' Anthropic plan stays the billing and policy anchor, and t
 
 > **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
 
-```
-                    ┌──────────────── user's machine ────────────────┐
-  IdP  ◀── sign-in, │ aigw-claude-auth (daemon + 2 Claude Code hooks)│
-  (and broker) ───▶ │   keeps a fresh JWT in ~/.claude/settings.json │
-       refresh      │                                                │
-                    │ Claude Code sends                              │
-                    │   Authorization: Bearer <its Anthropic login>  │
-                    │   x-portkey-api-key: <gateway JWT>             │
-                    └───────────────────────┬────────────────────────┘
-                                            ▼
-                 [optional LB guard: sentinel or missing JWT → 498]
-                                            ▼
-                 AI Gateway: verifies the JWT → workspace, config, limits, logs, guardrails
-                                            ▼  passthrough config forwards Authorization, anthropic-beta
-                 Anthropic API: checks the user's own login
-```
+![How it fits together: the client keeps a gateway JWT in Claude Code's settings; every request carries the user's Anthropic login and the JWT; the gateway checks the JWT and forwards the login to Anthropic](docs/flow.svg)
+
+Shown with Entra ID and a token broker (Mode A), as tested. With Mode B there is no broker: the client puts the IdP's own token into the header.
 
 | Piece | What it does | Where |
 |---|---|---|
