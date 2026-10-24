@@ -7,7 +7,7 @@ status: verified          # verified | reported | stale | superseded | retracted
 visibility: internal      # internal | public
 verified: 2026-10-24      # YYYY-MM-DD: date of the newest private evidence folder; empty if never tested
 versions:                 # component: version, as confirmed by that evidence
-  claude-code: 2.1.286
+  claude-code: 2.1.286 (Linux), 2.1.308 (macOS)
   aigw-claude-auth: 1.0.0
   aigw-gateway: 2.29.0
 source:                   # required when status is reported: where the claim came from

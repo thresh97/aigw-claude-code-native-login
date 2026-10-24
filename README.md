@@ -60,7 +60,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
   - tokens signed by a broker that exchanges an IdP token for a gateway JWT ("Mode A"; for Entra ID see article `aigw-entra-jwt-broker`).
 - **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' JWT selects (`defaults.config_slug` in the JWT, or the workspace default). Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
 - **An IdP public client** (no secret) for the client to sign in with:
-  - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra accepts any port on loopback);
+  - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra: platform "Mobile and desktop applications"; it accepts any port on loopback). Without it, the browser sign-in fails with `AADSTS500113` (no reply address registered);
   - `offline_access` granted, so the IdP issues a refresh token;
   - for Mode A, permission for the broker's API scope (Entra: `api://<broker app>/access_as_user`).
 - **Users with an Anthropic login** in Claude Code (`claude`, then `/login`).
@@ -264,6 +264,7 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
    - everything in [What you need](#what-you-need);
    - a dedicated Claude Code config dir with a stored login;
    - a prior `aigw-claude-auth login`, or a `TOKEN_COMMAND`.
+   Run it outside a coding agent's sandbox: the scenarios listen on 127.0.0.1, and a sandbox that forbids that turns every scenario into `ERROR` with `PermissionError: [Errno 1] Operation not permitted`.
 2. `cp repro/env.example repro/env` and fill it in. The offline scenarios need nothing in it.
 3. `repro/run.sh check` (read-only preflight).
 4. `repro/run.sh all --yes` (or one scenario from `repro/run.sh list`). `stored_login`, `live_login` and `client_live` require `--yes` because they:
@@ -280,6 +281,7 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
 
 Tested 2026-10-24 against:
 - Claude Code 2.1.286 and aigw-claude-auth 1.0.0, on Linux with Python 3.10 to 3.12;
+- the offline scenarios also on macOS 26.6 (Apple silicon) with Claude Code 2.1.308 and Python 3.13, plus by hand there: device code sign-in against Entra ID, the launchd agent, the hooks in an interactive session and the Notification Center notice;
 - a hybrid AI Gateway (`gateway_enterprise` 2.29.0) with JWT auth: Mode A, with Entra ID and a token broker, behind an AWS ALB with the guard rules.
 
 Behavior may change in later releases.
@@ -296,7 +298,7 @@ Behavior may change in later releases.
 | 8 | UserPromptSubmit hooks: a hook running past the default 30 s timeout is killed and the prompt is sent (fail-open); the entry's `timeout` field is honored; `{"decision":"block","reason":...}` blocks the prompt and shows the reason | `precheck` |
 | 9 | The client renews an expired JWT in the precheck before the turn, and the turn succeeds on the first request (live: Entra ID → broker → gateway → Anthropic). It blocks in time when the IdP hangs, and writes the sentinel when blocking is off | `precheck`, `client_live` |
 
-Not covered by a live run: the interactive sign-in. In the lab the client's refresh token was seeded from a test user's direct sign-in. The device code and PKCE flows were tested only against the fake IdP (`unit`). Run `aigw-claude-auth login` once against your IdP to confirm them.
+Not covered by a live run: the browser (PKCE) sign-in against a real IdP; it was tested only against the fake IdP (`unit`). The device code sign-in was run by hand against Entra ID on macOS. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
 
 ## License
 

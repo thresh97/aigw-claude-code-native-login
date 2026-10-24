@@ -45,6 +45,17 @@ def observe(key, value):
     print(f"{key}={value}", flush=True)
 
 
+def wait_until(cond, timeout=20, step=0.5):
+    """Poll cond() until it's true or timeout seconds pass. Hooks run after the turn's result is out, and how long
+    after varies (seconds on a busy or slower machine), so fixed sleeps make the checks flaky."""
+    end = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > end:
+            return False
+        time.sleep(step)
+    return True
+
+
 def secs(t0):
     return round(time.time() - t0, 1)
 
@@ -329,6 +340,7 @@ def scenario_errors(out):
             observe(f"{name}_attempts", len(gw.messages(mark)))
             observe(f"{name}_fast", "yes" if t["seconds"] < 15 else f"no ({t['seconds']}s)")
             observe(f"{name}_message", classify(t["text"]) if name.endswith("401") else ("status-shown" if name in t["text"] else "other"))
+            wait_until(lambda: len(payloads(out, "stopfailure")) > seen)
             p = payloads(out, "stopfailure")[seen:]
             observe(f"{name}_stopfailure_error", p[0].get("error") if p else "none")
         gw.set(revoked=[], oauth=OAUTH, force=None)
@@ -409,7 +421,7 @@ def scenario_stopfailure(out):
         gw.set(revoked=[mock_gateway.fingerprint(bad)])
         t = claude.turn("the gateway now refuses this JWT")
         observe("refused_turn", classify(t["text"]))
-        time.sleep(2)
+        wait_until(lambda: header_of(claude.settings()) not in (bad, "") and note.exists() and "renewed" in note.read_text())
         observe("jwt_replaced", "yes" if header_of(claude.settings()) not in (bad, "") else "no")
         observe("notified", "renewed" if note.exists() and "renewed" in note.read_text() else "no")
         time.sleep(2)
