@@ -120,6 +120,17 @@ claude        # then /login
 
 `install` keeps everything else in the settings file, including other headers in `ANTHROPIC_CUSTOM_HEADERS`, other hooks and other keys. It's safe to run again: it replaces only its own entries.
 
+**Trial install (your everyday Claude Code untouched).** Claude Code re-reads its settings about a second after they change. So `install` on `~/.claude/settings.json` reroutes every running Claude Code session, including an agent doing the install. To try it first, use a separate Claude Code config dir. That dir needs its own `/login`:
+
+```bash
+export CLAUDE_CONFIG_DIR=~/.claude-aigw
+claude                                                   # /login once, then exit
+aigw-claude-auth install --base-url https://<gateway host>   # edits only ~/.claude-aigw/settings.json
+CLAUDE_CONFIG_DIR=~/.claude-aigw claude                  # a session through the gateway
+```
+
+For the daemon, set the same `CLAUDE_CONFIG_DIR` in the unit (`Environment=`) or the plist (`EnvironmentVariables`). The hooks need nothing: they inherit the environment of the Claude Code that runs them, `CLAUDE_CONFIG_DIR` included. To go live later, run `install` again without `CLAUDE_CONFIG_DIR`.
+
 **Fleet rollout (managed settings).** IT can ship the hooks and `ANTHROPIC_BASE_URL` in Claude Code's managed settings:
 1. Print the snippet with `aigw-claude-auth install --print --base-url https://<gateway host> --hook-command /usr/local/bin/aigw-claude-auth`.
 2. For each user, run `aigw-claude-auth install --no-hooks`, which only writes the JWT.
@@ -239,7 +250,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 
 The offline scenarios take about 10 minutes and the live ones about 15, because two live scenarios wait out the OAuth loop.
 
-1. Prerequisites: Python 3.8+, curl, Claude Code. For the live scenarios you also need:
+1. Prerequisites: Python 3.8+, bash 4+ (on macOS: `brew install bash`), curl, Claude Code. For the live scenarios you also need:
    - everything in [What you need](#what-you-need);
    - a dedicated Claude Code config dir with a stored login;
    - a prior `aigw-claude-auth login`, or a `TOKEN_COMMAND`.

@@ -6,6 +6,7 @@
 #   run.sh all [--yes]          every scenario
 # Results: repro/results/<date>-<scenario>/{run.log,summary.txt}. Verdict: PASS, CHANGED or ERROR.
 set -uo pipefail
+(( BASH_VERSINFO[0] >= 4 )) || { echo "ERROR: needs bash 4+ (macOS: brew install bash, then run: $(command -v brew >/dev/null && echo "$(brew --prefix)/bin/bash" || echo bash) $0 ...)"; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 [[ -f $HERE/env ]] || { echo "ERROR: copy env.example to env and fill it in"; exit 2; }
 # shellcheck source=/dev/null
@@ -16,7 +17,8 @@ OUT= OBS=0 DIFF=0
 CLEANUP=()
 log()     { echo "$(date -u +%H:%M:%SZ) $*" | tee -a "$OUT/run.log"; }
 mask()    { sed -E 's/[A-Za-z0-9+\/_=-]{24,}/<masked>/g'; }          # pipe anything that might carry a secret
-fp()      { echo "len $(wc -c < "$1") tail $(tail -c3 "$1") sha $(sha256sum < "$1" | cut -c1-12)"; }  # a secret file, safely
+sha()     { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }   # macOS may lack sha256sum
+fp()      { echo "len $(wc -c < "$1" | tr -d ' ') tail $(tail -c3 "$1") sha $(sha < "$1" | cut -c1-12)"; }  # a secret file, safely
 need()    { for v; do [[ -n ${!v:-} ]] || { echo "ERROR: $v is empty in env"; exit 2; }; done; }
 on_exit() { CLEANUP+=("$*"); }                                    # registered undo steps run in reverse, even on failure
 expect()  { # expect "<what>" "<expected>" "<observed>"
@@ -57,7 +59,7 @@ check() {
   if [[ -n ${GATEWAY_URL:-} ]]; then
     echo "gateway: HTTP $(curl -s -o /dev/null -w '%{http_code}' -m 15 "$GATEWAY_URL/v1/messages" -X POST -H 'content-type: application/json' -d '{}') for an unauthenticated POST (expect 401, or 498 behind the LB guard)"
     local t; if t=$(eval "${TOKEN_COMMAND:-python3 $CLIENT token}" 2>/dev/null) && [[ $t == *.*.* ]]; then
-      echo "gateway JWT: len ${#t} sha $(printf %s "$t" | sha256sum | cut -c1-12)"
+      echo "gateway JWT: len ${#t} sha $(printf %s "$t" | sha | cut -c1-12)"
     else echo "gateway JWT: TOKEN_COMMAND failed (sign in first: python3 $CLIENT login)"; fi
   else echo "gateway: GATEWAY_URL not set (gateway, live_login, client_live will refuse to run)"; fi
   echo "check: ok"; }
