@@ -4,7 +4,7 @@ title: Claude Code with its own Anthropic login behind the AI Gateway: gateway J
 area: aigw
 type: guide            # guide | behavior | capability | limitation | workaround | position
 status: verified          # verified | reported | stale | superseded | retracted
-visibility: internal      # internal | public
+visibility: public        # internal | public
 verified: 2026-10-24      # YYYY-MM-DD: date of the newest private evidence folder; empty if never tested
 versions:                 # component: version, as confirmed by that evidence
   claude-code: 2.1.286 (Linux), 2.1.308 (macOS)
