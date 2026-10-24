@@ -1,6 +1,6 @@
 # aigw-claude-code-native-login
 
-Claude Code users who sign in with their own Anthropic account (`claude login`, for example a Claude Enterprise seat) can still go through the AI Gateway, so the gateway sees, logs, guards and attributes every request. Claude Code keeps sending its Anthropic login in `Authorization: Bearer`, and the gateway passes it through to Anthropic. The gateway identifies the user by a short-lived JWT in a second header, `x-portkey-api-key`.
+Claude Code users who sign in with their own Anthropic account (`claude login`, for example a Claude Enterprise seat) can still go through the AI Gateway, so the gateway sees, logs, guards and attributes every request. Claude Code keeps sending its Anthropic login in `Authorization: Bearer`, and the gateway passes it through to Anthropic. The gateway identifies the user by a short-lived JWT in a second header, `x-portkey-api-key`, or by a gateway API key in that header (see [Without a JWT](#without-a-jwt-gateway-api-keys)).
 
 This article ships a small client, `aigw-claude-auth` (one Python file, standard library only). It gets that JWT from your IdP, directly or through a token broker, and keeps it fresh in Claude Code's settings. It also makes gateway auth failures fail fast. Without that, a gateway 401 sends a logged-in Claude Code into its own Anthropic OAuth refresh-and-retry loop for several minutes.
 
@@ -20,6 +20,19 @@ Shown with Entra ID and a token broker (Mode A), as tested. With Mode B there is
 | Precheck hook (UserPromptSubmit) | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message | `aigw-claude-auth hook precheck` |
 | StopFailure hook | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works | `aigw-claude-auth hook stop-failure` |
 | LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) |
+
+## Without a JWT: gateway API keys
+
+A JWT isn't the only way to authenticate to the gateway. The gateway's own API keys go in the same header, `x-portkey-api-key`, and the rest of the layout stays as it is: Claude Code's Anthropic login in `Authorization`, and the passthrough config forwarding it.
+
+- **AI Gateway service API keys:** one key per workspace, team or machine. The gateway knows the key, not the person.
+- **AI Gateway user API keys:** one key per user, so requests are attributed to the person. This needs the SCM tenant onboarded with the customer's directory through Cloud Identity Engine (CIE), so the gateway knows the users.
+
+Set it once, in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings (`x-portkey-api-key: <key>`), and make the passthrough config the workspace default. No client, broker or IdP sign-in is needed. The trade-offs, compared with the JWT:
+- The key is a long-lived secret in the settings file. Rotation is manual, or done by another tool such as an MDM that rewrites the settings. Revoking it takes effect at once, unlike a JWT, which stays valid until it expires.
+- A revoked or wrong key gets the gateway's 401, which sends a logged-in Claude Code into the OAuth loop described below. The StopFailure hook can't help: there's nothing to renew. The LB guard can only catch a missing header.
+
+API keys are untested in the scope of this article, which covers the JWT path.
 
 ## Why the extra parts are needed
 
@@ -44,7 +57,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 
 ## What you need
 
-- **An AI Gateway that accepts a JWT** in `x-portkey-api-key`, in one of two ways:
+- **An AI Gateway that accepts a JWT** in `x-portkey-api-key` (for gateway API keys instead, see [Without a JWT](#without-a-jwt-gateway-api-keys)), in one of two ways:
   - your IdP's tokens directly (Portkey JWT auth, "Mode B");
   - tokens signed by a broker that exchanges an IdP token for a gateway JWT ("Mode A"; for Entra ID see article `aigw-entra-jwt-broker`).
 - **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), set as the config the users' requests get: `defaults.config_slug` in the JWT, or the workspace default. Reading `config_slug` from the JWT is specific to the hybrid gateway at the moment (reported 2026-10-24, not tested here on SaaS); on the SaaS gateway, use the workspace default. Its `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
