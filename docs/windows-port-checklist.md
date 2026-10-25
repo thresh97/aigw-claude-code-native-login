@@ -10,13 +10,15 @@ on 2026-10-25. None of them has been tried on Windows yet. Line numbers are as o
 - `:673` `start_new_session`. Windows needs `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
 - `:588-589` `signal.SIGTERM` handler. Windows has only `SIGINT`/`SIGBREAK`.
 - `:723-733` notify: `osascript`/`notify-send`, with no toast path. Use PowerShell 5.1 WinRT with `-EncodedCommand`.
-- `:739` hook commands quoted with `shlex.quote`. This depends on the S7 hook-shell result.
+- `:739` hook commands quoted with `shlex.quote`. S7 (README finding 17): this runs under Git Bash but not under Windows
+  PowerShell 5.1, which Claude Code uses when Git for Windows is absent. Use a form that parses in both.
 - `:94`, `:100` default `~/.config` instead of `%APPDATA%`.
 - `:156-165` `mkdir(mode=0o700)` and `chmod` don't restrict access on Windows. Needs a user-only ACL.
-- Settings rename: retry `os.replace` on `PermissionError`. Whether this happens is measured by S7 (`lock_*`).
+- Settings rename: retry `os.replace` on `PermissionError`. S7 saw none in 60 replacements (finding 17); keep a short retry.
 
 ## repro/harness.py
 
+- `UnixGateway` read `socket.AF_UNIX` at import (fixed: `getattr`), which stopped the probe importing `harness` on Windows.
 - `:34` imports `test_aigw_claude_auth` → client → `fcntl`, so it can't be imported on Windows (the probe stubs `fcntl`).
 - `:37` `CLAUDE` assumes a bare `claude`; `:625` `Managed.DIR` is macOS/Linux only.
 - `:123-133` the clean environment for Claude Code lacks `SystemRoot`, `ComSpec`, `PATHEXT`, `USERPROFILE`, `APPDATA`,

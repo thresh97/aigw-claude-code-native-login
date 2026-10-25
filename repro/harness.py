@@ -535,7 +535,7 @@ class UnixGateway:
     """The mock gateway listening on a Unix socket instead of TCP (for the socket base URL tries)."""
 
     class Server(ThreadingHTTPServer):
-        address_family = socket.AF_UNIX
+        address_family = getattr(socket, "AF_UNIX", None)  # absent on Windows Python; keeps the import working
 
         def server_bind(self):
             self.socket.bind(self.server_address)
