@@ -148,9 +148,10 @@ For the daemon, set the same `CLAUDE_CONFIG_DIR` in the unit (`Environment=`) or
 1. Print the snippet with `aigw-claude-auth install --print --base-url https://<gateway host> --hook-command /usr/local/bin/aigw-claude-auth`.
 2. For each user, run `aigw-claude-auth install --no-hooks`, which only writes the JWT.
 
-Two constraints:
-- Managed settings must **not** set `ANTHROPIC_CUSTOM_HEADERS`. The JWT has to live in the user's settings file, which the client rewrites. How a managed value would combine with the user's value wasn't tested.
+Constraints (finding 11):
+- Managed settings must **not** set `ANTHROPIC_CUSTOM_HEADERS`. A managed value replaces the user's whole value, so the JWT isn't sent. The JWT has to live in the user's settings file, which the client rewrites.
 - With `allowManagedHooksOnly`, user hooks don't run, so the hooks must come from managed settings.
+- The user's `settings.json` must stay writable for the user. A read-only mode (444) is fine, because the client replaces the file. An immutable flag (macOS `chflags uchg`) isn't: the client can't renew the JWT, and from 1.1.1 the precheck blocks the prompt with the error.
 
 ## 2. Quick check
 
@@ -291,6 +292,7 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
 Tested 2026-10-24 against:
 - Claude Code 2.1.286 and aigw-claude-auth 1.0.0, on Linux with Python 3.10 to 3.12; aigw-claude-auth 1.1.0 (the precheck's sign-in, finding 10) in the offline scenarios;
 - the offline scenarios also on macOS 26.6 (Apple silicon) with Claude Code 2.1.308 and Python 3.13, plus by hand there: device code and browser (PKCE) sign-in against Entra ID, with 1.1.0 the precheck's sign-in against Entra ID, the launchd agent, the hooks in an interactive session and the Notification Center notice;
+- on 2026-10-25, the `managed` scenario on macOS 26.6 with Claude Code 2.1.308 and aigw-claude-auth 1.1.0 (finding 11); the fix for its immutable case is in 1.1.1, which has only been unit tested;
 - a hybrid AI Gateway (`gateway_enterprise` 2.29.0) with JWT auth: Mode A, with Entra ID and a token broker, behind an AWS ALB with the guard rules.
 
 Behavior may change in later releases.
@@ -307,6 +309,7 @@ Behavior may change in later releases.
 | 8 | UserPromptSubmit hooks: a hook running past the default 30 s timeout is killed and the prompt is sent (fail-open); the entry's `timeout` field is honored; `{"decision":"block","reason":...}` blocks the prompt and shows the reason | `precheck` |
 | 9 | The client renews an expired JWT in the precheck before the turn, and the turn succeeds on the first request (live: Entra ID → broker → gateway → Anthropic). It blocks in time when the IdP hangs, and writes the sentinel when blocking is off | `precheck`, `client_live` |
 | 10 | Signed out, the precheck starts a device code sign-in in a detached process and blocks the prompt with the URL and code; Claude Code shows the reason as "UserPromptSubmit operation blocked by hook: AI gateway sign-in needed: ...". A second prompt before the sign-in is done gets the same code (one device flow). Once the user signs in, the JWT is written and the next prompt goes through on its first request. If the user declines at the IdP, the detached process logs and notifies the error (Entra: `authorization_declined AADSTS700171`) and the next prompt gets a new code. Repro against the fake IdP; also by hand against Entra ID on macOS | `precheck` (`hooklogin`), `unit` |
+| 11 | Managed settings (machine-wide file, root-owned) next to the user's `settings.json`: a managed `env.ANTHROPIC_CUSTOM_HEADERS` replaces the user's value, so the JWT isn't sent (401 from the gateway). Hooks and `ANTHROPIC_BASE_URL` from managed settings with the JWT in the user's file work: the precheck renews an expired JWT, and a JWT renewed during a session is picked up. With `allowManagedHooksOnly`, user hooks don't run and managed hooks do. A `settings.json` with mode 444 doesn't stop the client. With `chflags uchg` on it, renewal fails and 1.1.0's precheck let the prompt through with the expired JWT (fixed in 1.1.1: it blocks). A managed `proxyAuthHelper` adds no `Proxy-Authorization` header to requests to the gateway | `managed` |
 
 Run by hand, not by the repro: device code and browser (PKCE) sign-in with `aigw-claude-auth login` against Entra ID on macOS. The browser sign-in needed the loopback redirect URI on the app registration first (see What you need). The precheck's sign-in (finding 10) against Entra ID on macOS: blocked at once with the code, the same code on a second prompt, signed in in the background, the resent prompt answered, and the decline case; code expiry and `claude -p` weren't tried. Run `aigw-claude-auth login` once against your IdP to confirm the flow you use.
 
@@ -328,7 +331,6 @@ Open questions and gaps, not tested here:
 - **Gateway API keys** instead of a JWT (see [Without a JWT](#without-a-jwt-gateway-api-keys)): service and user keys, a revoked key's 401, and per-user attribution of user keys.
 - **Also untested:**
   - Mode B;
-  - the hooks delivered through managed settings, and `allowManagedHooksOnly`;
   - 403 and 407 with a stored login;
   - on macOS: the live scenarios, where Claude Code keeps a stored login, `claude -p` while signed out, and device code expiry.
 - **Protecting the JWT and the refresh token at rest.** Both sit in files with mode 600 today. Options not built yet:
@@ -337,7 +339,7 @@ Open questions and gaps, not tested here:
   - Claude Code permission rules that deny reading the files;
   - sender-constrained tokens, if the gateway ever supports them.
 
-  Claude Code has no documented helper that supplies headers for model requests (as of 2.1.286). `apiKeyHelper` doesn't fit, since its value replaces the Anthropic login.
+  Claude Code has no documented helper that supplies headers for model requests (as of 2.1.286). `apiKeyHelper` doesn't fit, since its value replaces the Anthropic login, and `proxyAuthHelper` doesn't reach the gateway (finding 11).
 - **Token lifetime guidance.** The broker default is 1 h, renewed 5 min before expiry. A shorter JWT narrows the window for a stolen token or an offboarded user, because a Mode A JWT can't be revoked before it expires. A longer one means fewer IdP and broker calls and fewer renewals at prompt time. There's no recommendation yet. Also untested: how renewals behave across sleep, and the gateway's clock-skew tolerance on `exp`.
 
 ## License

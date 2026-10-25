@@ -53,7 +53,7 @@ import webbrowser
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -625,8 +625,14 @@ def hook_precheck(cfg, state, settings):
     """UserPromptSubmit. Silent and instant while the JWT is good; otherwise refresh and give Claude Code time to reload."""
     try:
         r = sync(cfg, state, settings)
-    except Exception as e:                                  # never break the user's prompt on a bug in here
+    except Exception as e:                                  # a bug, or the settings file can't be written
         log(f"precheck error: {e}")
+        try:
+            dead = seconds_left(settings.get()) <= 0
+        except Exception:
+            dead = False                                    # can't tell: don't break the user's prompt
+        if dead and cfg["block_on_failure"]:                # the request would only get a 401
+            print(json.dumps({"decision": "block", "reason": f"AI gateway: cannot renew the JWT: {e}"}))
         return 0
     if r.ok:
         if r.changed:

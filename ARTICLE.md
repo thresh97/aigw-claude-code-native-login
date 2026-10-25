@@ -5,10 +5,10 @@ area: aigw
 type: guide            # guide | behavior | capability | limitation | workaround | position
 status: verified          # verified | reported | stale | superseded | retracted
 visibility: public        # internal | public
-verified: 2026-10-24      # YYYY-MM-DD: date of the newest private evidence folder; empty if never tested
+verified: 2026-10-25      # YYYY-MM-DD: date of the newest private evidence folder; empty if never tested
 versions:                 # component: version, as confirmed by that evidence
   claude-code: 2.1.286 (Linux), 2.1.308 (macOS)
-  aigw-claude-auth: 1.1.0
+  aigw-claude-auth: 1.1.0 (live), 1.1.1 (unit tests)
   aigw-gateway: 2.29.0
 source:                   # required when status is reported: where the claim came from
 related: [aigw-entra-jwt-broker]               # other article IDs

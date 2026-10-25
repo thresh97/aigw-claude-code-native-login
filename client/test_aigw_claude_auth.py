@@ -425,6 +425,20 @@ class HookTests(Base):
         d = json.loads(self.settings_path.read_text())
         self.assertEqual(d["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"], A.HOOK_TIMEOUT)
 
+    def test_precheck_blocks_when_settings_unwritable(self):
+        # macOS `chflags uchg` on settings.json: the rename fails with EPERM.
+        self.sign_in()
+        self.put_header(jwt(time.time() - 10))
+        with mock.patch.object(A, "write_private", side_effect=PermissionError(1, "Operation not permitted")):
+            code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+            self.assertEqual(code, 0)
+            d = json.loads(out)
+            self.assertEqual(d["decision"], "block")
+            self.assertIn("Operation not permitted", d["reason"])
+        self.put_header(jwt(time.time() + 3600))            # a usable JWT in an unwritable file: let the prompt through
+        with mock.patch.object(A, "write_private", side_effect=PermissionError(1, "Operation not permitted")):
+            self.assertEqual(self.run_cli("hook", "precheck", stdin="{}")[:2], (0, ""))
+
     def test_precheck_no_block_when_disabled(self):
         self.write_config(block_on_failure=False)
         self.put_header(jwt(time.time() - 10))
