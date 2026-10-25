@@ -138,6 +138,9 @@ class Claude:
         self.env.update(HOME=str(self.tmp), CLAUDE_CONFIG_DIR=str(self.config_dir), TERM="dumb", ANTHROPIC_MODEL=MODEL,
                         ANTHROPIC_BASE_URL=base_url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1",
                         DISABLE_TELEMETRY="1")
+        if config_dir and sys.platform == "darwin":
+            # a stored login on macOS is in the login Keychain, which is found through the real HOME
+            self.env.update({k: os.environ[k] for k in ("HOME", "USER") if k in os.environ})
         self.env.update(env or {})
         self.proc = None
         self.lines = queue.Queue()
@@ -270,9 +273,18 @@ def return_settings(settings_file, backup):
 def cred_state(config_dir):
     """A stored `claude login`, reduced to hashes and the expiry (never the tokens)."""
     f = Path(config_dir) / ".credentials.json"
-    if not f.exists():
+    if f.exists():
+        o = json.loads(f.read_text()).get("claudeAiOauth", {})
+    elif sys.platform == "darwin":
+        # macOS keeps it in the login Keychain; with CLAUDE_CONFIG_DIR the item's service name ends in the first 8 hex
+        # of sha256(the config dir path)
+        service = "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+        r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not r.stdout.strip():
+            return {"exists": False}
+        o = json.loads(r.stdout).get("claudeAiOauth", {})
+    else:
         return {"exists": False}
-    o = json.loads(f.read_text()).get("claudeAiOauth", {})
     return {"exists": True, "expiresAt": o.get("expiresAt"), "access": fp(o.get("accessToken", "")), "refresh": fp(o.get("refreshToken", ""))}
 
 
