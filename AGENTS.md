@@ -22,8 +22,8 @@ Guidance for coding agents running or changing this repo. Read README.md first.
   one of these scenarios restores it. `client_live` also
   refreshes the client's sign-in in `AIGW_CLAUDE_AUTH_DIR`.
 - **`managed`** (needs `--yes` and sudo): writes the OS managed-settings file (`/Library/Application Support/ClaudeCode/`
-  or `/etc/claude-code/`) as root for each case and removes it, and the directory too if it created it. Refuses if a
-  managed-settings file exists. Every Claude Code on the machine reads that file while a case runs; the scenario's
+  or `/etc/claude-code/`) as root for each case, and files in `managed-settings.d/` for the drop-in cases. It removes
+  what it wrote, and the directories too if it created them. Refuses if a managed-settings file or a drop-in exists. Every Claude Code on the machine reads that file while a case runs; the scenario's
   hooks are guarded to act only in its own processes. A person runs this, not an agent: it needs the sudo password,
   and the managed settings would apply to an agent's own Claude Code too.
 - **Results** (`repro/results/`, gitignored): request logs with credential fingerprints (length and a short hash),

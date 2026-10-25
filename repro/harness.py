@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -136,6 +137,7 @@ class Claude:
         self.env.update(env or {})
         self.proc = None
         self.lines = queue.Queue()
+        self.args = []          # extra command-line arguments for start()
 
     def settings(self):
         return json.loads(self.settings_file.read_text()) if self.settings_file.exists() else {}
@@ -156,7 +158,7 @@ class Claude:
         return {"seconds": secs(t0), "is_error": bool(j.get("is_error")), "text": str(j.get("result") or "")}
 
     def start(self):
-        cmd = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+        cmd = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", *self.args]
         self.proc = subprocess.Popen(cmd, cwd=self.tmp / "cwd", env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=open(self.out / "claude.stderr.txt", "a"), text=True)
         threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout] and self.lines.put(None), daemon=True).start()
@@ -629,19 +631,36 @@ class Managed:
         self.out, self.file, self.dropin = out, self.DIR / "managed-settings.json", self.DIR / "managed-settings.d"
         if self.file.exists() or (self.dropin.is_dir() and any(self.dropin.iterdir())):
             sys.exit(f"{self.DIR} already holds managed settings; not touching a real policy")
+        self.dropin_files, self.made_dropin = [], False
         self.created_dir = not self.DIR.exists()
         self.sudo("mkdir", "-p", str(self.DIR))
 
     def sudo(self, *cmd):
         subprocess.run(["sudo", "-n", *cmd], check=True, capture_output=True, timeout=30)
 
-    def write(self, d):
-        src = self.out / "managed-settings.json"
-        src.write_text(json.dumps(d, indent=2))
-        self.sudo("install", "-m", "644", str(src), str(self.file))       # root-owned, like an MDM-deployed file
+    def write(self, d, dropins=None):
+        """d: the managed-settings.json content (None: no such file); dropins: {file name: content} for managed-settings.d/."""
+        if d is not None:
+            src = self.out / "managed-settings.json"
+            src.write_text(json.dumps(d, indent=2))
+            self.sudo("install", "-m", "644", str(src), str(self.file))       # root-owned, like an MDM-deployed file
+        for name, content in (dropins or {}).items():
+            if not self.dropin.is_dir():
+                self.sudo("mkdir", "-p", str(self.dropin))
+                self.made_dropin = True
+            src = self.out / f"dropin.{name}"
+            src.write_text(json.dumps(content, indent=2))
+            self.sudo("install", "-m", "644", str(src), str(self.dropin / name))
+            self.dropin_files.append(name)
 
     def clear(self):
         self.sudo("rm", "-f", str(self.file))
+        for name in self.dropin_files:                  # only the files this run wrote
+            self.sudo("rm", "-f", str(self.dropin / name))
+        self.dropin_files = []
+        if self.made_dropin:
+            self.sudo("rmdir", str(self.dropin))
+            self.made_dropin = False
 
     def close(self):
         self.clear()
@@ -718,11 +737,120 @@ def managed_session(out, managed, managed_settings, user_hooks=True, capture=Fal
     return obs
 
 
+S4_MARKER = "s4-marker"      # appears only in the unknown top-level key's value
+S4_HOOK_SCRIPT = f'''import json, os, sys
+raw = sys.stdin.read()
+try:
+    keys = sorted(json.loads(raw))
+except ValueError:
+    keys = []
+# only AIGW_* variables are read from the environment, and only these are written
+env = {{k: v for k, v in os.environ.items() if k.startswith("AIGW_") and k != "AIGW_REPRO_MANAGED"}}
+with open(sys.argv[1], "a") as f:
+    f.write(json.dumps({{"aigw_env": env, "input_keys": keys, "marker_in_input": "aigwClaudeAuth" in raw or "{S4_MARKER}" in raw}}) + "\\n")
+'''
+
+
+def s4_hook(out, event, label):
+    """A managed hook entry (guarded to this scenario's processes) that records the AIGW_* variables of the hook's
+    environment, the top-level key names of its input JSON, and whether the unknown key's value is in that input.
+    Goes to out/hookenv.<label>.jsonl."""
+    script = out / "s4_hook.py"
+    script.write_text(S4_HOOK_SCRIPT)
+    cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(out / f'hookenv.{label}.jsonl'))}"
+    return {event: [{"hooks": [{"type": "command", "command": Managed.guarded(cmd), "timeout": 30}]}]}
+
+
+def s4_bash_command(out):
+    """The command the Bash tool runs: the AIGW_* variables of its environment (and nothing else) into out/bash.env."""
+    return f"env | grep '^AIGW_' | grep -v '^AIGW_REPRO_MANAGED=' | sort > {shlex.quote(str(out / 'bash.env'))}"
+
+
+def s4_specs(out, url2):
+    """The managed settings of each spike-S4 case: {case: {managed_settings, dropins, user_env}}. url2 is a second mock
+    gateway; a managed ANTHROPIC_BASE_URL pointing at it shows that the managed source was applied. Writes only the
+    hook script into out."""
+    base = {"ANTHROPIC_BASE_URL": url2}
+    up, sf = s4_hook(out, "UserPromptSubmit", "userprompt"), s4_hook(out, "StopFailure", "stopfailure")
+    return {
+        # an unknown top-level key next to env and hooks
+        "unknownkey": dict(managed_settings={"aigwClaudeAuth": {"issuer": f"https://idp.invalid/{S4_MARKER}"}, "env": base, "hooks": {**up, **sf}}),
+        # AIGW_* in managed env; the user's settings.json has one of the same keys and one of its own
+        "envkeys": dict(managed_settings={"env": {**base, "AIGW_ISSUER": "managed-issuer", "AIGW_HOOK_LOGIN": "off"}, "hooks": {**up, **sf}},
+                        user_env={"AIGW_ISSUER": "user-issuer", "AIGW_USER_ONLY": "user-only"}),
+        # managed-settings.json plus two drop-ins; hooks for the same event in two files; a key set in all three files
+        "dropin": dict(managed_settings={"env": {**base, "AIGW_FROM_MAIN": "main", "AIGW_CONFLICT": "main"}, "hooks": up},
+                       dropins={"10-a.json": {"env": {"AIGW_FROM_10": "a", "AIGW_CONFLICT": "dropin10"}, "hooks": sf},
+                                "20-b.json": {"env": {"AIGW_FROM_20": "b", "AIGW_CONFLICT": "dropin20"},
+                                              "hooks": s4_hook(out, "UserPromptSubmit", "userprompt2")}}),
+        # only a drop-in, no managed-settings.json
+        "dropinonly": dict(managed_settings=None,
+                           dropins={"10-only.json": {"env": {**base, "AIGW_ONLY_DROPIN": "yes"}, "hooks": {**up, **sf}}}),
+    }
+
+
+def records(out, label):
+    f = out / f"hookenv.{label}.jsonl"
+    return [json.loads(line) for line in f.read_text().splitlines() if line.strip()] if f.exists() else []
+
+
+def s4_session(out, managed, name):
+    """Three turns in one session against two mock gateways: a normal one (UserPromptSubmit hook), one that makes the
+    model call the Bash tool (its environment is recorded), and one the gateway fails with 403 (StopFailure hook).
+    Records whether the managed source's ANTHROPIC_BASE_URL applied, which hooks ran, the AIGW_* variables each hook and
+    the Bash tool saw, the hook input's key names, and any warning on stderr."""
+    (out / "gw2").mkdir()
+    gw, gw2 = Gateway(out), Gateway(out / "gw2")
+    spec = s4_specs(out, gw2.url)[name]
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH, Managed.MARK: "1"})
+    claude.args = ["--allowedTools", "Bash"]
+    obs = {}
+    try:
+        claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {fresh_jwt()}", **spec.get("user_env", {})}})
+        managed.write(spec["managed_settings"], spec.get("dropins"))
+        for g in (gw, gw2):
+            g.set(bash_command=s4_bash_command(out))
+        claude.start()
+        obs["turn1"] = classify(claude.turn("s4 turn 1")["text"])
+        wait_until(lambda: len(records(out, "userprompt")) >= 1, timeout=10)
+        n1, n2 = len(gw.messages()), len(gw2.messages())
+        obs["base_url_from_managed"] = "yes" if n2 and not n1 else "no" if n1 and not n2 else "split"
+        claude.turn("RUN-BASH please")
+        wait_until(lambda: (out / "bash.env").exists(), timeout=10)
+        for g in (gw, gw2):
+            g.set(force=403)
+        claude.turn("s4 turn 3")
+        wait_until(lambda: len(records(out, "stopfailure")) >= 1, timeout=10)
+        time.sleep(2)                                   # a moment for hooks that are still running
+        fmt = lambda env: ",".join(f"{k}={v}" for k, v in sorted(env.items())) or "none"
+        for label in ("userprompt", "userprompt2", "stopfailure"):
+            rs = records(out, label)
+            obs[f"hook_{label}_ran"] = "yes" if rs else "no"
+            if label != "userprompt2":
+                obs[f"env_{label}"] = fmt(rs[-1]["aigw_env"]) if rs else "no-hook"
+        up = records(out, "userprompt")
+        obs["hook_input_keys"] = ",".join(up[0]["input_keys"]) if up else "no-hook"
+        obs["marker_in_hook_input"] = "yes" if any(r["marker_in_input"] for r in up + records(out, "stopfailure")) else "no"
+        bash = out / "bash.env"
+        obs["env_bash"] = fmt(dict(l.split("=", 1) for l in bash.read_text().splitlines())) if bash.exists() else "no-bash"
+        err = (out / "claude.stderr.txt").read_text() if (out / "claude.stderr.txt").exists() else ""
+        warn = [l for l in err.splitlines() if re.search(r"settings|managed|invalid|unknown|unrecogni[sz]ed", l, re.I)]
+        (out / "warnings.txt").write_text("\n".join(warn) + "\n")
+        obs["stderr_warning"] = "yes" if warn else "no"
+        stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+        obs["stream_warning"] = "yes" if re.search(r"Invalid (managed )?settings|Settings (validation )?(error|warning)|unrecogni[sz]ed key", stream, re.I) else "no"
+    finally:
+        managed.clear()
+        claude.cleanup(), gw.close(), gw2.close()
+    return obs
+
+
 def scenario_managed(out):
     """Managed settings (the OS managed-settings file, as MDM deploys it) next to the user's settings.json that the
     client rewrites: whether a managed ANTHROPIC_CUSTOM_HEADERS replaces the user's JWT header; the fleet layout (hooks
     from managed settings, JWT in the user file) with a mid-session renewal; allowManagedHooksOnly with and without
     managed hooks; a read-only or immutable user settings.json; and whether proxyAuthHelper reaches the gateway.
+    Spike S4 cases (s4_session): an unknown top-level key, AIGW_* in managed env, managed-settings.d/ drop-ins.
     Needs sudo. Managed hooks are guarded so that they act only in this scenario's Claude Code processes."""
     only = set(filter(None, os.environ.get("MANAGED_CASES", "").split(",")))
     pk = {"ANTHROPIC_CUSTOM_HEADERS": "x-managed-test: managed"}
@@ -737,13 +865,15 @@ def scenario_managed(out):
         "immutable": dict(managed_settings=None, lock="immutable"),
         "proxyauth": dict(managed_settings={"proxyAuthHelper": "echo 'Basic cmVwcm86cmVwcm8='"}, initial="valid"),
     }
-    cases = {k: v for k, v in cases.items() if not only or k in only}
-    managed = Managed(out) if any(v["managed_settings"] is not None for v in cases.values()) else None
+    s4 = {k: dict(s4=True, **v) for k, v in s4_specs(out, "http://127.0.0.1:0").items()}     # spike S4: see s4_session
+    cases = {k: v for k, v in {**cases, **s4}.items() if not only or k in only}
+    managed = Managed(out) if any(v.get("managed_settings") is not None or v.get("dropins") for v in cases.values()) else None
     try:
         for name, kw in cases.items():
             sub = out / name
             sub.mkdir()
-            for k, v in managed_session(sub, managed, **kw).items():
+            obs = s4_session(sub, managed, name) if kw.get("s4") else managed_session(sub, managed, **kw)
+            for k, v in obs.items():
                 observe(f"{name}_{k}", v)
     finally:
         if managed:

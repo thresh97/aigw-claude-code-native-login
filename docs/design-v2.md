@@ -469,7 +469,7 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S1 | Built-in helper for a custom header? | Answered: no (`apiKeyHelper` replaces the login, `proxyAuthHelper` doesn't reach the gateway) | Re-check per Claude Code release |
 | S2 | Settings reread mid-session? | Answered: yes, about 1 s after rename | `headers` scenario guards it |
 | S3 | Managed versus user `env` for the same key? | Answered: managed replaces the user's whole value | `managed` scenario guards it |
-| S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Open | Extend `managed` scenario |
+| S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Cases written (`unknownkey`, `envkeys`, `dropin`, `dropinonly` in the `managed` scenario, also covering `managed-settings.d/`); expectations are predictions; awaits a run by a person (`bash repro/run.sh managed --yes`) | Extend `managed` scenario |
 | S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Open | Mock gateway plus each app |
 | S6 | Do server-managed settings apply to users behind the gateway? | Open | Anthropic account team; pilot tenant |
 | S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Open | Windows port of the offline scenarios |
