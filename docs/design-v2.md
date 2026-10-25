@@ -480,7 +480,7 @@ The Claude desktop app's Chat, Cowork and Code tabs don't take routing from Clau
 **What a gateway needs for it**
 
 - A config whose upstream uses the organization's provider credential, not the passthrough config (which forwards the caller's `authorization`). Mode A's `defaults.config_slug` / `config_id` claim, or the workspace default, selects it.
-- JWT validation for whatever reaches it. With `inferenceGatewayOidc` that's the IdP's own token in `Authorization: Bearer` (validate against the IdP's JWKS, `aud` = the desktop app's client ID): the gateway's Mode B shape. A gateway that reads `x-portkey-api-key` instead could get the JWT there through a credential helper's `headers`; whether the gateway accepts the JWT in `Authorization` is untested.
+- JWT validation for whatever reaches it. With `inferenceGatewayOidc` that's the IdP's own token in `Authorization: Bearer` (validate against the IdP's JWKS, `aud` = the desktop app's client ID): the gateway's Mode B shape. The gateway accepts a JWT in `Authorization: Bearer` as well as in `x-portkey-api-key` (the operator's statement; not run here, finding 2 covers `x-portkey-api-key` only). A credential helper's `headers` could also put it in `x-portkey-api-key`.
 - `cache_control` passed through, SSE streamed, and `GET /v1/models` (or `inferenceModels`) for the model list.
 
 **Where this client fits.** Little: the app signs users in and refreshes credentials itself. Recommend `inferenceGatewayOidc` (same IdP app registration pattern as the client's PKCE sign-in) and document the gateway config; don't ship `aigw-claude-auth` as a credential helper unless a gateway needs claims only the broker can mint (Mode A with Entra ID), in which case the helper would print the broker's JWT.
