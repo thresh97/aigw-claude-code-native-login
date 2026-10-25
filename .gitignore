@@ -14,3 +14,8 @@ __pycache__/
 /.state.env
 /config.json
 /aigw-gw
+# Terraform (infra/windows-test-vm): .terraform.lock.hcl and terraform.tfvars.example stay tracked
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

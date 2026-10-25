@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Placeholders only.
+allowed_source_cidrs = ["<your ip>/32"]
+ssh_public_key       = "ssh-ed25519 AAAA... you@host"
+# subscription_id    = "<subscription id>"   # or set ARM_SUBSCRIPTION_ID
+# location           = "westeurope"
+# image_publisher    = "MicrosoftWindowsServer"
+# image_offer        = "WindowsServer"
+# image_sku          = "2022-datacenter-azure-edition"
+# license_type       = null
