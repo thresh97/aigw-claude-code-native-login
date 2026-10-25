@@ -11,7 +11,10 @@ on 2026-10-25. None of them has been tried on Windows yet. Line numbers are as o
 - `:588-589` `signal.SIGTERM` handler. Windows has only `SIGINT`/`SIGBREAK`.
 - `:723-733` notify: `osascript`/`notify-send`, with no toast path. Use PowerShell 5.1 WinRT with `-EncodedCommand`.
 - `:739` hook commands quoted with `shlex.quote`. S7 (README finding 17): this runs under Git Bash but not under Windows
-  PowerShell 5.1, which Claude Code uses when Git for Windows is absent. Use a form that parses in both.
+  PowerShell 5.1, which Claude Code uses when Git for Windows is absent. Use a form that parses in both. Per the hooks docs
+  (not run here): exec form (`"command": "<python.exe>", "args": [...]`) spawns the executable with no shell on any
+  platform, which avoids quoting entirely; `command` must be a real `.exe`, not a `.cmd` shim. A per-hook
+  `shell: "bash" | "powershell"` field also exists. Try exec form on the VM first.
 - `:94`, `:100` default `~/.config` instead of `%APPDATA%`.
 - `:156-165` `mkdir(mode=0o700)` and `chmod` don't restrict access on Windows. Needs a user-only ACL.
 - Settings rename: retry `os.replace` on `PermissionError`. S7 saw none in 60 replacements (finding 17); keep a short retry.
