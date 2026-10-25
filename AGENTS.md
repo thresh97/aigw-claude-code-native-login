@@ -13,6 +13,9 @@ Guidance for coding agents running or changing this repo. Read README.md first.
   of the gateway. Both are shared infrastructure: get the operator's go-ahead first.
 - **Offline scenarios** (`unit headers errors precheck stopfailure`): local only. Throwaway HOME, config dir and fake
   IdP under the run's results dir; a mock gateway on 127.0.0.1. Dummy credentials only.
+- **`winprobe`** (`repro/winprobe.py`, spike S7): local only, no sudo or `--yes`. Throwaway HOME, USERPROFILE, APPDATA and
+  Claude config dir under its `--out` dir, mock gateway on 127.0.0.1, dummy credentials. On Windows it also launches
+  `powershell.exe` toasts (no registry or settings changes). Setup: `repro/WINDOWS.md`.
 - **`gateway`**: requests to the real gateway with the JWT from `TOKEN_COMMAND` (default: the client's `token`), and
   one request with the stored login's access token from `LOGIN_CONFIG_DIR` (read, not refreshed).
 - **`stored_login`, `live_login`, `client_live`** (need `--yes`): run Claude Code with the stored login in
