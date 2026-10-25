@@ -617,7 +617,140 @@ def scenario_client_live(out):
         gw.close()
 
 
-SCENARIOS = {name[len("scenario_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("scenario_")}
+class Managed:
+    """The OS managed-settings file (macOS /Library/Application Support/ClaudeCode, Linux /etc/claude-code), written
+    with `sudo -n` (run.sh primes sudo) and removed after each case. Refuses to run if a managed-settings file is
+    already there, so a real policy is never overwritten. The directory is removed again if this created it."""
+
+    DIR = Path("/Library/Application Support/ClaudeCode" if sys.platform == "darwin" else "/etc/claude-code")
+    MARK = "AIGW_REPRO_MANAGED"          # managed hooks act only in Claude Code processes started with this set
+
+    def __init__(self, out):
+        self.out, self.file, self.dropin = out, self.DIR / "managed-settings.json", self.DIR / "managed-settings.d"
+        if self.file.exists() or (self.dropin.is_dir() and any(self.dropin.iterdir())):
+            sys.exit(f"{self.DIR} already holds managed settings; not touching a real policy")
+        self.created_dir = not self.DIR.exists()
+        self.sudo("mkdir", "-p", str(self.DIR))
+
+    def sudo(self, *cmd):
+        subprocess.run(["sudo", "-n", *cmd], check=True, capture_output=True, timeout=30)
+
+    def write(self, d):
+        src = self.out / "managed-settings.json"
+        src.write_text(json.dumps(d, indent=2))
+        self.sudo("install", "-m", "644", str(src), str(self.file))       # root-owned, like an MDM-deployed file
+
+    def clear(self):
+        self.sudo("rm", "-f", str(self.file))
+
+    def close(self):
+        self.clear()
+        if self.created_dir:
+            self.sudo("rmdir", str(self.DIR))
+
+    @classmethod
+    def guarded(cls, command):
+        return f'[ -n "${cls.MARK}" ] || exit 0; {command}'
+
+    @classmethod
+    def client_hooks(cls):
+        client = f"{shlex.quote(sys.executable)} {shlex.quote(str(CLIENT))}"
+        return {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": cls.guarded(f"{client} hook precheck"), "timeout": 30}]}],
+                "StopFailure": [{"hooks": [{"type": "command", "command": cls.guarded(f"{client} hook stop-failure"), "timeout": 30}]}]}
+
+
+def managed_session(out, managed, managed_settings, user_hooks=True, capture=False, lock=None, initial="expired"):
+    """One persistent session, two turns, with `managed_settings` in the OS managed-settings file (None: no file).
+    The user's settings get the JWT (and the client hooks if user_hooks); capture adds a user-level capture hook.
+    lock: "readonly" (chmod 444) or "immutable" (macOS chflags uchg) on the user's settings.json before the session."""
+    gw, idp = Gateway(out), FakeIdP()
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH, Managed.MARK: "1"})
+    client = Client(claude.tmp, idp)
+    claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
+    obs = {}
+    try:
+        client.sign_in()
+        client.run("install", "--base-url", gw.url, *([] if user_hooks else ["--no-hooks"]), settings=claude.settings_file)
+        s = claude.settings()
+        start_jwt = {"expired": jwt(time.time() - 60, kind="gateway"), "valid": fresh_jwt()}[initial]
+        s["env"]["ANTHROPIC_CUSTOM_HEADERS"] = f"{PK}: {start_jwt}"
+        if capture:
+            s.setdefault("hooks", {})["UserPromptSubmit"] = s.get("hooks", {}).get("UserPromptSubmit", []) + [capture_hook(out, "user")]
+        claude.write_settings(s)
+        if managed_settings is not None:
+            managed.write(managed_settings)
+        if lock == "readonly":
+            os.chmod(claude.settings_file, 0o444)
+        elif lock == "immutable":
+            if sys.platform != "darwin":
+                return {"skipped": "macos-only"}
+            subprocess.run(["chflags", "uchg", str(claude.settings_file)], check=True)
+        if lock:
+            r = client.run("sync", "--force", settings=claude.settings_file)
+            obs["sync_exit"] = r.returncode
+            obs["sync_wrote"] = "yes" if header_of(claude.settings()) not in (start_jwt, "") else "no"
+        claude.start()
+        for i in (1, 2):
+            mark = gw.mark()
+            t = claude.turn(f"managed turn {i}")
+            reqs = gw.messages(mark)
+            h = reqs[0]["headers"] if reqs else {}
+            sent = h.get(PK, "")
+            obs[f"turn{i}"] = classify(t["text"]) if reqs else ("blocked" if "AI gateway" in t["text"] or t["is_error"] else "no-request")
+            obs[f"turn{i}_jwt"] = ("none" if not sent else "initial" if sent == mock_gateway.fingerprint(start_jwt)
+                                   else "sentinel" if sent == mock_gateway.fingerprint(SENTINEL) else "renewed")
+            obs[f"turn{i}_managed_header"] = "yes" if h.get("x-managed-test") else "no"
+            obs[f"turn{i}_proxy_authorization"] = "yes" if h.get("proxy-authorization") else "no"
+            if i == 1 and lock is None and initial == "valid":
+                client.run("sync", "--force", settings=claude.settings_file)    # a renewal mid-session, managed file present
+                time.sleep(3)
+        obs["user_hook_ran"] = "yes" if payloads(out, "user") else "no"
+        stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+        obs["block_message"] = "yes" if "blocked by hook" in stream and "AI gateway" in stream else "no"
+    finally:
+        if lock == "immutable" and sys.platform == "darwin":
+            subprocess.run(["chflags", "nouchg", str(claude.settings_file)])
+        if lock:
+            os.chmod(claude.settings_file, 0o600)
+        if managed_settings is not None:
+            managed.clear()
+        claude.cleanup(), gw.close(), idp.close()
+    return obs
+
+
+def scenario_managed(out):
+    """Managed settings (the OS managed-settings file, as MDM deploys it) next to the user's settings.json that the
+    client rewrites: whether a managed ANTHROPIC_CUSTOM_HEADERS replaces the user's JWT header; the fleet layout (hooks
+    from managed settings, JWT in the user file) with a mid-session renewal; allowManagedHooksOnly with and without
+    managed hooks; a read-only or immutable user settings.json; and whether proxyAuthHelper reaches the gateway.
+    Needs sudo. Managed hooks are guarded so that they act only in this scenario's Claude Code processes."""
+    only = set(filter(None, os.environ.get("MANAGED_CASES", "").split(",")))
+    pk = {"ANTHROPIC_CUSTOM_HEADERS": "x-managed-test: managed"}
+    cases = {
+        "none": dict(managed_settings=None),
+        "headers": dict(managed_settings={"env": pk}, initial="valid"),
+        "fleet": dict(managed_settings={"hooks": Managed.client_hooks()}, user_hooks=False),
+        "fleetreload": dict(managed_settings={"hooks": Managed.client_hooks()}, user_hooks=False, initial="valid"),
+        "hooksonly": dict(managed_settings={"allowManagedHooksOnly": True}, capture=True),
+        "hooksonlymanaged": dict(managed_settings={"allowManagedHooksOnly": True, "hooks": Managed.client_hooks()}, user_hooks=False, capture=True),
+        "readonly": dict(managed_settings=None, lock="readonly"),
+        "immutable": dict(managed_settings=None, lock="immutable"),
+        "proxyauth": dict(managed_settings={"proxyAuthHelper": "echo 'Basic cmVwcm86cmVwcm8='"}, initial="valid"),
+    }
+    cases = {k: v for k, v in cases.items() if not only or k in only}
+    managed = Managed(out) if any(v["managed_settings"] is not None for v in cases.values()) else None
+    try:
+        for name, kw in cases.items():
+            sub = out / name
+            sub.mkdir()
+            for k, v in managed_session(sub, managed, **kw).items():
+                observe(f"{name}_{k}", v)
+    finally:
+        if managed:
+            managed.close()
+
+
+SCENARIOS ={name[len("scenario_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("scenario_")}
 
 
 def main():

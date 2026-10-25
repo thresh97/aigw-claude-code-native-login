@@ -74,7 +74,7 @@ harness() { # harness <scenario>: run repro/harness.py, keep its key=value obser
 expect_seen() { # stdin: "<key> <expected...>" lines (# comments allowed); compares each with SEEN[key]
   local k want; while read -r k want; do [[ -z $k || $k == \#* ]] && continue; expect "$k" "$want" "${SEEN[$k]:-missing}"; done; }
 
-SCENARIOS=(unit headers errors precheck stopfailure stored_login gateway live_login client_live)
+SCENARIOS=(unit headers errors precheck stopfailure stored_login gateway live_login client_live managed)
 
 describe_unit() { echo "unit: the client's offline tests (fake IdP and broker): settings edits, refresh, sentinel, device/PKCE sign-in, hooks, daemon. Changes: nothing. Under 1 min."; }
 scenario_unit() {
@@ -282,6 +282,53 @@ turn_fresh ok
 turn_after_expiry ok
 turn_after_expiry_statuses 200
 turn_after_expiry_fast yes
+EOF
+  finish; }
+
+describe_managed() { echo "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper. Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 5 min."; }
+scenario_managed() {
+  guard managed "writes the machine-wide managed-settings file while it runs"
+  sudo -v || { echo "ERROR: managed needs sudo"; exit 2; }
+  start managed
+  ( while sleep 50; do sudo -n true || exit; done ) & on_exit "kill $! 2>/dev/null"   # keep sudo's timestamp fresh
+  harness managed
+  local immutable_exit=1 immutable_wrote=no immutable_turn=blocked
+  [[ $(uname -s) == Darwin ]] || { immutable_exit=missing immutable_wrote=missing immutable_turn=missing; expect "immutable_skipped" "macos-only" "${SEEN[immutable_skipped]:-missing}"; }
+  expect_seen <<EOF
+# no managed file: the client hooks renew the expired JWT (control)
+none_turn1 ok
+none_turn1_jwt renewed
+# managed env ANTHROPIC_CUSTOM_HEADERS: expected to replace the user's value, so the JWT isn't sent
+headers_turn1_managed_header yes
+headers_turn1_jwt none
+headers_turn1 portkey
+# fleet layout: hooks from managed settings, JWT in the user file; the managed precheck renews the expired JWT
+fleet_turn1 ok
+fleet_turn1_jwt renewed
+fleet_turn2 ok
+# fleet layout, valid JWT, the client renews it between turns: the session picks up the new one
+fleetreload_turn1_jwt initial
+fleetreload_turn2 ok
+fleetreload_turn2_jwt renewed
+# allowManagedHooksOnly without managed hooks: user hooks don't run, so nothing renews the expired JWT
+hooksonly_user_hook_ran no
+hooksonly_turn1 portkey
+hooksonly_turn1_jwt initial
+# allowManagedHooksOnly with the client hooks in managed settings: user hooks don't run, the managed ones do
+hooksonlymanaged_user_hook_ran no
+hooksonlymanaged_turn1 ok
+hooksonlymanaged_turn1_jwt renewed
+# chmod 444 on settings.json: the client's atomic rename replaces the file anyway
+readonly_sync_exit 0
+readonly_sync_wrote yes
+readonly_turn1 ok
+# macOS immutable flag (chflags uchg): the client can't write; the precheck blocks
+immutable_sync_exit $immutable_exit
+immutable_sync_wrote $immutable_wrote
+immutable_turn1 $immutable_turn
+# proxyAuthHelper (EAP) in managed settings: expected not to reach the gateway (it's for a forward proxy)
+proxyauth_turn1 ok
+proxyauth_turn1_proxy_authorization no
 EOF
   finish; }
 

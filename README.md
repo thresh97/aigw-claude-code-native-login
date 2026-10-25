@@ -185,6 +185,7 @@ If the curl shows `Portkey Error: ...` (for example `Invalid API Key. Error Code
 | `gateway` | The real gateway, request by request: which failures are the gateway's, and passthrough works | gateway, JWT |
 | `live_login` | Real gateway and stored login: a refused JWT costs the OAuth loop; with the LB guard, sentinel and missing header fail at once | gateway, JWT, stored login |
 | `client_live` | The client for real: IdP (and broker) → JWT → gateway → Anthropic; the precheck replaces an expired JWT before the turn | everything, after `aigw-claude-auth login` |
+| `managed` | Managed settings next to the user's file: a managed `ANTHROPIC_CUSTOM_HEADERS` vs the user's JWT, hooks from managed settings, `allowManagedHooksOnly`, a read-only or immutable `settings.json`, `proxyAuthHelper` | Claude Code, sudo, no managed settings on the machine yet |
 
 ## 4. Teardown
 
@@ -276,6 +277,8 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
 4. `repro/run.sh all --yes` (or one scenario from `repro/run.sh list`). `stored_login`, `live_login` and `client_live` require `--yes` because they:
    - rotate the stored login at Anthropic (it stays valid);
    - replace the `settings.json` in `LOGIN_CONFIG_DIR` for the run, restoring it afterwards. Until then the original sits in `settings.json.repro-backup`, so if a run is killed, the next one restores it.
+
+   `managed` requires `--yes` and sudo. It writes the machine-wide managed-settings file for each case and removes it afterwards, and it refuses to run if one exists already. While it runs, other Claude Code sessions on the machine see each case's managed settings, so close them first. Its hooks only act in the scenario's own Claude Code processes.
 5. Read `repro/results/<date>-<scenario>/summary.txt`:
    - `PASS`: matches Findings.
    - `CHANGED`: Claude Code or the gateway now behaves differently. For example, if a 401 no longer loops for a stored login, the LB guard and the StopFailure hook matter less. If hook timeouts or the settings reload changed, the client needs updating.
