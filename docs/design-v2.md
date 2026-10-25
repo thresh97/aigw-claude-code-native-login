@@ -48,7 +48,7 @@ The helper manages one gateway credential in one header for Claude Code users wh
 - Verifying JWT signatures locally by default.
 - Cloud sessions in Anthropic-hosted environments, which read no device settings.
 - Gateway API keys (static `x-portkey-api-key` values). They need no client; the repo documents them as an alternative.
-- Claude desktop app (Code and Chat tabs) and Cowork. The app sends its Code sessions to `api.anthropic.com` whatever `ANTHROPIC_BASE_URL` the user or project settings say (finding 16), and per the docs it ignores managed settings for routing too. Its only gateway routes are Claude Desktop on 3P and the Claude apps gateway, and both replace the user's claude.ai login with an organization credential billed to the organization (docs). Organizations that want desktop traffic on the gateway use one of those; `aigw-claude-auth` adds little there, since both sign users in and refresh credentials themselves.
+- The client for the Claude desktop app (Chat, Cowork, Code tabs). The app ignores `ANTHROPIC_BASE_URL` from settings (finding 16), so this client can't route it. The Claude apps reach the gateway through Claude Desktop on 3P instead, billed to the organization: see [Claude apps (desktop, Cowork) through the gateway](#claude-apps-desktop-cowork-through-the-gateway).
 
 **Assumptions: what the repo settled and what is still open**
 
@@ -456,11 +456,38 @@ The tested fleet recipe from v1.1.1 is: hooks and `ANTHROPIC_BASE_URL` in Claude
 
 - First sign-in is interactive per user (made painless by the precheck's device code).
 - Unmanaged devices get no client: rely on the gateway rejecting them, or a manual install.
-- The desktop app and Cowork bypass the gateway with the user's own login (finding 16). Pin Claude Code to the gateway with managed `allowedProviders: ["customEndpoint"]` (Claude Code 2.1.285+, docs) and decide separately whether desktop and Cowork are allowed; cloud sessions read no device settings.
+- The desktop app signed in to claude.ai bypasses the gateway (finding 16); put desktop users on Claude Desktop on 3P to route them (organization billing). Pin Claude Code to the gateway with managed `allowedProviders: ["customEndpoint"]` (Claude Code 2.1.285+, docs) and decide separately whether desktop and Cowork are allowed; cloud sessions read no device settings.
 - SaaS gateway: no LB of yours in front, so hooks only (or mode 2), and `block_on_failure` stays `true`.
 - Observability: the client logs locally; a heartbeat to the gateway is an open idea.
 
 **Trial install.** `CLAUDE_CONFIG_DIR=~/.claude-aigw` with its own `/login` keeps an everyday Claude Code untouched, because `install` on the real settings file reroutes every running session within a second.
+
+## Claude apps (desktop, Cowork) through the gateway
+
+The Claude desktop app's Chat, Cowork and Code tabs don't take routing from Claude Code settings (finding 16). They reach an AI gateway through **Claude Desktop on 3P**, a deployment mode of the same app that sends all inference to a provider the organization configures. Everything in this section is from the docs ([Claude Desktop on 3P](https://claude.com/docs/third-party/claude-desktop/overview), [with an LLM gateway](https://claude.com/docs/third-party/claude-desktop/gateway), [credential helper](https://claude.com/docs/third-party/claude-desktop/credential-helper)), not from a run.
+
+**How it differs from the CLI passthrough**
+
+| | Claude Code CLI and IDE (this client) | Claude Desktop on 3P |
+| --- | --- | --- |
+| Routing | `ANTHROPIC_BASE_URL` in settings | `inferenceProvider: "gateway"` and `inferenceGatewayBaseUrl` in the app's managed configuration (macOS profile, Windows policy, local file, bootstrap server or admin console) |
+| Credential to the gateway | The user's claude.ai login in `Authorization`, the JWT in `x-portkey-api-key` | A gateway credential in `Authorization` (or `x-api-key`, `inferenceGatewayAuthScheme`); the claude.ai login isn't used. 3P mode replaces signing in to claude.ai, and signing in to claude.ai leaves 3P mode |
+| Who pays | The user's own plan, through the passthrough config | The organization: the gateway forwards with its own provider credential (Anthropic API key, Bedrock, Vertex, Foundry) |
+| Per-user identity at the gateway | The JWT's claims | SSO: `inferenceGatewayOidc` signs each user in with the IdP (Entra ID, Okta; refresh built in) and sends the IdP token as the bearer. Or `inferenceCredentialHelper`, an executable that prints a token or `{"token": ..., "headers": {...}}` |
+| Token problems | Hooks, sentinel, LB guard or proxy keep a gateway 401 from starting the OAuth loop | The app refreshes the credential before each turn and re-runs the helper when the gateway refuses it mid-session; there's no claude.ai login to loop on |
+| Extra headers | `ANTHROPIC_CUSTOM_HEADERS` | `inferenceCustomHeaders` (static, no secrets), or the helper's `headers` (per user, refreshed) |
+
+**What a gateway needs for it**
+
+- A config whose upstream uses the organization's provider credential, not the passthrough config (which forwards the caller's `authorization`). Mode A's `defaults.config_slug` / `config_id` claim, or the workspace default, selects it.
+- JWT validation for whatever reaches it. With `inferenceGatewayOidc` that's the IdP's own token in `Authorization: Bearer` (validate against the IdP's JWKS, `aud` = the desktop app's client ID): the gateway's Mode B shape. A gateway that reads `x-portkey-api-key` instead could get the JWT there through a credential helper's `headers`; whether the gateway accepts the JWT in `Authorization` is untested.
+- `cache_control` passed through, SSE streamed, and `GET /v1/models` (or `inferenceModels`) for the model list.
+
+**Where this client fits.** Little: the app signs users in and refreshes credentials itself. Recommend `inferenceGatewayOidc` (same IdP app registration pattern as the client's PKCE sign-in) and document the gateway config; don't ship `aigw-claude-auth` as a credential helper unless a gateway needs claims only the broker can mint (Mode A with Entra ID), in which case the helper would print the broker's JWT.
+
+**Alternative.** The Claude apps gateway (`claude gateway`, Anthropic's own) serves the CLI and the desktop app with SSO and per-group policy, also with an organization upstream credential and the claude.ai login set aside ([docs](https://code.claude.com/docs/en/claude-apps-gateway)). It replaces the AI gateway rather than sitting with it.
+
+**A fleet with both.** CLI users can keep their own plan through the passthrough while desktop users go through 3P on the organization's account; they're separate configs at the gateway and separate billing. Users can leave 3P by signing in to claude.ai unless `disableDeploymentModeChooser` is set, in which case the desktop app no longer reaches Anthropic directly.
 
 ## Open questions and verification spikes
 
@@ -472,7 +499,7 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S2 | Settings reread mid-session? | Answered: yes, about 1 s after rename | `headers` scenario guards it |
 | S3 | Managed versus user `env` for the same key? | Answered: managed replaces the user's whole value | `managed` scenario guards it |
 | S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Answered: unknown keys are ignored silently; `AIGW_*` in managed `env` reaches hooks and the Bash tool, managed wins per key; drop-ins merge in name order (finding 15) | `managed` scenario guards it |
-| S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Answered: the desktop app's Code sessions use `~/.claude`, apply settings `env` and run hooks, show a block reason as is, but keep `https://api.anthropic.com` whatever the user or project settings say (finding 16). Per the docs, desktop and Cowork route only through their third-party configuration, which replaces the claude.ai login; out of scope. The 401 and 498 questions don't arise | By hand, mock gateway |
+| S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Answered: the desktop app's Code sessions use `~/.claude`, apply settings `env` and run hooks, show a block reason as is, but keep `https://api.anthropic.com` whatever the user or project settings say (finding 16). Per the docs, desktop and Cowork route only through Claude Desktop on 3P, which replaces the claude.ai login with an organization credential (see Claude apps through the gateway). The 401 and 498 questions don't arise | By hand, mock gateway |
 | S6 | Do server-managed settings apply to users behind the gateway? | Open | Anthropic account team; pilot tenant |
 | S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Probe built (`repro/winprobe.py`, setup in `repro/WINDOWS.md`; plumbing checked on macOS), awaiting a Windows run | Run the probe on a Windows VM, then the Windows port of the offline scenarios |
 | S8 | SaaS gateway: Mode A only, `config_id`, hooks-only behavior | Open (reported, untested) | Run `gateway` and `live_login` scenarios against SaaS |
@@ -586,4 +613,14 @@ Where the tested repo and the earlier chat draft disagreed, the repo wins unless
 
 - [aigw-claude-code-native-login](https://github.com/thresh97/aigw-claude-code-native-login): README (findings 1 to 11, client reference, Not covered yet), `AGENTS.md`, `client/aigw_claude_auth.py` 1.1.1; commit `ca5ab19`, 2026-10-25.
 - [Claude Code settings](https://code.claude.com/docs/en/settings) and [managed settings](https://code.claude.com/docs/en/managed-settings): managed file paths, MDM policy locations, precedence.
+- [Other LLM gateways → Subscriptions and gateways](https://code.claude.com/docs/en/llm-gateway#subscriptions-and-gateways): with only `ANTHROPIC_BASE_URL` set, the saved claude.ai login stays the active credential and its billing applies; the gateway must forward the OAuth capability in `anthropic-beta`.
+- [Connect Claude Code to an LLM gateway → Desktop app](https://code.claude.com/docs/en/llm-gateway-connect#desktop-app): the desktop app reads gateway routing from its third-party inference configuration, not from `ANTHROPIC_BASE_URL` or `settings.json`.
+- [Roll out an LLM gateway → Distribute through managed settings](https://code.claude.com/docs/en/llm-gateway-rollout#distribute-through-managed-settings): the desktop app doesn't take gateway routing from managed settings; deploy its third-party configuration through MDM.
+- [Settings reference → allowedProviders](https://code.claude.com/docs/en/settings-reference#allowedproviders): `["customEndpoint"]` pins Claude Code to the managed `ANTHROPIC_BASE_URL` (2.1.285+).
+- [Claude Desktop on 3P: overview](https://claude.com/docs/third-party/claude-desktop/overview): 3P is a deployment mode; inference and billing by the configured provider; signing in to claude.ai leaves it.
+- [Claude Desktop on 3P with an LLM gateway](https://claude.com/docs/third-party/claude-desktop/gateway): `inferenceProvider: gateway`, `inferenceGatewayBaseUrl`, `inferenceGatewayOidc`, `inferenceCustomHeaders`.
+- [Claude Desktop on 3P: credential helper](https://claude.com/docs/third-party/claude-desktop/credential-helper): helper output formats, `CLAUDE_HELPER_CONTEXT`, caching and mid-session refresh.
+- [Claude Desktop on 3P: configuration reference](https://claude.com/docs/third-party/claude-desktop/configuration): every managed key, including `disableDeploymentModeChooser`.
+- [Claude Desktop on 3P: user identity and local data](https://claude.com/docs/third-party/claude-desktop/data-storage): with MDM, file or bootstrap configuration, users never sign in to Anthropic.
+- [Claude apps gateway](https://code.claude.com/docs/en/claude-apps-gateway): Anthropic's self-hosted gateway for the CLI and the desktop app; SSO, organization upstream credential, claude.ai login set aside.
 - Everything not attributed to the repo or the docs is design proposal, not a test result.
