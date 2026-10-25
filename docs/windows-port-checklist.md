@@ -14,7 +14,8 @@ on 2026-10-25. None of them has been tried on Windows yet. Line numbers are as o
   PowerShell 5.1, which Claude Code uses when Git for Windows is absent. Use a form that parses in both. Per the hooks docs
   (not run here): exec form (`"command": "<python.exe>", "args": [...]`) spawns the executable with no shell on any
   platform, which avoids quoting entirely; `command` must be a real `.exe`, not a `.cmd` shim. A per-hook
-  `shell: "bash" | "powershell"` field also exists. Try exec form on the VM first.
+  `shell: "bash" | "powershell"` field also exists. Run on the VM 2026-10-25 (`exec`, `exec_py3`, `shell_ps` in
+  `winprobe.py`): exec form works with and without Git for Windows. Decision: `install` writes exec form on Windows.
 - `:94`, `:100` default `~/.config` instead of `%APPDATA%`.
 - `:156-165` `mkdir(mode=0o700)` and `chmod` don't restrict access on Windows. Needs a user-only ACL.
 - Settings rename: retry `os.replace` on `PermissionError`. S7 saw none in 60 replacements (finding 17); keep a short retry.

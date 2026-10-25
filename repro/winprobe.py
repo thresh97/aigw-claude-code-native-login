@@ -318,7 +318,8 @@ def phase_basics(out):
 
 # ----------------------------------------------------------------------- hooks (S7.1)
 def hook_cases(py, script, wrapper):
-    """label -> (command, expected tail args or None, windows only). The tail is what follows `case=<label>`."""
+    """label -> (command, expected tail args or None, windows only[, extra hook fields]). The tail is what follows
+    `case=<label>`. Extra fields: `args` (exec form, no shell) or `shell`."""
     import shlex
     s, fwd, pyf = str(script), Path(script).as_posix(), Path(py).as_posix()
     plain = ["a b", "back\\slash"]
@@ -339,6 +340,10 @@ def hook_cases(py, script, wrapper):
         "wrapper": (f'"{wrapper}" "{s}" case=wrapper "a b" back\\slash', plain, False),
         "cmd_c": (f'cmd /d /c ""{py}" "{s}" case=cmd_c "a b" back\\slash"', plain, True),
         "powershell_c": (f"powershell -NoProfile -Command \"& '{py}' '{s}' case=powershell_c 'a b' 'back\\slash'\"", plain, True),
+        # Exec form: no shell on any platform, each element passed verbatim (hooks docs).
+        "exec": (py, plain + [f"${v}", f"%{v}%"], False, {"args": [s, "case=exec", *plain, f"${v}", f"%{v}%"]}),
+        "exec_py3": ("py", plain, True, {"args": ["-3", s, "case=exec_py3", *plain]}),
+        "shell_ps": (f"& '{py}' '{s}' case=shell_ps 'a b' 'back\\slash'", plain, True, {"shell": "powershell"}),
     }
 
 
@@ -364,8 +369,10 @@ def phase_hooks(out):
     for k in allcases.keys() - cases.keys():
         observe(f"hook_{k}_ran", "skipped (windows only)")
     claude.write_settings({"hooks": {"UserPromptSubmit": [{"hooks": [
-        {"type": "command", "command": c[0], "timeout": HOOK_TIMEOUT} for c in cases.values()]}]}})
-    (sub / "hook_commands.txt").write_text("".join(f"{k}\t{c[0]}\n" for k, c in cases.items()), encoding="utf-8")
+        {"type": "command", "command": c[0], "timeout": HOOK_TIMEOUT, **(c[3] if len(c) > 3 else {})}
+        for c in cases.values()]}]}})
+    (sub / "hook_commands.txt").write_text(
+        "".join(f"{k}\t{c[0]}{chr(9) + json.dumps(c[3]) if len(c) > 3 else ''}\n" for k, c in cases.items()), encoding="utf-8")
     try:
         claude.start(hook_events=True)
         observe("hooks_turn", harness.classify(claude.turn("hook matrix", timeout=180)["text"]))
@@ -377,7 +384,7 @@ def phase_hooks(out):
     (sub / "hook_events.jsonl").write_text("".join(e[:4000] + "\n" for e in events), encoding="utf-8")
     observe("hook_events_in_stream", len(events))
     seen = {}
-    for label, (cmd, want, _) in cases.items():
+    for label, (cmd, want, *_) in cases.items():
         f = dumps / f"{label}.json"
         if not f.exists():
             observe(f"hook_{label}_ran", "no")
