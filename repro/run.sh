@@ -285,7 +285,7 @@ turn_after_expiry_fast yes
 EOF
   finish; }
 
-describe_managed() { echo "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper. Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 5 min."; }
+describe_managed() { echo "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper; spike S4 (an unknown top-level key, AIGW_* in managed env, managed-settings.d/ drop-ins). Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Drop-in cases also write files in managed-settings.d/ (and remove them, and the directory if it created it). Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 8 min."; }
 scenario_managed() {
   guard managed "writes the machine-wide managed-settings file while it runs"
   sudo -v || { echo "ERROR: managed needs sudo"; exit 2; }
@@ -329,6 +329,37 @@ immutable_turn1 $immutable_turn
 # proxyAuthHelper (EAP) in managed settings: expected not to reach the gateway (it's for a forward proxy)
 proxyauth_turn1 ok
 proxyauth_turn1_proxy_authorization no
+# Spike S4. PREDICTIONS, not observations: the first run confirms or corrects them (a CHANGED verdict on these is expected
+# information, then update the expectation and write the finding in the README).
+# an unknown top-level key (aigwClaudeAuth) in managed-settings.json: predicted ignored; the rest of the file still applies
+unknownkey_turn1 ok
+unknownkey_base_url_from_managed yes
+unknownkey_hook_userprompt_ran yes
+unknownkey_hook_stopfailure_ran yes
+unknownkey_marker_in_hook_input no
+unknownkey_stderr_warning no
+unknownkey_stream_warning no
+# AIGW_* in managed env: predicted in the environment of hooks and of the Bash tool; managed wins over the user's same key
+# (as with ANTHROPIC_CUSTOM_HEADERS, finding 11), and the user's other AIGW_* key survives
+envkeys_base_url_from_managed yes
+envkeys_env_userprompt AIGW_HOOK_LOGIN=off,AIGW_ISSUER=managed-issuer,AIGW_USER_ONLY=user-only
+envkeys_env_stopfailure AIGW_HOOK_LOGIN=off,AIGW_ISSUER=managed-issuer,AIGW_USER_ONLY=user-only
+envkeys_env_bash AIGW_HOOK_LOGIN=off,AIGW_ISSUER=managed-issuer,AIGW_USER_ONLY=user-only
+envkeys_stderr_warning no
+# managed-settings.d/: predicted merged with managed-settings.json, files in name order, a later file wins on a conflicting key;
+# hooks for one event in different files all run
+dropin_base_url_from_managed yes
+dropin_hook_userprompt_ran yes
+dropin_hook_userprompt2_ran yes
+dropin_hook_stopfailure_ran yes
+dropin_env_userprompt AIGW_CONFLICT=dropin20,AIGW_FROM_10=a,AIGW_FROM_20=b,AIGW_FROM_MAIN=main
+dropin_env_stopfailure AIGW_CONFLICT=dropin20,AIGW_FROM_10=a,AIGW_FROM_20=b,AIGW_FROM_MAIN=main
+dropin_env_bash AIGW_CONFLICT=dropin20,AIGW_FROM_10=a,AIGW_FROM_20=b,AIGW_FROM_MAIN=main
+# a drop-in without managed-settings.json: predicted applied
+dropinonly_base_url_from_managed yes
+dropinonly_hook_userprompt_ran yes
+dropinonly_hook_stopfailure_ran yes
+dropinonly_env_userprompt AIGW_ONLY_DROPIN=yes
 EOF
   finish; }
 
