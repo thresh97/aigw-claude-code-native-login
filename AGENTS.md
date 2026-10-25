@@ -11,7 +11,7 @@ Guidance for coding agents running or changing this repo. Read README.md first.
   launchd agent.
 - **Gateway** (README 1.1, 1.2, manual): a passthrough config in a workspace, and optionally ALB listener rules in front
   of the gateway. Both are shared infrastructure: get the operator's go-ahead first.
-- **Offline scenarios** (`unit headers errors precheck stopfailure proxy`): local only. Throwaway HOME, config dir and fake
+- **Offline scenarios** (`unit headers errors precheck stopfailure proxy`; `run.sh` or `run.py`): local only. Throwaway HOME, config dir and fake
   IdP under the run's results dir; a mock gateway on 127.0.0.1. Dummy credentials only. `proxy` also starts
   `repro/proxy_prototype.py` on 127.0.0.1 (its token file is a fake JWT in a throwaway dir) and a mock gateway listening
   on a Unix socket in a throwaway dir.
@@ -69,5 +69,6 @@ Guidance for coding agents running or changing this repo. Read README.md first.
 - Hooks must finish well inside Claude Code's 30 s hook timeout, or Claude Code ignores their decision. Anything
   that does network I/O in a hook uses `hook_http_timeout`. Anything that waits for the user (the precheck's sign-in)
   runs in a detached process whose stdout is not the hook's: Claude Code reads the hook's stdout until it closes.
-- `repro/harness.py` drives Claude Code and prints `key=value` observations; `repro/run.sh` compares them with the
-  expected values. Changing an expectation means the Findings in the README change too.
+- `repro/harness.py` drives Claude Code and prints `key=value` observations; `repro/run.sh` (bash 4+) and `repro/run.py` (Python, also native Windows) compare them with the
+  expected values (the two runners carry the same expectations: change both). Changing an expectation means the Findings in
+  the README change too.

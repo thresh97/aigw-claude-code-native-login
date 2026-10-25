@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runs Claude Code against the mock (or relayed real) gateway and prints observations; run.sh judges them.
+"""Runs Claude Code against the mock (or relayed real) gateway and prints observations; run.sh / run.py judge them.
 
 Usage:  harness.py <scenario> --out DIR          (run.sh calls this; see `run.sh list`)
 
@@ -44,6 +44,7 @@ MODEL = os.environ.get("MODEL") or "claude-haiku-4-5"
 OAUTH = "sk-ant-oat01-mock"     # a dummy; what the mock gateway expects as the Anthropic login in Authorization
 PK = "x-portkey-api-key"
 SENTINEL = os.environ.get("SENTINEL") or "expired"
+IS_WIN = sys.platform == "win32"
 
 
 def observe(key, value):
@@ -59,6 +60,43 @@ def wait_until(cond, timeout=20, step=0.5):
             return False
         time.sleep(step)
     return True
+
+
+def try_chmod(path, mode):
+    """Best effort: on Windows chmod only sets the read-only flag, and a failure must not end a run."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def kill_tree(proc):
+    """Stop proc and its children. Windows has no process groups to signal: taskkill /T walks the tree, so files the
+    children hold open are released before the throwaway dirs are removed."""
+    if IS_WIN:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def rmtree(path):
+    """shutil.rmtree that retries on Windows, where a file a just-killed process held can stay locked for a moment."""
+    tries = 10 if IS_WIN else 1
+    for _ in range(tries):
+        shutil.rmtree(path, ignore_errors=True)
+        if not Path(path).exists():
+            return
+        time.sleep(0.5)
+
+
+def command_hook(argv, **extra):
+    """A hook entry for the command argv. Windows: exec form (command + args), which runs with no shell under both Git
+    Bash and PowerShell and passes the arguments verbatim (README finding 17). Elsewhere: one POSIX-quoted string."""
+    if IS_WIN:
+        return {"type": "command", "command": argv[0], "args": list(argv[1:]), **extra}
+    return {"type": "command", "command": " ".join(shlex.quote(a) for a in argv), **extra}
 
 
 def secs(t0):
@@ -81,10 +119,10 @@ class Gateway:
 
     def set(self, **kw):
         self.control.update(kw)
-        self.control_file.write_text(json.dumps(self.control))
+        self.control_file.write_text(json.dumps(self.control), encoding="utf-8")
 
     def messages(self, since=0):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        rows = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         return [r for r in rows if r["path"].split("?")[0].endswith("/v1/messages")][since:]
 
     def mark(self):
@@ -107,25 +145,29 @@ class Client:
 
     def configure(self, **kw):
         self.cfg.update(kw)
-        (self.dir / "config.json").write_text(json.dumps(self.cfg))
+        (self.dir / "config.json").write_text(json.dumps(self.cfg), encoding="utf-8")
 
     def sign_in(self):
         """What a finished `aigw-claude-auth login` leaves behind: a refresh token the IdP knows."""
-        (self.dir / "state.json").write_text(json.dumps({"refresh_token": self.idp.tokens()["refresh_token"]}))
-        os.chmod(self.dir / "state.json", 0o600)
+        (self.dir / "state.json").write_text(json.dumps({"refresh_token": self.idp.tokens()["refresh_token"]}), encoding="utf-8")
+        try_chmod(self.dir / "state.json", 0o600)
 
     def sign_out(self):
-        (self.dir / "state.json").write_text("{}")
+        (self.dir / "state.json").write_text("{}", encoding="utf-8")
 
     def run(self, *args, settings):
         env = dict(os.environ, AIGW_CLAUDE_AUTH_DIR=str(self.dir), AIGW_CLAUDE_SETTINGS=str(settings))
-        return subprocess.run([sys.executable, str(CLIENT), *args], env=env, capture_output=True, text=True, timeout=60)
+        return subprocess.run([sys.executable, str(CLIENT), *args], env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=60)
 
 
 class Claude:
     """Claude Code in a throwaway HOME/cwd. persistent(): one session fed turns over stream-json; oneshot(): `claude -p`."""
 
     CLEAN = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy")
+    # Windows: what a process needs to start and to find programs and temp files. The profile locations (USERPROFILE,
+    # APPDATA, LOCALAPPDATA) are throwaway, like HOME.
+    CLEAN_WIN = ("SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "ProgramFiles", "ProgramFiles(x86)",
+                 "ProgramW6432", "ProgramData", "CommonProgramFiles", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS")
 
     def __init__(self, out, base_url, config_dir=None, env=None):
         self.out = out
@@ -134,10 +176,15 @@ class Claude:
         self.config_dir.mkdir(exist_ok=True)
         (self.tmp / "cwd").mkdir()
         self.settings_file = self.config_dir / "settings.json"
-        self.env = {k: os.environ[k] for k in self.CLEAN if k in os.environ}
+        self.env = {k: os.environ[k] for k in self.CLEAN + (self.CLEAN_WIN if IS_WIN else ()) if k in os.environ}
         self.env.update(HOME=str(self.tmp), CLAUDE_CONFIG_DIR=str(self.config_dir), TERM="dumb", ANTHROPIC_MODEL=MODEL,
                         ANTHROPIC_BASE_URL=base_url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1",
                         DISABLE_TELEMETRY="1")
+        if IS_WIN:
+            appdata, local = self.tmp / "AppData" / "Roaming", self.tmp / "AppData" / "Local"
+            appdata.mkdir(parents=True)
+            local.mkdir(parents=True)
+            self.env.update(USERPROFILE=str(self.tmp), APPDATA=str(appdata), LOCALAPPDATA=str(local))
         if config_dir and sys.platform == "darwin":
             # a stored login on macOS is in the login Keychain, which is found through the real HOME
             self.env.update({k: os.environ[k] for k in ("HOME", "USER") if k in os.environ})
@@ -147,17 +194,17 @@ class Claude:
         self.args = []          # extra command-line arguments for start()
 
     def settings(self):
-        return json.loads(self.settings_file.read_text()) if self.settings_file.exists() else {}
+        return json.loads(self.settings_file.read_text(encoding="utf-8")) if self.settings_file.exists() else {}
 
     def write_settings(self, d):
-        self.settings_file.write_text(json.dumps(d, indent=2))
+        self.settings_file.write_text(json.dumps(d, indent=2), encoding="utf-8")
 
     def oneshot(self, prompt, timeout=420):
         t0 = time.time()
         try:
             p = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "json"], cwd=self.tmp / "cwd", env=self.env,
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
-            with open(self.out / "claude.oneshot.jsonl", "a") as f:
+                               stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
+            with open(self.out / "claude.oneshot.jsonl", "a", encoding="utf-8") as f:
                 f.write(p.stdout.strip() + "\n")
             j = json.loads(p.stdout or "{}")
         except (subprocess.TimeoutExpired, ValueError) as e:
@@ -167,7 +214,7 @@ class Claude:
     def start(self):
         cmd = [CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", *self.args]
         self.proc = subprocess.Popen(cmd, cwd=self.tmp / "cwd", env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=open(self.out / "claude.stderr.txt", "a"), text=True)
+                                     stderr=open(self.out / "claude.stderr.txt", "a", encoding="utf-8"), encoding="utf-8", errors="replace")
         threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout] and self.lines.put(None), daemon=True).start()
 
     def turn(self, prompt, timeout=420):
@@ -176,7 +223,7 @@ class Claude:
         self.proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n")
         self.proc.stdin.flush()
         result = None
-        with open(self.out / "claude.stream.jsonl", "a") as f:
+        with open(self.out / "claude.stream.jsonl", "a", encoding="utf-8") as f:
             while time.time() - t0 < timeout:
                 try:
                     line = self.lines.get(timeout=1)
@@ -203,11 +250,11 @@ class Claude:
                 self.proc.stdin.close()
                 self.proc.wait(timeout=20)
             except Exception:
-                self.proc.kill()
+                kill_tree(self.proc)
 
     def cleanup(self):
         self.stop()
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        rmtree(self.tmp)
 
 
 def fresh_jwt(lifetime=3600, **claims):
@@ -241,13 +288,27 @@ def classify(text):
 def capture_hook(out, label):
     """A hook command that appends its stdin (the hook payload) to out/hook.<label>.jsonl."""
     script = out / "capture_hook.py"
-    script.write_text("import sys\nwith open(sys.argv[1], 'a') as f:\n    f.write(sys.stdin.read().strip() + '\\n')\n")
-    return {"hooks": [{"type": "command", "command": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(out / f'hook.{label}.jsonl'))}"}]}
+    script.write_text("import sys\nwith open(sys.argv[1], 'a', encoding='utf-8') as f:\n    f.write(sys.stdin.read().strip() + '\\n')\n", encoding="utf-8")
+    return {"hooks": [command_hook([sys.executable, str(script), str(out / f"hook.{label}.jsonl")])]}
+
+
+def notify_command(out, note):
+    """The client's `notify` setting: a command that gets the message as its last argument and appends it to `note`.
+    POSIX: a #!/bin/sh script. Windows: a Python script, run as `python script note` with forward slashes so the
+    client's shlex.split of the setting keeps the paths whole."""
+    if IS_WIN:
+        script = out / "notify.py"
+        script.write_text("import sys\nwith open(sys.argv[1], 'a', encoding='utf-8') as f:\n    f.write(sys.argv[2] + '\\n')\n", encoding="utf-8")
+        return " ".join(f'"{Path(x).as_posix()}"' for x in (sys.executable, script, note))
+    script = out / "notify.sh"
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> {shlex.quote(str(note))}\n', encoding="utf-8")
+    script.chmod(0o755)
+    return str(script)
 
 
 def payloads(out, label):
     f = out / f"hook.{label}.jsonl"
-    return [json.loads(line) for line in f.read_text().splitlines() if line.strip()] if f.exists() else []
+    return [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()] if f.exists() else []
 
 
 def borrow_settings(settings_file):
@@ -255,16 +316,16 @@ def borrow_settings(settings_file):
     (settings.json.repro-backup), so a killed run can still be undone. A backup left by a killed run is the original."""
     backup = settings_file.with_name(settings_file.name + ".repro-backup")
     if not backup.exists():
-        data = {"existed": settings_file.exists(), "text": settings_file.read_text() if settings_file.exists() else ""}
-        with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:   # may hold a JWT
+        data = {"existed": settings_file.exists(), "text": settings_file.read_text(encoding="utf-8") if settings_file.exists() else ""}
+        with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:   # may hold a JWT
             json.dump(data, f)
     return backup
 
 
 def return_settings(settings_file, backup):
-    saved = json.loads(backup.read_text())
+    saved = json.loads(backup.read_text(encoding="utf-8"))
     if saved["existed"]:
-        settings_file.write_text(saved["text"])
+        settings_file.write_text(saved["text"], encoding="utf-8")
     else:
         settings_file.unlink(missing_ok=True)
     backup.unlink()
@@ -274,12 +335,12 @@ def cred_state(config_dir):
     """A stored `claude login`, reduced to hashes and the expiry (never the tokens)."""
     f = Path(config_dir) / ".credentials.json"
     if f.exists():
-        o = json.loads(f.read_text()).get("claudeAiOauth", {})
+        o = json.loads(f.read_text(encoding="utf-8")).get("claudeAiOauth", {})
     elif sys.platform == "darwin":
         # macOS keeps it in the login Keychain; with CLAUDE_CONFIG_DIR the item's service name ends in the first 8 hex
         # of sha256(the config dir path)
         service = "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
-        r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"], capture_output=True, encoding="utf-8", errors="replace", timeout=10)
         if r.returncode != 0 or not r.stdout.strip():
             return {"exists": False}
         o = json.loads(r.stdout).get("claudeAiOauth", {})
@@ -397,7 +458,7 @@ def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="exp
                                    else "sentinel" if sent == mock_gateway.fingerprint(SENTINEL) else "renewed")
             obs[f"turn{i}_seconds"] = t["seconds"]
             if hook_login == "device" and i == 1:
-                stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+                stream = (out / "claude.stream.jsonl").read_text(encoding="utf-8") if (out / "claude.stream.jsonl").exists() else ""
                 obs["code_in_message"] = "yes" if "ABCD-EFGH" in stream and "/activate" in stream else "no"
                 obs["device_flows"] = sum(1 for c in idp.calls if c[1] == "/device")
                 idp.device_pending = 0                     # the user enters the code; the background process finishes
@@ -405,7 +466,7 @@ def precheck_session(out, idp_up=True, signed_in=True, hook_wait=3, initial="exp
                 obs["signed_in_in_background"] = "yes" if done else "no"
                 time.sleep(2)                              # Claude Code reloads the settings about 1 s after the write
         obs["settings_value"] = "sentinel" if header_of(claude.settings()) == SENTINEL else "jwt"
-        stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+        stream = (out / "claude.stream.jsonl").read_text(encoding="utf-8") if (out / "claude.stream.jsonl").exists() else ""
         obs["block_message"] = "yes" if "blocked by hook" in stream and "AI gateway" in stream else "no"
     finally:
         claude.cleanup(), gw.close()
@@ -438,10 +499,7 @@ def scenario_stopfailure(out):
     gw, idp = Gateway(out), FakeIdP()
     claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
     note = out / "notifications.txt"
-    notify = out / "notify.sh"
-    notify.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> {shlex.quote(str(note))}\n')
-    notify.chmod(0o755)
-    client = Client(claude.tmp, idp, notify=str(notify))
+    client = Client(claude.tmp, idp, notify=notify_command(out, note))
     claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
     try:
         client.sign_in()
@@ -452,9 +510,9 @@ def scenario_stopfailure(out):
         gw.set(revoked=[mock_gateway.fingerprint(bad)])
         t = claude.turn("the gateway now refuses this JWT")
         observe("refused_turn", classify(t["text"]))
-        wait_until(lambda: header_of(claude.settings()) not in (bad, "") and note.exists() and "renewed" in note.read_text())
+        wait_until(lambda: header_of(claude.settings()) not in (bad, "") and note.exists() and "renewed" in note.read_text(encoding="utf-8"))
         observe("jwt_replaced", "yes" if header_of(claude.settings()) not in (bad, "") else "no")
-        observe("notified", "renewed" if note.exists() and "renewed" in note.read_text() else "no")
+        observe("notified", "renewed" if note.exists() and "renewed" in note.read_text(encoding="utf-8") else "no")
         time.sleep(2)
         observe("retry_turn", classify(claude.turn("retry")["text"]))
         cur = header_of(claude.settings())
@@ -497,7 +555,7 @@ def scenario_stored_login(out):
     finally:
         claude.stop()
         return_settings(claude.settings_file, backup)
-        shutil.rmtree(claude.tmp, ignore_errors=True)
+        rmtree(claude.tmp)
         gw.close()
 
 
@@ -509,7 +567,7 @@ class Proxy:
         self.log.touch()
         self.dir = Path(tempfile.mkdtemp(prefix="aigw-proxy-"))     # the token file stays out of the results dir
         self.token_file = self.dir / "gateway.token"
-        self.srv = proxy_prototype.serve(self.token_file, upstream, log=open(self.log, "a"))
+        self.srv = proxy_prototype.serve(self.token_file, upstream, log=open(self.log, "a", encoding="utf-8"))
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
 
     def set_token(self, value):
@@ -517,10 +575,10 @@ class Proxy:
         if value is None:
             self.token_file.unlink(missing_ok=True)
         else:
-            self.token_file.write_text(value)
+            self.token_file.write_text(value, encoding="utf-8")
 
     def rows(self, since=0):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        rows = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         return [r for r in rows if r["path"].endswith("/v1/messages")][since:]
 
     def mark(self):
@@ -528,7 +586,7 @@ class Proxy:
 
     def close(self):
         self.srv.shutdown()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        rmtree(self.dir)
 
 
 class UnixGateway:
@@ -551,18 +609,18 @@ class UnixGateway:
         self.log = out / "gateway.unix.log.jsonl"
         self.log.touch()
         ctl = out / "gateway.unix.control.json"
-        ctl.write_text(json.dumps({"oauth": OAUTH}))
+        ctl.write_text(json.dumps({"oauth": OAUTH}), encoding="utf-8")
         self.srv = self.Server(self.path, mock_gateway.make_handler(str(self.log), str(ctl)))
         self.srv.handle_error = lambda *a: None
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
     def messages(self):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        rows = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         return [r for r in rows if r["path"].split("?")[0].endswith("/v1/messages")]
 
     def close(self):
         self.srv.shutdown()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        rmtree(self.dir)
 
 
 def socket_try(out, name, good, base_url, env=None, settings_env=None, timeout=15):
@@ -674,6 +732,8 @@ def scenario_proxy(out):
     finally:
         proxy.close()
         gw.close()
+    if IS_WIN:
+        return        # S11 needs AF_UNIX, which Windows Python lacks; run.py reports the socket_* expectations as SKIP (windows)
     # --- S11: can Claude Code reach a Unix socket? A plain-HTTP listener on a socket stands in for the gateway.
     good = fresh_jwt()
     tries = [
@@ -733,7 +793,7 @@ def scenario_stored_login_proxy(out):
     finally:
         claude.stop()
         return_settings(claude.settings_file, backup)
-        shutil.rmtree(claude.tmp, ignore_errors=True)
+        rmtree(claude.tmp)
         proxy.close()
         gw.close()
 
@@ -747,8 +807,10 @@ def tamper(token):
 
 def live_token():
     """A valid gateway JWT from TOKEN_COMMAND (default: the client's `token`)."""
-    cmd = os.environ.get("TOKEN_COMMAND") or f"{shlex.quote(sys.executable)} {shlex.quote(str(CLIENT))} token"
-    p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+    # shell=True: /bin/sh on POSIX, cmd.exe on Windows (double quotes and %VAR%; single quotes do not quote there)
+    argv = [sys.executable, str(CLIENT), "token"]
+    cmd = os.environ.get("TOKEN_COMMAND") or (subprocess.list2cmdline(argv) if IS_WIN else " ".join(shlex.quote(a) for a in argv))
+    p = subprocess.run(cmd, shell=True, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
     if p.returncode != 0 or p.stdout.count(".") != 2:
         sys.exit(f"TOKEN_COMMAND failed (exit {p.returncode}): {p.stderr.strip()[:200]}")
     return p.stdout.strip()
@@ -773,7 +835,7 @@ def gateway_request(token, oauth=None, extra=None):
 
 
 def stored_access_token():
-    o = json.loads((Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser() / ".credentials.json").read_text()).get("claudeAiOauth", {})
+    o = json.loads((Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser() / ".credentials.json").read_text(encoding="utf-8")).get("claudeAiOauth", {})
     return o.get("accessToken", "")
 
 
@@ -790,7 +852,7 @@ def scenario_gateway(out):
         cases.append(("valid_real_login", tok, oauth))
     for name, t, o in cases:
         status, body, hdrs = gateway_request(t, o if o != "x" else "sk-ant-oat01-invalid")
-        (out / f"gateway.{name}.txt").write_text(f"{status}\n{body[:600]}\n")
+        (out / f"gateway.{name}.txt").write_text(f"{status}\n{body[:600]}\n", encoding="utf-8")
         who = classify(body)
         if status == 200:
             who = "reply"
@@ -813,7 +875,7 @@ def scenario_live_login(out):
         cases += [("sentinel", SENTINEL), ("missing", None)]
     try:
         for name, t in cases:
-            s = {k: v for k, v in json.loads(json.loads(backup.read_text())["text"] or "{}").items() if k not in ("env", "hooks")}
+            s = {k: v for k, v in json.loads(json.loads(backup.read_text(encoding="utf-8"))["text"] or "{}").items() if k not in ("env", "hooks")}
             s["env"] = {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {t}"} if t is not None else {}
             claude.write_settings(s)
             b = cred_state(cfg)
@@ -829,7 +891,7 @@ def scenario_live_login(out):
             observe(f"{name}_login_still_valid", "yes" if login_valid(a) else "no")
     finally:
         return_settings(claude.settings_file, backup)
-        shutil.rmtree(claude.tmp, ignore_errors=True)
+        rmtree(claude.tmp)
         gw.close()
 
 
@@ -842,12 +904,12 @@ def scenario_client_live(out):
     env = dict(os.environ, AIGW_CLAUDE_SETTINGS=str(settings_file))
     # Claude Code runs with a throwaway HOME, so tell the hooks where the client's config and sign-in live.
     env.setdefault("AIGW_CLAUDE_AUTH_DIR", str(Path.home() / ".config" / "aigw-claude-auth"))
-    run = lambda *a: subprocess.run([sys.executable, str(CLIENT), *a], env=env, capture_output=True, text=True, timeout=120)
+    run = lambda *a: subprocess.run([sys.executable, str(CLIENT), *a], env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
     gw = Gateway(out, upstream=os.environ["GATEWAY_URL"])
     claude = Claude(out, gw.url, config_dir=cfg, env={"AIGW_CLAUDE_AUTH_DIR": env["AIGW_CLAUDE_AUTH_DIR"]})
     try:
         st = run("status")
-        (out / "client.status.txt").write_text(st.stdout + st.stderr)
+        (out / "client.status.txt").write_text(st.stdout + st.stderr, encoding="utf-8")
         observe("signed_in", "yes" if any(l.split()[:3] == ["signed", "in", "yes"] for l in st.stdout.splitlines()) else "no")
         r = run("install", "--base-url", gw.url)
         observe("install_exit", r.returncode)
@@ -868,7 +930,7 @@ def scenario_client_live(out):
         observe("turn_after_expiry_fast", "yes" if t["seconds"] < 30 else f"no ({t['seconds']}s)")
     finally:
         return_settings(settings_file, backup)
-        shutil.rmtree(claude.tmp, ignore_errors=True)
+        rmtree(claude.tmp)
         gw.close()
 
 
@@ -895,14 +957,14 @@ class Managed:
         """d: the managed-settings.json content (None: no such file); dropins: {file name: content} for managed-settings.d/."""
         if d is not None:
             src = self.out / "managed-settings.json"
-            src.write_text(json.dumps(d, indent=2))
+            src.write_text(json.dumps(d, indent=2), encoding="utf-8")
             self.sudo("install", "-m", "644", str(src), str(self.file))       # root-owned, like an MDM-deployed file
         for name, content in (dropins or {}).items():
             if not self.dropin.is_dir():
                 self.sudo("mkdir", "-p", str(self.dropin))
                 self.made_dropin = True
             src = self.out / f"dropin.{name}"
-            src.write_text(json.dumps(content, indent=2))
+            src.write_text(json.dumps(content, indent=2), encoding="utf-8")
             self.sudo("install", "-m", "644", str(src), str(self.dropin / name))
             self.dropin_files.append(name)
 
@@ -977,7 +1039,7 @@ def managed_session(out, managed, managed_settings, user_hooks=True, capture=Fal
                 client.run("sync", "--force", settings=claude.settings_file)    # a renewal mid-session, managed file present
                 time.sleep(3)
         obs["user_hook_ran"] = "yes" if payloads(out, "user") else "no"
-        stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+        stream = (out / "claude.stream.jsonl").read_text(encoding="utf-8") if (out / "claude.stream.jsonl").exists() else ""
         obs["block_message"] = "yes" if "blocked by hook" in stream and "AI gateway" in stream else "no"
     finally:
         if lock == "immutable" and sys.platform == "darwin":
@@ -999,7 +1061,7 @@ except ValueError:
     keys = []
 # only AIGW_* variables are read from the environment, and only these are written
 env = {{k: v for k, v in os.environ.items() if k.startswith("AIGW_") and k != "AIGW_REPRO_MANAGED"}}
-with open(sys.argv[1], "a") as f:
+with open(sys.argv[1], "a", encoding="utf-8") as f:
     f.write(json.dumps({{"aigw_env": env, "input_keys": keys, "marker_in_input": "aigwClaudeAuth" in raw or "{S4_MARKER}" in raw}}) + "\\n")
 '''
 
@@ -1009,7 +1071,7 @@ def s4_hook(out, event, label):
     environment, the top-level key names of its input JSON, and whether the unknown key's value is in that input.
     Goes to out/hookenv.<label>.jsonl."""
     script = out / "s4_hook.py"
-    script.write_text(S4_HOOK_SCRIPT)
+    script.write_text(S4_HOOK_SCRIPT, encoding="utf-8")
     cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(out / f'hookenv.{label}.jsonl'))}"
     return {event: [{"hooks": [{"type": "command", "command": Managed.guarded(cmd), "timeout": 30}]}]}
 
@@ -1044,7 +1106,7 @@ def s4_specs(out, url2):
 
 def records(out, label):
     f = out / f"hookenv.{label}.jsonl"
-    return [json.loads(line) for line in f.read_text().splitlines() if line.strip()] if f.exists() else []
+    return [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()] if f.exists() else []
 
 
 def s4_session(out, managed, name):
@@ -1085,12 +1147,12 @@ def s4_session(out, managed, name):
         obs["hook_input_keys"] = ",".join(up[0]["input_keys"]) if up else "no-hook"
         obs["marker_in_hook_input"] = "yes" if any(r["marker_in_input"] for r in up + records(out, "stopfailure")) else "no"
         bash = out / "bash.env"
-        obs["env_bash"] = fmt(dict(l.split("=", 1) for l in bash.read_text().splitlines())) if bash.exists() else "no-bash"
-        err = (out / "claude.stderr.txt").read_text() if (out / "claude.stderr.txt").exists() else ""
+        obs["env_bash"] = fmt(dict(l.split("=", 1) for l in bash.read_text(encoding="utf-8").splitlines())) if bash.exists() else "no-bash"
+        err = (out / "claude.stderr.txt").read_text(encoding="utf-8") if (out / "claude.stderr.txt").exists() else ""
         warn = [l for l in err.splitlines() if re.search(r"settings|managed|invalid|unknown|unrecogni[sz]ed", l, re.I)]
-        (out / "warnings.txt").write_text("\n".join(warn) + "\n")
+        (out / "warnings.txt").write_text("\n".join(warn) + "\n", encoding="utf-8")
         obs["stderr_warning"] = "yes" if warn else "no"
-        stream = (out / "claude.stream.jsonl").read_text() if (out / "claude.stream.jsonl").exists() else ""
+        stream = (out / "claude.stream.jsonl").read_text(encoding="utf-8") if (out / "claude.stream.jsonl").exists() else ""
         obs["stream_warning"] = "yes" if re.search(r"Invalid (managed )?settings|Settings (validation )?(error|warning)|unrecogni[sz]ed key", stream, re.I) else "no"
     finally:
         managed.clear()

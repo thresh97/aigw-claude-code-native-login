@@ -66,3 +66,40 @@ Read `hook_<form>_as_intended=no` with the `_argv` next to it: for `back\slash` 
 expansion, and `$WINPROBE_VAR` expanding means a POSIX shell or PowerShell.
 
 To build the VM with Terraform on Azure, see `infra/windows-test-vm/README.md`.
+
+## Running the offline scenarios: `run.py`
+
+`repro/run.py` is the cross-platform runner (same scenario names, expectations, verdicts and results layout as `run.sh`,
+which needs bash 4+). It needs only Python 3.8+ (`py -3`), Claude Code on `PATH` (or `CLAUDE_BIN`), and the repo's `repro\` and
+`client\` directories. The offline scenarios need no `repro\env`: if the file is missing, defaults are used (copy
+`env.example` to `env` only for the live scenarios). From `cmd.exe` or Windows PowerShell, in the repo root:
+
+```
+py -3 repro\run.py list
+py -3 repro\run.py check
+py -3 repro\run.py unit
+py -3 repro\run.py headers
+py -3 repro\run.py errors
+py -3 repro\run.py precheck
+py -3 repro\run.py stopfailure
+py -3 repro\run.py proxy
+```
+
+Results go to `repro\results\<date>-<scenario>\` (`summary.txt`, `run.log`, `detail\`). The verdict line is `PASS`, `CHANGED`
+or `ERROR`; the exit code is 0 for PASS and CHANGED, 1 for ERROR (as `run.sh`).
+
+What differs on Windows:
+
+- The harness gives Claude Code a clean environment: `PATH`, `SystemRoot`, `ComSpec`, `PATHEXT`, `TEMP`, `TMP` and a few
+  more system variables from yours, and throwaway `HOME`, `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` under a temp dir. Your
+  Claude Code settings and login are not used.
+- Hook and notify commands that the harness writes itself use the exec form (`command` plus `args`, no shell). The
+  client's own hook entries come from `install` and need the client's Windows port.
+- The proxy scenario's Unix-socket cases (spike S11, the `socket_*` expectations) cannot run: Windows Python has no
+  `AF_UNIX`. They show as `SKIP (windows)` lines and do not count as differences; the summary says how many were skipped.
+- `managed` needs sudo and the POSIX managed-settings locations; on Windows it ends with the verdict `SKIP (windows)`.
+- The live scenarios (`gateway`, `stored_login`, `stored_login_proxy`, `live_login`, `client_live`) are ported but not run
+  on Windows yet. `TOKEN_COMMAND` runs through `cmd.exe` there: use double quotes and `%VAR%`; single quotes do not quote.
+  Paths in `repro\env` can use either slash.
+- Until the client's Windows port is merged, `import fcntl` in the client fails, so every scenario that imports the client
+  (all of them via the harness, and `unit`) stops at once with `ERROR`. Do not work around it in the runner.
