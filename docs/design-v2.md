@@ -39,7 +39,7 @@ The helper manages one gateway credential in one header for Claude Code users wh
 - Claude Code CLI, interactive and `claude -p` (both run the hooks).
 - macOS and Linux (v1.1.1 today), native Windows (v2). WSL is Linux and already works.
 - Hybrid gateway with or without the optional load-balancer guard; SaaS gateway with hooks only.
-- Claude desktop app and Cowork, once the open questions about their config dir, hooks and base URL are answered.
+- The passthrough model is the one Anthropic documents for Claude Code: with only `ANTHROPIC_BASE_URL` set, "a saved claude.ai login remains the active credential, so its usage limits and billing apply", and the gateway must forward the OAuth capability in `anthropic-beta` (Claude Code docs, [Other LLM gateways → Subscriptions and gateways](https://code.claude.com/docs/en/llm-gateway#subscriptions-and-gateways); docs, not a run).
 
 **Non-goals**
 
@@ -48,6 +48,7 @@ The helper manages one gateway credential in one header for Claude Code users wh
 - Verifying JWT signatures locally by default.
 - Cloud sessions in Anthropic-hosted environments, which read no device settings.
 - Gateway API keys (static `x-portkey-api-key` values). They need no client; the repo documents them as an alternative.
+- Claude desktop app (Code and Chat tabs) and Cowork. The app sends its Code sessions to `api.anthropic.com` whatever `ANTHROPIC_BASE_URL` the user or project settings say (finding 16), and per the docs it ignores managed settings for routing too. Its only gateway routes are Claude Desktop on 3P and the Claude apps gateway, and both replace the user's claude.ai login with an organization credential billed to the organization (docs). Organizations that want desktop traffic on the gateway use one of those; `aigw-claude-auth` adds little there, since both sign users in and refresh credentials themselves.
 
 **Assumptions: what the repo settled and what is still open**
 
@@ -57,7 +58,7 @@ The helper manages one gateway credential in one header for Claude Code users wh
 | A2 | Claude Code rereads `ANTHROPIC_CUSTOM_HEADERS` when the settings file changes | Confirmed, about 1 s after an atomic rename | Finding 7 |
 | A3 | A managed value wins over the user value for the same `env` key | Confirmed: managed `ANTHROPIC_CUSTOM_HEADERS` replaces the user's whole value | Finding 11 |
 | A4 | Unknown top-level keys in managed settings are stripped | Confirmed tolerated: ignored without a warning, the rest of the file applies; `AIGW_*` in managed `env` reaches hooks, managed wins per key; `managed-settings.d/` merges, later file wins | Finding 15 |
-| A5 | Desktop app and Cowork honor the user settings file, hooks or `ANTHROPIC_BASE_URL` | Open | Repo "Not covered yet"; spike S5 |
+| A5 | Desktop app and Cowork honor the user settings file, hooks or `ANTHROPIC_BASE_URL` | **Partly wrong**: the desktop app's Code sessions read `~/.claude`, apply settings `env` and run hooks, but ignore `ANTHROPIC_BASE_URL` from settings; desktop and Cowork route only through their own third-party configuration | Finding 16; Claude Desktop on 3P docs |
 | A6 | The gateway validates the JWT in a custom header | Confirmed for the hybrid gateway, Mode A with Entra ID and a broker | Findings 1 and 2 |
 | A7 | A gateway 401 is harmless to the client | **Wrong** | A stored login treats it as its own expired Anthropic login: 13 attempts over about 4 minutes (finding 3). See Gateway failure handling |
 
@@ -140,7 +141,7 @@ v2 keeps v1.1.1's per-user config file and strict key set, and adds the ability 
 **Rules**
 
 - Never put `ANTHROPIC_CUSTOM_HEADERS` in managed settings in file mode: it replaces the user's whole value, so the JWT is not sent (finding 11).
-- Ship `ANTHROPIC_BASE_URL` and the hooks in managed settings for fleets (`install --print` produces the snippet), and keep the JWT in the user's file (`install --no-hooks`).
+- Ship `ANTHROPIC_BASE_URL` and the hooks in managed settings for fleets (`install --print` produces the snippet), and keep the JWT in the user's file (`install --no-hooks`). Add `allowedProviders: ["customEndpoint"]` so Claude Code refuses any other base URL (Claude Code 2.1.285+, docs, not yet run).
 - The user's `settings.json` must stay replaceable by the user: mode 444 is fine because the client renames over it; an immutable flag (`chflags uchg`) is not, and v1.1.1 blocks the prompt with the error.
 - One background process serves one settings file. Run one per `CLAUDE_CONFIG_DIR`, or let the hooks handle the others.
 
@@ -178,7 +179,7 @@ Mode 1 is what v1.1.1 ships: a small background daemon keeps the JWT in the user
 **Limits**
 
 - The JWT sits in the settings file at mode 600, like Claude Code's own credentials file. It is short-lived; the long-lived secret is the refresh token.
-- Only clients that reread the user settings file benefit; desktop app and Cowork are open (spike S5).
+- Only Claude Code clients that honor `ANTHROPIC_BASE_URL` from settings benefit: the CLI and the IDE extensions. The desktop app and Cowork don't (finding 16; out of scope).
 
 ## Mode 2: local injecting proxy (new in v2)
 
@@ -218,7 +219,7 @@ Proposed for the prototype: loopback TCP bound to `127.0.0.1` only, documented a
 - Stdlib is enough for a prototype (`http.server` with threads, or `asyncio` with `http.client`); verify chunked and SSE pass-through under load first.
 - Keep TLS verification to the gateway; honor the system CA store and proxy settings.
 - Log status, latency and token fingerprint only, never bodies.
-- Desktop app and Cowork coverage depends on them honoring `ANTHROPIC_BASE_URL` (spike S5).
+- The desktop app and Cowork can't use the proxy: they ignore `ANTHROPIC_BASE_URL` from settings (finding 16).
 
 ## Auth flows, token sources and IdP profiles
 
@@ -330,6 +331,7 @@ v2 picks the sign-in method from an explicit, overridable order, remembers what 
 | `block_on_failure: false` against a SaaS gateway | Error | Sentinel then gets a 401 and the OAuth loop |
 | Sentinel empty, or does not match the documented LB rule | Error / Info | An empty header cannot be told from a missing one; LB rule cannot be read locally |
 | Managed `apiKeyHelper` or API-key / auth-token env var | Warning | Replaces the Anthropic login the passthrough relies on |
+| Managed `allowedProviders` doesn't pin `customEndpoint` with the managed `ANTHROPIC_BASE_URL` (fleet installs) | Info | A user can point Claude Code at Anthropic directly and bypass the gateway; `allowedProviders: ["customEndpoint"]` refuses that (Claude Code 2.1.285+, docs) |
 | Mode, issuer, client ID or header differ between managed and local config | Error | Ambiguous intent, wrong audience |
 | Current JWT's `iss`, `aud` or Mode A claims differ from configuration | Error | Gateway will refuse it |
 | Refresh token stored in a file while `secret_store` is `auto` and a store is available | Warning | Migration incomplete |
@@ -454,7 +456,7 @@ The tested fleet recipe from v1.1.1 is: hooks and `ANTHROPIC_BASE_URL` in Claude
 
 - First sign-in is interactive per user (made painless by the precheck's device code).
 - Unmanaged devices get no client: rely on the gateway rejecting them, or a manual install.
-- Cowork with a full VM sandbox sees no device policy; cloud sessions read none.
+- The desktop app and Cowork bypass the gateway with the user's own login (finding 16). Pin Claude Code to the gateway with managed `allowedProviders: ["customEndpoint"]` (Claude Code 2.1.285+, docs) and decide separately whether desktop and Cowork are allowed; cloud sessions read no device settings.
 - SaaS gateway: no LB of yours in front, so hooks only (or mode 2), and `block_on_failure` stays `true`.
 - Observability: the client logs locally; a heartbeat to the gateway is an open idea.
 
@@ -470,7 +472,7 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S2 | Settings reread mid-session? | Answered: yes, about 1 s after rename | `headers` scenario guards it |
 | S3 | Managed versus user `env` for the same key? | Answered: managed replaces the user's whole value | `managed` scenario guards it |
 | S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Answered: unknown keys are ignored silently; `AIGW_*` in managed `env` reaches hooks and the Bash tool, managed wins per key; drop-ins merge in name order (finding 15) | `managed` scenario guards it |
-| S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Open | Mock gateway plus each app |
+| S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Answered: the desktop app's Code sessions use `~/.claude`, apply settings `env` and run hooks, show a block reason as is, but keep `https://api.anthropic.com` whatever the user or project settings say (finding 16). Per the docs, desktop and Cowork route only through their third-party configuration, which replaces the claude.ai login; out of scope. The 401 and 498 questions don't arise | By hand, mock gateway |
 | S6 | Do server-managed settings apply to users behind the gateway? | Open | Anthropic account team; pilot tenant |
 | S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Probe built (`repro/winprobe.py`, setup in `repro/WINDOWS.md`; plumbing checked on macOS), awaiting a Windows run | Run the probe on a Windows VM, then the Windows port of the offline scenarios |
 | S8 | SaaS gateway: Mode A only, `config_id`, hooks-only behavior | Open (reported, untested) | Run `gateway` and `live_login` scenarios against SaaS |
