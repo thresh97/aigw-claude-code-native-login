@@ -472,7 +472,7 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Open | Extend `managed` scenario |
 | S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Open | Mock gateway plus each app |
 | S6 | Do server-managed settings apply to users behind the gateway? | Open | Anthropic account team; pilot tenant |
-| S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Open | Windows port of the offline scenarios |
+| S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Probe built (`repro/winprobe.py`, setup in `repro/WINDOWS.md`; plumbing checked on macOS), awaiting a Windows run | Run the probe on a Windows VM, then the Windows port of the offline scenarios |
 | S8 | SaaS gateway: Mode A only, `config_id`, hooks-only behavior | Open (reported, untested) | Run `gateway` and `live_login` scenarios against SaaS |
 | S9 | Mode B (plain IdP token, hybrid only) | Open | `client_live` with an empty `broker_url` |
 | S10 | Okta, Keycloak and Ping profiles, including Mode A claims straight from the IdP | Open | `client_live` per IdP; Keycloak in Docker for CI |
