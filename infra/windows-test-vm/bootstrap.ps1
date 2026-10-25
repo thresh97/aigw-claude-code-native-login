@@ -1,4 +1,4 @@
-# Runs as SYSTEM via CustomScriptExtension. Terraform prepends $PublicKeyB64 and $SshDefaultShell.
+# Runs as SYSTEM via CustomScriptExtension from custom_data. Terraform prepends $PublicKeyB64 and $SshDefaultShell.
 # Idempotent. Logs to C:\ProgramData\aigw-bootstrap\bootstrap.log; never logs the key.
 $ErrorActionPreference = 'Stop'
 $logDir = 'C:\ProgramData\aigw-bootstrap'
@@ -24,6 +24,9 @@ try {
       -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
     Log 'firewall rule created'
   } else { Log 'firewall rule exists' }
+  # The capability creates the rule for the Private profile only; Azure NICs are on Public.
+  Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Profile Any -Enabled True
+  Log 'firewall rule set to all profiles'
 
   $key = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($PublicKeyB64)).Trim()
   $akFile = 'C:\ProgramData\ssh\administrators_authorized_keys'

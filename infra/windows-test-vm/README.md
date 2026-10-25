@@ -76,18 +76,21 @@ If your IP changes, re-run apply with the new `allowed_source_cidrs`.
 
 ## What the bootstrap does
 
-`bootstrap.ps1` runs once as SYSTEM through the CustomScriptExtension. It is gzipped and base64-encoded into the
-extension's `protected_settings` (not shown in the portal or extension status), together with the public key. It:
+`bootstrap.ps1`, with the public key prepended, is passed as the VM's `custom_data` (Azure writes it to
+`C:\AzureData\CustomData.bin`). The CustomScriptExtension copies it to a `.ps1` and runs it once as SYSTEM with `-File`.
+An earlier version gzipped and base64-encoded it into `-Command` with `Invoke-Expression`. Defender killed that as
+`Behavior:Win32/PShellCobStager.A`, while the extension still reported success. The script:
 
 - installs the `OpenSSH.Server` Windows capability, sets `sshd` to Automatic and starts it, ensures the firewall rule
-  for TCP 22;
+  for TCP 22 and opens it for all profiles (the capability's own rule covers only Private; Azure NICs are on Public);
 - writes the key to `C:\ProgramData\ssh\administrators_authorized_keys` (the admin user is in Administrators) with
   `icacls /inheritance:r` granting only Administrators and SYSTEM;
 - sets `PasswordAuthentication no` and `PubkeyAuthentication yes` in `sshd_config` and restarts `sshd`;
 - sets the SSH default shell (`ssh_default_shell`: `powershell` = Windows PowerShell 5.1, the default, or `cmd`).
 
 It is idempotent and logs to `C:\ProgramData\aigw-bootstrap\bootstrap.log` (never the key or password). If SSH does not
-work after apply, RDP in with the password and read that log, or check the extension status in the portal.
+work after apply, RDP in with the password and read that log. If the log is missing, check
+`Get-MpThreatDetection` and the Defender Operational event log.
 
 The script then needs your own steps from `repro/WINDOWS.md` (Python, Claude Code, Git for Windows).
 

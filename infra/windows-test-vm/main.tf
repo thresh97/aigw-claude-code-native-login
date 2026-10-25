@@ -2,20 +2,17 @@ locals {
   admin_password = coalesce(var.admin_password, random_password.admin.result)
   computer_name  = "${var.name_prefix}-vm"
 
-  # The script is gzipped and base64-encoded to fit the CustomScriptExtension command line.
-  # The key travels base64-encoded in protected_settings (not shown in logs or the portal).
-  bootstrap_prefix = join("\n", [
+  # The script travels as plain text in custom_data (Azure writes it to C:\AzureData\CustomData.bin), and the
+  # extension runs it with -File. Don't gzip/base64 it into -Command with Invoke-Expression: Defender kills that
+  # pattern as Behavior:Win32/PShellCobStager.A, and the extension still reports success.
+  bootstrap_script = join("\n", [
     "$PublicKeyB64 = '${base64encode(trimspace(var.ssh_public_key))}'",
     "$SshDefaultShell = '${var.ssh_default_shell}'",
-    "",
+    file("${path.module}/bootstrap.ps1"),
   ])
-  bootstrap_b64 = base64gzip("${local.bootstrap_prefix}${file("${path.module}/bootstrap.ps1")}")
   bootstrap_cmd = join(" ", [
-    "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command",
-    "\"$b=[Convert]::FromBase64String('${local.bootstrap_b64}');",
-    "$g=New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(,$b)),[IO.Compression.CompressionMode]::Decompress);",
-    "$s=(New-Object IO.StreamReader($g,[Text.Encoding]::UTF8)).ReadToEnd();",
-    "Invoke-Expression $s\"",
+    "cmd /c \"copy /y C:\\AzureData\\CustomData.bin C:\\AzureData\\aigw-bootstrap.ps1 &&",
+    "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\AzureData\\aigw-bootstrap.ps1\"",
   ])
 }
 
@@ -129,6 +126,7 @@ resource "azurerm_windows_virtual_machine" "this" {
   size                = var.vm_size
   admin_username      = var.admin_username
   admin_password      = local.admin_password
+  custom_data         = base64encode(local.bootstrap_script)
   license_type        = var.license_type
   network_interface_ids = [
     azurerm_network_interface.this.id,
