@@ -428,9 +428,8 @@ immutable_turn1 $immutable_turn
 # proxyAuthHelper (EAP) in managed settings: expected not to reach the gateway (it's for a forward proxy)
 proxyauth_turn1 ok
 proxyauth_turn1_proxy_authorization no
-# Spike S4. PREDICTIONS, not observations: the first run confirms or corrects them (a CHANGED verdict on these is expected
-# information, then update the expectation and write the finding in the README).
-# an unknown top-level key (aigwClaudeAuth) in managed-settings.json: predicted ignored; the rest of the file still applies
+# Spike S4 (finding 15; first run 2026-10-25 confirmed every expectation below)
+# an unknown top-level key (aigwClaudeAuth) in managed-settings.json: ignored; the rest of the file still applies
 unknownkey_turn1 ok
 unknownkey_base_url_from_managed yes
 unknownkey_hook_userprompt_ran yes
@@ -438,14 +437,14 @@ unknownkey_hook_stopfailure_ran yes
 unknownkey_marker_in_hook_input no
 unknownkey_stderr_warning no
 unknownkey_stream_warning no
-# AIGW_* in managed env: predicted in the environment of hooks and of the Bash tool; managed wins over the user's same key
+# AIGW_* in managed env: in the environment of hooks and of the Bash tool; managed wins over the user's same key
 # (as with ANTHROPIC_CUSTOM_HEADERS, finding 11), and the user's other AIGW_* key survives
 envkeys_base_url_from_managed yes
 envkeys_env_userprompt AIGW_HOOK_LOGIN=off,AIGW_ISSUER=managed-issuer,AIGW_USER_ONLY=user-only
 envkeys_env_stopfailure AIGW_HOOK_LOGIN=off,AIGW_ISSUER=managed-issuer,AIGW_USER_ONLY=user-only
 envkeys_env_bash AIGW_HOOK_LOGIN=off,AIGW_ISSUER=managed-issuer,AIGW_USER_ONLY=user-only
 envkeys_stderr_warning no
-# managed-settings.d/: predicted merged with managed-settings.json, files in name order, a later file wins on a conflicting key;
+# managed-settings.d/: merged with managed-settings.json, files in name order, a later file wins on a conflicting key;
 # hooks for one event in different files all run
 dropin_base_url_from_managed yes
 dropin_hook_userprompt_ran yes
@@ -454,7 +453,7 @@ dropin_hook_stopfailure_ran yes
 dropin_env_userprompt AIGW_CONFLICT=dropin20,AIGW_FROM_10=a,AIGW_FROM_20=b,AIGW_FROM_MAIN=main
 dropin_env_stopfailure AIGW_CONFLICT=dropin20,AIGW_FROM_10=a,AIGW_FROM_20=b,AIGW_FROM_MAIN=main
 dropin_env_bash AIGW_CONFLICT=dropin20,AIGW_FROM_10=a,AIGW_FROM_20=b,AIGW_FROM_MAIN=main
-# a drop-in without managed-settings.json: predicted applied
+# a drop-in without managed-settings.json: applied
 dropinonly_base_url_from_managed yes
 dropinonly_hook_userprompt_ran yes
 dropinonly_hook_stopfailure_ran yes

@@ -56,7 +56,7 @@ The helper manages one gateway credential in one header for Claude Code users wh
 | A1 | No built-in Claude Code helper can supply the gateway header | Confirmed | `apiKeyHelper` replaces the Anthropic login; a managed `proxyAuthHelper` adds no header to gateway requests (repo finding 11) |
 | A2 | Claude Code rereads `ANTHROPIC_CUSTOM_HEADERS` when the settings file changes | Confirmed, about 1 s after an atomic rename | Finding 7 |
 | A3 | A managed value wins over the user value for the same `env` key | Confirmed: managed `ANTHROPIC_CUSTOM_HEADERS` replaces the user's whole value | Finding 11 |
-| A4 | Unknown top-level keys in managed settings are stripped | Open | Spike S4 |
+| A4 | Unknown top-level keys in managed settings are stripped | Confirmed tolerated: ignored without a warning, the rest of the file applies; `AIGW_*` in managed `env` reaches hooks, managed wins per key; `managed-settings.d/` merges, later file wins | Finding 15 |
 | A5 | Desktop app and Cowork honor the user settings file, hooks or `ANTHROPIC_BASE_URL` | Open | Repo "Not covered yet"; spike S5 |
 | A6 | The gateway validates the JWT in a custom header | Confirmed for the hybrid gateway, Mode A with Entra ID and a broker | Findings 1 and 2 |
 | A7 | A gateway 401 is harmless to the client | **Wrong** | A stored login treats it as its own expired Anthropic login: 13 attempts over about 4 minutes (finding 3). See Gateway failure handling |
@@ -469,7 +469,7 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S1 | Built-in helper for a custom header? | Answered: no (`apiKeyHelper` replaces the login, `proxyAuthHelper` doesn't reach the gateway) | Re-check per Claude Code release |
 | S2 | Settings reread mid-session? | Answered: yes, about 1 s after rename | `headers` scenario guards it |
 | S3 | Managed versus user `env` for the same key? | Answered: managed replaces the user's whole value | `managed` scenario guards it |
-| S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Cases written (`unknownkey`, `envkeys`, `dropin`, `dropinonly` in the `managed` scenario, also covering `managed-settings.d/`); expectations are predictions; awaits a run by a person (`bash repro/run.sh managed --yes`) | Extend `managed` scenario |
+| S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Answered: unknown keys are ignored silently; `AIGW_*` in managed `env` reaches hooks and the Bash tool, managed wins per key; drop-ins merge in name order (finding 15) | `managed` scenario guards it |
 | S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Open | Mock gateway plus each app |
 | S6 | Do server-managed settings apply to users behind the gateway? | Open | Anthropic account team; pilot tenant |
 | S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Probe built (`repro/winprobe.py`, setup in `repro/WINDOWS.md`; plumbing checked on macOS), awaiting a Windows run | Run the probe on a Windows VM, then the Windows port of the offline scenarios |
