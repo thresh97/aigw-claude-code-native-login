@@ -74,7 +74,7 @@ harness() { # harness <scenario>: run repro/harness.py, keep its key=value obser
 expect_seen() { # stdin: "<key> <expected...>" lines (# comments allowed); compares each with SEEN[key]
   local k want; while read -r k want; do [[ -z $k || $k == \#* ]] && continue; expect "$k" "$want" "${SEEN[$k]:-missing}"; done; }
 
-SCENARIOS=(unit headers errors precheck stopfailure stored_login gateway live_login client_live managed)
+SCENARIOS=(unit headers errors precheck stopfailure proxy stored_login stored_login_proxy gateway live_login client_live managed)
 
 describe_unit() { echo "unit: the client's offline tests (fake IdP and broker): settings edits, refresh, sentinel, device/PKCE sign-in, hooks, daemon. Changes: nothing. Under 1 min."; }
 scenario_unit() {
@@ -203,6 +203,82 @@ anthropic_jwt_kept yes
 EOF
   finish; }
 
+describe_proxy() { echo "proxy: Claude Code (CLAUDE_CODE_OAUTH_TOKEN login) through the prototype local proxy (proxy_prototype.py) in front of the mock gateway: the gateway header injected and a client-supplied one stripped, a renewed token picked up, SSE passed through as it arrives, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token failing closed; then which Unix socket base URLs Claude Code can use (spike S11). Mock gateway. Changes: nothing. About 3 min."; }
+scenario_proxy() {
+  start proxy; harness proxy
+  expect_seen <<'EOF'
+# a normal turn through the proxy
+normal_result ok
+normal_header_injected yes
+normal_client_header_stripped yes
+normal_authorization oauth
+normal_beta_passed yes
+normal_streamed yes
+normal_proxy_logged_fingerprint yes
+# the token file changes: the next request carries the new token
+renewed_result ok
+renewed_header_injected yes
+# the gateway refuses the JWT (Portkey 401): the proxy answers 498, so one attempt (direct 401: 2 attempts, finding 5)
+portkey401_attempts 1
+portkey401_upstream_requests 1
+portkey401_proxy_status 498
+portkey401_proxy_note gateway-401->498
+portkey401_fast yes
+portkey401_message gateway-token
+portkey401_498_shown yes
+portkey401_stopfailure_error unknown
+# Anthropic refuses the login (relayed 401): passed through, so Claude Code treats it as it does without a proxy
+anthropic401_attempts 2
+anthropic401_upstream_requests 2
+anthropic401_proxy_status 401
+anthropic401_proxy_note passthrough-401
+anthropic401_fast yes
+anthropic401_message anthropic
+anthropic401_498_shown no
+anthropic401_stopfailure_error authentication_failed
+# no usable token (file missing, empty, sentinel): 498 from the proxy, nothing sent upstream
+notoken_missing_attempts 1
+notoken_missing_upstream_requests 0
+notoken_missing_proxy_status 498
+notoken_missing_proxy_note no-token:missing
+notoken_missing_fast yes
+notoken_missing_message gateway-token
+notoken_missing_498_shown yes
+notoken_missing_stopfailure_error unknown
+notoken_empty_attempts 1
+notoken_empty_upstream_requests 0
+notoken_empty_proxy_status 498
+notoken_empty_proxy_note no-token:missing
+notoken_empty_fast yes
+notoken_empty_message gateway-token
+notoken_empty_498_shown yes
+notoken_empty_stopfailure_error unknown
+notoken_sentinel_attempts 1
+notoken_sentinel_upstream_requests 0
+notoken_sentinel_proxy_status 498
+notoken_sentinel_proxy_note no-token:expired
+notoken_sentinel_fast yes
+notoken_sentinel_message gateway-token
+notoken_sentinel_498_shown yes
+notoken_sentinel_stopfailure_error unknown
+recovery ok
+# chunked SSE, events 0.6 s apart, read through the proxy: the first event arrives at once, the stream is chunked and whole
+sse_status 200
+sse_chunked yes
+sse_first_event_early yes
+sse_spread_over_time yes
+sse_complete yes
+# spike S11: socket base URL forms (a plain-HTTP listener on a Unix socket). Only ANTHROPIC_UNIX_SOCKET from the environment works
+socket_unix_url no-request (still retrying after 15s)
+socket_http_plus_unix no-request (still retrying after 15s)
+socket_http_unix_colon no-request (still retrying after 15s)
+socket_env_var reached-listener, reply ok
+socket_env_var_gateway_header yes
+socket_env_var_authorization oauth
+socket_env_var_in_settings no-request (still retrying after 15s)
+EOF
+  finish; }
+
 describe_stored_login() { echo "stored_login: a stored \`claude login\` (LOGIN_CONFIG_DIR) against the mock gateway: 498 fails at once and leaves the login alone; a gateway 401 runs the OAuth refresh loop (about 4 min). Changes: rotates the stored login at Anthropic, swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 4 min."; }
 scenario_stored_login() {
   need LOGIN_CONFIG_DIR; guard stored_login "rotates the stored login in LOGIN_CONFIG_DIR at Anthropic"
@@ -218,6 +294,29 @@ portkey401_attempts many
 portkey401_long yes
 portkey401_login_rotated yes
 portkey401_login_still_valid yes
+recovery ok
+EOF
+  finish; }
+
+describe_stored_login_proxy() { echo "stored_login_proxy: a stored \`claude login\` (LOGIN_CONFIG_DIR) through the prototype local proxy and the mock gateway: a refused JWT (gateway 401) becomes 498 at the proxy and fails in one attempt without the OAuth loop; no usable token fails the same way without reaching the gateway. Changes: rotates the stored login at Anthropic if the proxy did not work, swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 1 min."; }
+scenario_stored_login_proxy() {
+  need LOGIN_CONFIG_DIR; guard stored_login_proxy "may rotate the stored login in LOGIN_CONFIG_DIR at Anthropic, and swaps its settings.json for the run"
+  start stored_login_proxy; harness stored-login-proxy
+  expect_seen <<'EOF'
+login_present yes
+baseline ok
+portkey401_attempts 1
+portkey401_upstream_requests 1
+portkey401_message gateway-token
+portkey401_long no
+portkey401_login_rotated no
+portkey401_login_still_valid yes
+notoken_attempts 1
+notoken_upstream_requests 0
+notoken_message gateway-token
+notoken_long no
+notoken_login_rotated no
+notoken_login_still_valid yes
 recovery ok
 EOF
   finish; }

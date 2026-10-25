@@ -13,6 +13,9 @@ It answers the Anthropic Messages API the way the real gateway does in this layo
      file. Failure -> 401 with the relayed Anthropic body, request-id and x-should-retry: false.
   4. Otherwise a normal reply ("MOCK-OK"), streamed when asked.
 
+"chunked_sse": N in the control file makes a streamed reply go out as chunked SSE, one event at a time, N seconds apart
+(to see whether a proxy in between passes it on as it arrives).
+
 "force": N in the control file skips all that and answers HTTP N with a gateway body (to see how Claude Code treats N).
 
 With --upstream URL it is a logging relay in front of a real gateway instead (for the live scenarios: request counts
@@ -122,6 +125,19 @@ def make_handler(log_path, control_path, upstream=None):
             self.wfile.write(data)
             return code
 
+        def send_chunked(self, pieces, gap):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i, piece in enumerate(pieces):
+                if i:
+                    time.sleep(float(gap))
+                self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            return 200
+
         def record(self, body, status, t0):
             hdrs = {k.lower(): (fingerprint(v) if k.lower() in SECRET_HEADERS else v) for k, v in self.headers.items()}
             entry = {"t": round(t0, 3), "ms": round((time.time() - t0) * 1000), "method": self.command, "path": self.path,
@@ -179,6 +195,9 @@ def make_handler(log_path, control_path, upstream=None):
                     ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 2}}),
                     ("message_stop", {"type": "message_stop"}),
                 ]
+                gap = self.control().get("chunked_sse")
+                if gap:
+                    return self.send_chunked([f"event: {e}\ndata: {json.dumps(d)}\n\n".encode() for e, d in events], gap)
                 sse = "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events).encode()
                 return self.send(200, sse, ctype="text/event-stream")
             return self.send(200, {"id": "msg_mock", "type": "message", "role": "assistant", "model": model,
