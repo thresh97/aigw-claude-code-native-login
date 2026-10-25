@@ -14,24 +14,28 @@ fake IdP and token broker (from the client's tests).
 """
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import queue
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path[:0] = [str(HERE), str(ROOT / "client")]
 import mock_gateway  # noqa: E402
+import proxy_prototype  # noqa: E402
 from test_aigw_claude_auth import FakeIdP, jwt  # noqa: E402
 
 CLIENT = ROOT / "client" / "aigw_claude_auth.py"
@@ -482,6 +486,243 @@ def scenario_stored_login(out):
         claude.stop()
         return_settings(claude.settings_file, backup)
         shutil.rmtree(claude.tmp, ignore_errors=True)
+        gw.close()
+
+
+class Proxy:
+    """repro/proxy_prototype.py in this process, in front of a gateway, with its token in a file (as the client would keep it)."""
+
+    def __init__(self, out, upstream):
+        self.log = out / "proxy.log.jsonl"
+        self.log.touch()
+        self.dir = Path(tempfile.mkdtemp(prefix="aigw-proxy-"))     # the token file stays out of the results dir
+        self.token_file = self.dir / "gateway.token"
+        self.srv = proxy_prototype.serve(self.token_file, upstream, log=open(self.log, "a"))
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def set_token(self, value):
+        """value None: the file is gone."""
+        if value is None:
+            self.token_file.unlink(missing_ok=True)
+        else:
+            self.token_file.write_text(value)
+
+    def rows(self, since=0):
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [r for r in rows if r["path"].endswith("/v1/messages")][since:]
+
+    def mark(self):
+        return len(self.rows())
+
+    def close(self):
+        self.srv.shutdown()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class UnixGateway:
+    """The mock gateway listening on a Unix socket instead of TCP (for the socket base URL tries)."""
+
+    class Server(ThreadingHTTPServer):
+        address_family = socket.AF_UNIX
+
+        def server_bind(self):
+            self.socket.bind(self.server_address)
+            self.server_name, self.server_port = "unix", 0
+
+        def get_request(self):
+            conn, _ = self.socket.accept()
+            return conn, ("unix", 0)
+
+    def __init__(self, out):
+        self.dir = Path(tempfile.mkdtemp(prefix="aigw-sock-"))
+        self.path = str(self.dir / "gw.sock")
+        self.log = out / "gateway.unix.log.jsonl"
+        self.log.touch()
+        ctl = out / "gateway.unix.control.json"
+        ctl.write_text(json.dumps({"oauth": OAUTH}))
+        self.srv = self.Server(self.path, mock_gateway.make_handler(str(self.log), str(ctl)))
+        self.srv.handle_error = lambda *a: None
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def messages(self):
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [r for r in rows if r["path"].split("?")[0].endswith("/v1/messages")]
+
+    def close(self):
+        self.srv.shutdown()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def socket_try(out, name, good, base_url, env=None, settings_env=None, timeout=15):
+    """One `claude -p` against a Unix socket listener. base_url, env and settings_env are functions of the socket path.
+    A try that never reaches the listener is cut off after `timeout` s: Claude Code retries a connection error with
+    backoff for minutes. Returns the observation text and the requests the listener saw."""
+    sub = out / name
+    sub.mkdir()
+    uds = UnixGateway(sub)
+    claude = Claude(sub, base_url(uds.path), env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH, **(env(uds.path) if env else {})})
+    claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {good}", **(settings_env(uds.path) if settings_env else {})}})
+    try:
+        r = claude.oneshot("socket try", timeout=timeout)
+        time.sleep(0.5)
+        reqs = uds.messages()
+        if reqs:
+            return f"reached-listener, reply {classify(r['text'])}", reqs
+        return f"no-request ({'still retrying after %ss' % timeout if r['text'] == 'TimeoutExpired' else 'other: ' + r['text'][:80]})", reqs
+    finally:
+        claude.cleanup()
+        uds.close()
+
+
+def scenario_proxy(out):
+    """Claude Code (CLAUDE_CODE_OAUTH_TOKEN login) through the prototype local proxy (repro/proxy_prototype.py), in front
+    of the mock gateway: header injection, streaming, gateway 401 -> 498, Anthropic 401 passed through, fail closed;
+    then whether Claude Code can reach a Unix socket (S11)."""
+    gw = Gateway(out)
+    claude = Claude(out, "http://unset", env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+    good, clients = fresh_jwt(), fresh_jwt(sub="client-supplied")
+    proxy = Proxy(out, gw.url)
+    proxy.set_token(good)
+    claude.env["ANTHROPIC_BASE_URL"] = proxy.url
+    # the settings still carry a (different, valid-looking) JWT of their own: the proxy must replace it
+    claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {clients}"}, "hooks": {"StopFailure": [capture_hook(out, "stopfailure")]}})
+    try:
+        try:
+            claude.start()
+            # --- normal turn: injected header, stripped client value, untouched Authorization, streamed reply
+            mark, pmark = gw.mark(), proxy.mark()
+            t = claude.turn("normal")
+            reqs, prow = gw.messages(mark), proxy.rows(pmark)
+            h = reqs[0]["headers"] if reqs else {}
+            observe("normal_result", classify(t["text"]))
+            observe("normal_header_injected", "yes" if h.get(PK) == mock_gateway.fingerprint(good) else "no")
+            observe("normal_client_header_stripped", "yes" if h.get(PK) != mock_gateway.fingerprint(clients) else "no")
+            observe("normal_authorization", "oauth" if h.get("authorization") == mock_gateway.fingerprint(f"Bearer {OAUTH}") else "other")
+            observe("normal_beta_passed", "yes" if "oauth-2025-04-20" in (h.get("anthropic-beta") or "") else "no")
+            observe("normal_streamed", "yes" if reqs and reqs[0].get("stream") is True else "no")
+            observe("normal_proxy_logged_fingerprint", "yes" if prow and prow[0]["token"] == mock_gateway.fingerprint(good) else "no")
+            # --- token rotated in the file: the next request carries it, no restart
+            renewed = fresh_jwt(sub="renewed")
+            proxy.set_token(renewed)
+            mark = gw.mark()
+            t = claude.turn("after the token file changed")
+            reqs = gw.messages(mark)
+            observe("renewed_result", classify(t["text"]))
+            observe("renewed_header_injected", "yes" if reqs and reqs[0]["headers"].get(PK) == mock_gateway.fingerprint(renewed) else "no")
+            # --- the gateway refuses the JWT (Portkey 401), Anthropic refuses the login (relayed 401), no usable token
+            cases = [
+                ("portkey401", dict(revoked=[mock_gateway.fingerprint(good)]), good),
+                ("anthropic401", dict(oauth="some-other-login"), good),
+                ("notoken_missing", {}, None),
+                ("notoken_empty", {}, ""),
+                ("notoken_sentinel", {}, SENTINEL),
+            ]
+            for name, ctl, token in cases:
+                gw.set(revoked=[], oauth=OAUTH, force=None)
+                gw.set(**ctl)
+                proxy.set_token(token)
+                seen = len(payloads(out, "stopfailure"))
+                mark, pmark = gw.mark(), proxy.mark()
+                t = claude.turn(f"case {name}")
+                time.sleep(1)
+                rows = proxy.rows(pmark)
+                observe(f"{name}_attempts", len(rows))
+                observe(f"{name}_upstream_requests", len(gw.messages(mark)))
+                observe(f"{name}_proxy_status", ",".join(sorted({str(r["status"]) for r in rows})) or "none")
+                observe(f"{name}_proxy_note", ",".join(sorted({r["note"] or "-" for r in rows})) or "none")
+                observe(f"{name}_fast", "yes" if t["seconds"] < 15 else f"no ({t['seconds']}s)")
+                observe(f"{name}_message", classify(t["text"]))
+                observe(f"{name}_498_shown", "yes" if "498" in t["text"] else "no")
+                wait_until(lambda: len(payloads(out, "stopfailure")) > seen)
+                p = payloads(out, "stopfailure")[seen:]
+                observe(f"{name}_stopfailure_error", p[0].get("error") if p else "none")
+            gw.set(revoked=[], oauth=OAUTH, force=None)
+            proxy.set_token(good)
+            observe("recovery", classify(claude.turn("recovery")["text"]))
+        finally:
+            claude.cleanup()
+        # --- SSE passes through as it arrives: the mock sends chunked SSE 0.6 s apart; read it through the proxy
+        gw.set(chunked_sse=0.6)
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.srv.server_address[1], timeout=30)
+        body = json.dumps({"model": MODEL, "stream": True, "max_tokens": 8, "messages": [{"role": "user", "content": "x"}]})
+        t0 = time.time()
+        conn.request("POST", "/v1/messages", body, {"content-type": "application/json", "authorization": f"Bearer {OAUTH}",
+                                                    "anthropic-beta": "oauth-2025-04-20"})
+        resp = conn.getresponse()
+        observe("sse_status", resp.status)
+        observe("sse_chunked", "yes" if resp.getheader("Transfer-Encoding") == "chunked" else "no")
+        first = resp.read1(65536)
+        t_first = time.time() - t0
+        rest = resp.read()
+        t_all = time.time() - t0
+        observe("sse_first_event_early", "yes" if first.startswith(b"event: message_start") and t_first < 0.5 else f"no ({t_first:.1f}s)")
+        observe("sse_spread_over_time", "yes" if t_all > 2.5 else f"no ({t_all:.1f}s)")
+        observe("sse_complete", "yes" if b"event: message_stop" in first + rest else "no")
+        conn.close()
+    finally:
+        proxy.close()
+        gw.close()
+    # --- S11: can Claude Code reach a Unix socket? A plain-HTTP listener on a socket stands in for the gateway.
+    good = fresh_jwt()
+    tries = [
+        ("socket_unix_url", lambda s: f"unix://{s}", None, None),
+        ("socket_http_plus_unix", lambda s: "http+unix://" + s.replace("/", "%2F"), None, None),
+        ("socket_http_unix_colon", lambda s: f"http://unix:{s}:/", None, None),
+        ("socket_env_var", lambda s: "http://localhost", lambda s: {"ANTHROPIC_UNIX_SOCKET": s}, None),
+        ("socket_env_var_in_settings", lambda s: "http://localhost", None, lambda s: {"ANTHROPIC_UNIX_SOCKET": s}),
+    ]
+    for name, base, env, settings_env in tries:
+        result, reqs = socket_try(out, name, good, base, env, settings_env)
+        observe(name, result)
+        if reqs:
+            h = reqs[0]["headers"]
+            observe(f"{name}_gateway_header", "yes" if h.get(PK) == mock_gateway.fingerprint(good) else "no")
+            observe(f"{name}_authorization", "oauth" if h.get("authorization") == mock_gateway.fingerprint(f"Bearer {OAUTH}") else "other")
+
+
+def scenario_stored_login_proxy(out):
+    """A stored `claude login` (LOGIN_CONFIG_DIR) through the prototype proxy and the mock gateway: a gateway 401 becomes
+    498 at the proxy, so Claude Code makes one attempt and leaves the login alone (compare stored_login: 13 attempts
+    and a rotated login without the proxy); no usable token fails the same way without reaching the gateway.
+    Rotates the real login at Anthropic if the proxy does not work, so only run it on purpose."""
+    cfg = Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser()
+    gw = Gateway(out, oauth=None)          # the mock can't check a real login; Authorization is only logged
+    claude = Claude(out, "http://unset", config_dir=cfg)
+    backup = borrow_settings(claude.settings_file)
+    good = fresh_jwt()
+    proxy = Proxy(out, gw.url)
+    proxy.set_token(good)
+    claude.env["ANTHROPIC_BASE_URL"] = proxy.url
+    try:
+        before = cred_state(cfg)
+        observe("login_present", "yes" if before.get("exists") else "no")
+        claude.write_settings({})          # no JWT in the settings: the proxy supplies it
+        claude.start()
+        observe("baseline", classify(claude.turn("baseline")["text"]))
+        for name, ctl, token in (("portkey401", dict(revoked=[mock_gateway.fingerprint(good)]), good), ("notoken", {}, SENTINEL)):
+            gw.set(force=None, revoked=[])
+            gw.set(**ctl)
+            proxy.set_token(token)
+            b = cred_state(cfg)
+            mark, pmark = gw.mark(), proxy.mark()
+            t = claude.turn(f"case {name}")
+            time.sleep(2)
+            a = cred_state(cfg)
+            n = len(proxy.rows(pmark))
+            observe(f"{name}_attempts", "1" if n == 1 else "many" if n > 5 else n)
+            observe(f"{name}_upstream_requests", len(gw.messages(mark)))
+            observe(f"{name}_message", classify(t["text"]))
+            observe(f"{name}_long", "yes" if t["seconds"] > 60 else "no")
+            observe(f"{name}_login_rotated", "yes" if a.get("refresh") != b.get("refresh") else "no")
+            observe(f"{name}_login_still_valid", "yes" if login_valid(a) else "no")
+        gw.set(force=None, revoked=[])
+        proxy.set_token(good)
+        observe("recovery", classify(claude.turn("recovery")["text"]))
+    finally:
+        claude.stop()
+        return_settings(claude.settings_file, backup)
+        shutil.rmtree(claude.tmp, ignore_errors=True)
+        proxy.close()
         gw.close()
 
 
