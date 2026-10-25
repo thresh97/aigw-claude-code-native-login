@@ -10,3 +10,7 @@ repro/results/
 __pycache__/
 # Claude Code worktrees and local settings
 .claude/
+# Local tenant config and secrets (never commit)
+/.state.env
+/config.json
+/aigw-gw
