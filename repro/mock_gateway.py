@@ -168,6 +168,24 @@ def make_handler(log_path, control_path, upstream=None):
             except ValueError:
                 req = {}
             model = req.get("model") or "claude-mock"
+            cmd = self.control().get("bash_command")
+            last = (req.get("messages") or [{}])[-1]
+            if cmd and req.get("stream") and req.get("tools") and last.get("role") == "user" \
+                    and "RUN-BASH" in json.dumps(last) and "tool_result" not in json.dumps(last):
+                # a turn that asks for a Bash tool call (lets a scenario see the Bash tool's environment)
+                events = [
+                    ("message_start", {"type": "message_start", "message": {"id": "msg_mock", "type": "message", "role": "assistant", "model": model,
+                                                                           "content": [], "stop_reason": None, "stop_sequence": None,
+                                                                           "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+                    ("content_block_start", {"type": "content_block_start", "index": 0,
+                                             "content_block": {"type": "tool_use", "id": "toolu_mock1", "name": "Bash", "input": {}}}),
+                    ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                             "delta": {"type": "input_json_delta", "partial_json": json.dumps({"command": cmd})}}),
+                    ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                    ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 2}}),
+                    ("message_stop", {"type": "message_stop"}),
+                ]
+                return self.send(200, "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events).encode(), ctype="text/event-stream")
             if req.get("stream"):
                 events = [
                     ("message_start", {"type": "message_start", "message": {"id": "msg_mock", "type": "message", "role": "assistant", "model": model,
