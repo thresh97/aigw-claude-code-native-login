@@ -59,7 +59,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 
 - **An AI Gateway that accepts a JWT** in `x-portkey-api-key` (for gateway API keys instead, see [Without a JWT](#without-a-jwt-gateway-api-keys)), in one of two ways:
   - **"Mode A":** the JWT carries Portkey's own claims (`portkey_oid`, `portkey_workspace`, a nested `defaults` object) and is signed by a key the gateway trusts. Your IdP can issue it directly if it can emit nested JSON claims. IdPs that can't, such as Entra ID, need a broker that exchanges the IdP token for one (for Entra ID see article `aigw-entra-jwt-broker`);
-  - **"Mode B":** your IdP's ordinary token; the gateway works out the organisation and workspace from its own settings. Hybrid gateway only: the SaaS gateway takes Mode A only.
+  - **"Mode B":** your IdP's ordinary token; the gateway works out the organization and workspace from its own settings. Hybrid gateway only: the SaaS gateway takes Mode A only.
 - **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), as the config the users' requests get. Either:
   - bind it to the credential: named in the JWT's claims, or bound to the service or user API key. Different users or groups in one workspace can then get different configs, and Claude Code's settings (or the MDM or Claude Enterprise policy that manages them) need to know nothing about configs or workspaces;
   - or make it the workspace default. That's simpler, but then everyone in the workspace who doesn't name a config gets that one.
