@@ -64,3 +64,5 @@ sending if you like; there is no real account data in it. Also write down by han
 Read `hook_<form>_as_intended=no` with the `_argv` next to it: for `back\slash` an unquoted backslash that arrives as
 `backslash` means a POSIX-style shell (Git Bash) ate it; for `%WINPROBE_VAR%` a literal `%WINPROBE_VAR%` means no cmd.exe
 expansion, and `$WINPROBE_VAR` expanding means a POSIX shell or PowerShell.
+
+To build the VM with Terraform on Azure, see `infra/windows-test-vm/README.md`.
