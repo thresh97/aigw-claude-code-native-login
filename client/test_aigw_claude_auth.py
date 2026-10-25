@@ -4,6 +4,7 @@
 Run:  python3 -m unittest -v client/test_aigw_claude_auth.py      (from the repo root; about 10 s)
 """
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -184,7 +185,8 @@ class SettingsTests(Base):
         self.assertEqual(d["model"], "opus")
         self.assertEqual(d["env"]["FOO"], "1")
         self.assertEqual(d["env"]["ANTHROPIC_CUSTOM_HEADERS"], "x-team: blue\nx-portkey-api-key: new")
-        self.assertEqual(stat.S_IMODE(self.settings_path.stat().st_mode), 0o600)
+        if sys.platform != "win32":
+            self.assertEqual(stat.S_IMODE(self.settings_path.stat().st_mode), 0o600)
         self.assertEqual(self.header(), "new")
 
     def test_put_creates_file_and_is_atomic(self):
@@ -482,12 +484,262 @@ class DaemonTests(Base):
     def test_daemon_refreshes_then_stops_on_signal(self):
         self.sign_in()
         self.put_header(jwt(time.time() - 1))
-        stop = threading.Timer(1.5, lambda: os.kill(os.getpid(), __import__("signal").SIGTERM))
+        stop = threading.Timer(1.5, lambda: __import__("signal").raise_signal(__import__("signal").SIGTERM))
         stop.start()
         code, _, err = self.run_cli("daemon", "--max-sleep", "5")
         self.assertEqual(code, 0)
         self.assertIn("wrote a new JWT", err)
         self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+
+
+SCRIPT = str(Path(A.__file__).resolve())
+
+
+class WindowsMockTests(Base):
+    """The Windows pieces, run on any OS with sys.platform and the system calls mocked."""
+
+    def win(self):
+        """Pretend to be Windows; where msvcrt does not exist, a no-op stand-in so the lock path can run."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch("sys.platform", "win32"))
+        if not hasattr(A, "msvcrt"):
+            stack.enter_context(mock.patch.object(A, "msvcrt", mock.Mock(LK_LOCK=1, LK_UNLCK=0), create=True))
+        return stack
+
+    def test_hook_entry_exec_form_on_windows(self):
+        with self.win():
+            hook = A.default_hook_command()
+        self.assertEqual(hook, [str(Path(sys.executable).resolve()), SCRIPT])
+        self.assertEqual(A.hook_entry(hook, "precheck"), {"hooks": [{"type": "command", "command": hook[0], "args": [SCRIPT, "hook", "precheck"], "timeout": A.HOOK_TIMEOUT}]})
+
+    def test_hook_entry_shell_form_elsewhere_is_unchanged(self):
+        with mock.patch("sys.platform", "linux"):
+            hook = A.default_hook_command()
+        self.assertIsInstance(hook, str)
+        import shlex
+        self.assertEqual(hook, f"{shlex.quote(sys.executable)} {shlex.quote(SCRIPT)}")
+        self.assertEqual(A.hook_entry(hook, "stop-failure"), {"hooks": [{"type": "command", "command": f"{hook} hook stop-failure", "timeout": A.HOOK_TIMEOUT}]})
+
+    def test_install_and_print_agree_on_windows_and_reinstall_replaces(self):
+        self.sign_in()
+        with self.win():
+            code, out, _ = self.run_cli("install", "--print")
+            self.assertEqual(code, 0)
+            printed = json.loads(out)["hooks"]
+            for _ in range(2):
+                self.assertEqual(self.run_cli("install")[0], 0)
+        d = json.loads(self.settings_path.read_text())
+        self.assertEqual(d["hooks"], printed)
+        self.assertEqual(len(d["hooks"]["UserPromptSubmit"]), 1)
+        self.assertEqual(d["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][-2:], ["hook", "precheck"])
+
+    def test_install_replaces_shell_form_entry_with_exec_form(self):
+        self.settings_path.parent.mkdir(parents=True)
+        self.settings_path.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'/x/aigw-claude-auth' hook precheck"}]}]}}))
+        self.sign_in()
+        with self.win():
+            self.run_cli("install")
+        ups = json.loads(self.settings_path.read_text())["hooks"]["UserPromptSubmit"]
+        self.assertEqual(len(ups), 1)
+        self.assertIn("args", ups[0]["hooks"][0])
+
+    def test_default_dirs_on_windows(self):
+        env = {"APPDATA": r"C:\Users\u\AppData\Roaming", "LOCALAPPDATA": r"C:\Users\u\AppData\Local"}
+        with self.win(), mock.patch.dict(os.environ, env):
+            os.environ.pop("AIGW_CLAUDE_AUTH_DIR", None)
+            self.assertEqual(A.config_dir(), Path(env["APPDATA"]) / "aigw-claude-auth")
+            self.assertEqual(A.log_dir(), Path(env["LOCALAPPDATA"]) / "aigw-claude-auth" / "logs")
+            os.environ["AIGW_CLAUDE_AUTH_DIR"] = "/override"
+            self.assertEqual(A.config_dir(), Path("/override"))
+
+    def test_pid_alive_windows_uses_exit_code_not_kill(self):
+        import ctypes
+
+        class K:
+            code, handle = 259, 1234
+
+            def OpenProcess(s, access, inherit, pid):
+                return s.handle
+
+            def GetExitCodeProcess(s, h, ref):
+                ref._obj.value = s.code
+                return 1
+
+            def CloseHandle(s, h):
+                pass
+
+        k = K()
+        with self.win(), mock.patch.object(A, "_kernel32", return_value=k), mock.patch("os.kill", side_effect=AssertionError("os.kill on Windows")):
+            self.assertTrue(A.pid_alive(42))
+            k.code = 1
+            self.assertFalse(A.pid_alive(42))
+            k.handle = None
+            with mock.patch.object(ctypes, "get_last_error", return_value=5, create=True):
+                self.assertTrue(A.pid_alive(42))             # access denied: it exists
+            with mock.patch.object(ctypes, "get_last_error", return_value=87, create=True):
+                self.assertFalse(A.pid_alive(42))            # invalid parameter: no such pid
+
+    def test_spawn_detached_windows_argv_and_flags(self):
+        import subprocess
+        pyw = self.tmp / "pythonw.exe"
+        pyw.write_text("")
+        py = self.tmp / "python.exe"
+        calls = []
+
+        def popen(cmd, **kw):
+            calls.append((cmd, kw))
+            if kw["creationflags"] & 0x01000000:
+                raise PermissionError(5, "Access is denied")
+            return mock.Mock()
+
+        with self.win(), mock.patch("subprocess.Popen", side_effect=popen), open(self.tmp / "log", "w") as logf:
+            A.spawn_detached([str(py), "script", "hook-login-wait"], logf)
+        self.assertEqual(len(calls), 2, "breakaway refused, then retried without it")
+        cmd, kw = calls[1]
+        self.assertEqual(cmd, [str(pyw), "script", "hook-login-wait"])
+        self.assertEqual(kw["creationflags"], 0x08 | 0x200)
+        self.assertNotIn("start_new_session", kw)
+        self.assertIs(kw["stdout"], logf)                      # never the hook's stdout
+        self.assertEqual(kw["stderr"], subprocess.STDOUT)
+
+    def test_spawn_detached_posix_unchanged(self):
+        with mock.patch("sys.platform", "linux"), mock.patch("subprocess.Popen") as popen:
+            A.spawn_detached(["a"], None)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertNotIn("creationflags", popen.call_args.kwargs)
+
+    def test_replace_file_retries_on_permission_error_on_windows_only(self):
+        n = []
+
+        def flaky(src, dst):
+            n.append(1)
+            if len(n) < 4:
+                raise PermissionError(13, "in use")
+            return "ok"
+
+        with self.win(), mock.patch("os.replace", side_effect=flaky), mock.patch("time.sleep"):
+            self.assertEqual(A.replace_file("a", "b"), "ok")
+        self.assertEqual(len(n), 4)
+        with self.win(), mock.patch("os.replace", side_effect=PermissionError(13, "x")), mock.patch("time.sleep"):
+            with self.assertRaises(PermissionError):
+                A.replace_file("a", "b")
+        with mock.patch("sys.platform", "linux"), mock.patch("os.replace", side_effect=PermissionError(1, "x")) as r:
+            with self.assertRaises(PermissionError):
+                A.replace_file("a", "b")
+        self.assertEqual(r.call_count, 1)
+
+    def test_toast_argv(self):
+        argv = A.toast_argv("Signed in <ok> & it's fine")
+        self.assertEqual(argv[:6], ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand"])
+        ps = base64.b64decode(argv[6]).decode("utf-16-le")
+        self.assertIn("$ProgressPreference = 'SilentlyContinue'", ps)
+        self.assertIn("Signed in &lt;ok&gt; &amp; it''s fine", ps)
+        self.assertNotIn("@@", ps)
+        self.assertNotRegex(ps.lower(), r"invoke-expression|iex|gzip|downloadstring")
+        self.assertLess(len(argv[6]), 5000)
+
+    def test_notify_on_windows_runs_toast(self):
+        with self.win(), mock.patch("subprocess.run") as run:
+            A.notify({"notify": "auto"}, "hello")
+        self.assertEqual(run.call_args.args[0][0], "powershell.exe")
+        self.assertEqual(run.call_args.kwargs["creationflags"], 0x08000000)
+
+    def test_task_xml(self):
+        import xml.etree.ElementTree as ET
+        script = r"C:\Users\me\My Dir\aigw_claude_auth.py"
+        xml = A.task_xml("DOM\\me&co", r"C:\Python\python.exe", script)
+        root = ET.fromstring(xml.split("?>", 1)[1])
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        self.assertEqual(root.find("t:Triggers/t:LogonTrigger/t:UserId", ns).text, "DOM\\me&co")
+        self.assertEqual(root.find("t:Settings/t:MultipleInstancesPolicy", ns).text, "IgnoreNew")
+        self.assertEqual(root.find("t:Settings/t:RestartOnFailure/t:Count", ns).text, "999")
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Arguments", ns).text, f'"{script}" daemon')
+        self.assertTrue(root.find("t:Actions/t:Exec/t:Command", ns).text.endswith("python.exe"))
+
+    def test_task_print_registers_nothing_and_install_refuses_off_windows(self):
+        with mock.patch("subprocess.run") as run:
+            code, out, _ = self.run_cli("task", "print")
+            self.assertEqual(code, 0)
+            self.assertIn("<LogonTrigger>", out)
+            if sys.platform != "win32":
+                self.assertEqual(self.run_cli("task", "install")[0], 1)
+        run.assert_not_called()
+
+    def test_task_install_argv_on_windows(self):
+        with self.win(), mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout="SUCCESS", stderr="")) as run:
+            self.assertEqual(self.run_cli("task", "install", "--name", "aigw-test-x")[0], 0)
+            self.assertEqual(self.run_cli("task", "remove", "--name", "aigw-test-x")[0], 0)
+        self.assertEqual(run.call_args_list[0].args[0][:4], ["schtasks.exe", "/Create", "/TN", "aigw-test-x"])
+        self.assertEqual(run.call_args_list[1].args[0], ["schtasks.exe", "/Delete", "/TN", "aigw-test-x", "/F"])
+
+    def test_lock_uses_msvcrt_on_windows(self):
+        fake = mock.Mock(LK_LOCK=1, LK_UNLCK=0)
+        fake.locking.side_effect = [OSError(36, "deadlock"), None, None]      # first try times out, second gets it
+        with self.win(), mock.patch.object(A, "msvcrt", fake, create=True), A.State(self.state_dir).lock():
+            self.assertEqual(fake.locking.call_count, 2)
+        self.assertEqual(fake.locking.call_count, 3)
+        self.assertEqual(fake.locking.call_args.args[1], 0)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows only")
+class WindowsRealTests(Base):
+    def test_lock_contention_between_processes(self):
+        import subprocess
+        self.state_dir.mkdir()
+        code = ("import sys,time; sys.path.insert(0, %r); import aigw_claude_auth as A\n"
+                "s=A.State(%r)\nwith s.lock():\n print('held', flush=True); time.sleep(2)\n") % (str(Path(A.__file__).parent), str(self.state_dir))
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        t0 = time.time()
+        with A.State(self.state_dir).lock():
+            waited = time.time() - t0
+        p.wait()
+        self.assertGreater(waited, 1.0, "second locker must block until the first releases")
+
+    def test_pid_alive_live_and_dead(self):
+        import subprocess
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(A.pid_alive(p.pid))
+        finally:
+            p.kill()
+            p.wait()
+        self.assertFalse(A.pid_alive(p.pid))
+        self.assertTrue(A.pid_alive(os.getpid()))
+
+    def test_detached_worker_survives_parent_exit(self):
+        import subprocess
+        out = self.tmp / "worker.out"
+        worker = self.tmp / "worker.py"
+        worker.write_text("import sys,time\nd=sys.stdin.read()\ntime.sleep(3)\nopen(sys.argv[1],'w').write('done '+d)\n")
+        parent = self.tmp / "parent.py"
+        parent.write_text("import sys\nsys.path.insert(0, %r)\nimport aigw_claude_auth as A\nlogf=open(sys.argv[2],'a')\n"
+                          "c=A.spawn_detached([sys.executable, sys.argv[1], sys.argv[3]], logf)\nc.stdin.write(b'payload'); c.stdin.close()\nprint(c.pid)\n"
+                          % str(Path(A.__file__).parent))
+        r = subprocess.run([sys.executable, str(parent), str(worker), str(self.tmp / "w.log"), str(out)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.strip().isdigit(), "worker must not write to the hook's stdout: " + r.stdout)
+        deadline = time.time() + 15
+        while time.time() < deadline and not out.exists():
+            time.sleep(0.2)
+        self.assertEqual(out.read_text(), "done payload")
+
+    def test_replace_file_waits_for_a_reader(self):
+        target = self.tmp / "t.txt"
+        target.write_text("old")
+        src = self.tmp / "s.txt"
+        src.write_text("new")
+        f = open(target, "rb")                                 # Python opens without FILE_SHARE_DELETE: replace is refused
+        threading.Timer(0.5, f.close).start()
+        t0 = time.time()
+        A.replace_file(str(src), str(target))
+        self.assertGreater(time.time() - t0, 0.3)
+        self.assertEqual(target.read_text(), "new")
+
+    def test_hook_entry_exec_form(self):
+        d = A.hook_entry(A.default_hook_command(), "precheck")["hooks"][0]
+        self.assertTrue(Path(d["command"]).is_absolute() and d["command"].lower().endswith(".exe"))
+        self.assertEqual(d["args"], [SCRIPT, "hook", "precheck"])
 
 
 if __name__ == "__main__":
