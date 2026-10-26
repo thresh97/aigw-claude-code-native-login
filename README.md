@@ -343,6 +343,7 @@ Tested 2026-10-24 against:
 - on 2026-10-25, the `managed` scenario on macOS 26.6 with Claude Code 2.1.308, first with aigw-claude-auth 1.1.0, then with 1.1.1, which fixes the immutable case (finding 11); later the same day with the spike S4 cases (finding 15);
 - on 2026-10-25, by hand, the Claude desktop app 3.6556.2 on macOS 26.6 (finding 16);
 - on 2026-10-25, the `winprobe` probe (spike S7) on an Azure Windows 11 24H2 VM with Claude Code 2.1.310 and Python 3.13.15 installed for all users, three runs: from Windows PowerShell over SSH with and without Git for Windows 2.56, and from cmd.exe in the RDP desktop session with Git (finding 17);
+- on 2026-10-26, aigw-claude-auth 1.4.0 (`mode: proxy`): `proxy` on macOS and the Windows 11 VM, and `stored_login_proxy` with a stored login on macOS, all `PASS`;
 - on 2026-10-26, by hand, aigw-claude-auth 1.3.0 against an Okta Integrator org: device code sign-in, refresh rotation and replay, claims (finding 21);
 - on 2026-10-26, aigw-claude-auth 1.3.0 (credential store, sign-in method selection, `doctor`, `inspect`): the `managed` scenario on macOS 26.6 with Claude Code 2.1.308, 19 cases (finding 19), and the `keycloak` scenario against Keycloak 26.4.7 in Docker (finding 18); the offline scenarios again with 1.3.0, all `PASS` on macOS and on the Windows 11 VM (Claude Code 2.1.310);
 - on 2026-10-26, aigw-claude-auth 1.2.0 (the Windows port) with `repro/run.py`: the offline scenarios `unit headers errors precheck stopfailure proxy` all `PASS` on the same Windows 11 VM (proxy: 55 observations, 7 Unix-socket ones `SKIP`) and on macOS 26.6 with Claude Code 2.1.308;
@@ -412,7 +413,7 @@ Open questions and gaps, not tested here:
 - **Also untested:**
   - 403 and 407 with a stored login;
   - on macOS: the live scenarios other than `stored_login_proxy` (the harness reads the stored login from the login Keychain and passes the real `HOME` to Claude Code for them), `claude -p` while signed out, and device code expiry.
-- **Protecting the JWT and the refresh token at rest.** In file mode the JWT sits in the settings file; `mode: proxy` (1.4.0) keeps it in memory only. Not yet run for the proxy: a stored login through it against the real gateway, and `stored_login_proxy` with 1.4.0. The refresh token is in the OS credential store since 1.3.0 (the file is the fallback). Options not built yet:
+- **Protecting the JWT and the refresh token at rest.** In file mode the JWT sits in the settings file; `mode: proxy` (1.4.0) keeps it in memory only. With a stored login through it (`stored_login_proxy`, 1.4.0, against the mock), a refused or missing JWT fails in one attempt and the login isn't rotated. Not yet run: the proxy against the real gateway. The refresh token is in the OS credential store since 1.3.0 (the file is the fallback). Options not built yet:
   - Claude Code permission rules that deny reading the files;
   - sender-constrained tokens, if the gateway ever supports them.
 
