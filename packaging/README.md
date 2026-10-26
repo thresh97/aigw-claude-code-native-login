@@ -108,8 +108,8 @@ disable the entry; macOS `uninstall.sh` boots the agent out).
     first proxy lives). That user's `doctor` shows Error `proxy-secret`, and their Claude Code would get 498 from the other user's proxy. Proxy mode on a
     shared Linux host (several simultaneous users) does not work with one fixed `proxy_listen`; a per-user port is needed (open item).
   - Uninstall: files, unit, global enable and drop-in are removed; the rpm used to leave empty `/etc/claude-code/managed-settings.d` (fixed: the spec owns the dirs).
-    Running daemons keep running after removal until the user logs out. `purge-user` must run before removal (the launcher is gone
-    afterwards: "can't open file"); it leaves `~/.claude/settings.json` (with the empty `env`) and removes `~/.config/aigw-claude-auth`. Without purge the user keeps
+    Running daemons were still active after removal (stop at logout: from reading the unit, not observed). `purge-user` must run before removal (the launcher is gone
+    afterwards: "can't open file"); it removes our header lines and `~/.config/aigw-claude-auth` but leaves the `~/.claude/settings.json` file itself, Without purge the user keeps
     `~/.config/aigw-claude-auth/*` and the header line in `settings.json` (inert without the managed base URL and hooks).
 
 Not covered: macOS and Windows privileged installs, LaunchAgent/Task Scheduler actually starting at login (systemd is covered above), the group-principal task
