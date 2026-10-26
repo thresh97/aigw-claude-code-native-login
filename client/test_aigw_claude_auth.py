@@ -2528,7 +2528,7 @@ class ProxyUpstreamTests(unittest.TestCase):
     def conn(self, url, **env):
         with mock.patch.dict(os.environ, env):
             for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
-                if k not in env:
+                if k.upper() not in env:            # Windows environment names are case-insensitive
                     os.environ.pop(k, None)             # an empty lowercase variable would override the uppercase one
             return A.Upstream(url).connect()
 

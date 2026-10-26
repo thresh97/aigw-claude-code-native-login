@@ -2028,6 +2028,9 @@ def probe_proxy(cfg, state, timeout=2):
         return "down", ""
     host, port = where
     try:
+        # Windows takes about 2 s to refuse a connection to a closed loopback port (it retries the SYN), longer than the
+        # request timeout: connect first with room for that, so a closed port is 'down' and not 'taken'.
+        socket.create_connection((host, port), timeout=max(timeout, 6)).close()
         status, body = control_call(host, port, proxy_secret(state), "GET", CONTROL_PREFIX + "status", timeout)
     except ConnectionRefusedError:
         return "down", ""
