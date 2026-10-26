@@ -1089,8 +1089,11 @@ class DoctorTests(Base):
 
     def test_secret_store_finding_when_a_store_exists(self):
         self.sign_in()
-        self.assertIn("secret-store", [n["id"] for n in self.doctor()[1]["not_applicable"]])
-        with mock.patch.object(A, "secret_store_available", create=True, return_value=True):
+        self.assertIn("secret-store", [n["id"] for n in self.doctor()[1]["not_applicable"]])      # Base writes secret_store: file
+        self.write_config(secret_store="auto")
+        with mock.patch.object(A, "make_store", return_value=None):
+            self.assertNotIn("secret-store", self.doctor()[2])
+        with mock.patch.object(A, "make_store", return_value=object()):
             self.assertEqual(self.doctor()[2]["secret-store"], "Warning")
 
     def test_managed_sources_rank_plist_over_file_and_hkcu_last(self):

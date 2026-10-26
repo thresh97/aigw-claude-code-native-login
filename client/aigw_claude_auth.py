@@ -2174,12 +2174,11 @@ def chk_jwt(ctx):
 
 @check("secret-store")
 def chk_secret_store(ctx):
-    avail = globals().get("secret_store_available")
-    if not callable(avail):
-        ctx["na"]["secret-store"] = "this build has no OS credential store"
+    if ctx["cfg"].get("secret_store", "auto") != "auto":
+        ctx["na"]["secret-store"] = "secret_store is file"
         return
-    if ctx["cfg"].get("secret_store", "auto") == "auto" and ctx["state"].load().get("refresh_token") and avail():
-        return [finding("secret-store", "Warning", "the refresh token is in a file although an OS credential store is available (secret_store: auto)",
+    if ctx["state"].load().get("refresh_token") and make_store(ctx["cfg"], ctx["state"].dir) is not None:
+        return [finding("secret-store", "Warning", "the refresh token is in state.json although an OS credential store is available (secret_store: auto)",
                         "run `aigw-claude-auth login` once to migrate it")]
 
 
