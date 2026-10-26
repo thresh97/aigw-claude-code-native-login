@@ -418,7 +418,7 @@ macOS and Linux are done in v1.1.1; Windows is the main porting job. Keep each p
 | Settings write | Atomic rename | Atomic rename | Atomic `os.replace` with retries on `PermissionError` |
 | Refresh-token store | File today; Keychain via `security` in v2 | File today; libsecret via `secret-tool` in v2, file fallback | Credential Manager or DPAPI via `ctypes` |
 | Notifications | Notification Center (`osascript`) | `notify-send` | Toast through `powershell.exe` and WinRT, `-EncodedCommand`, no console window; own AppUserModelID |
-| Hook command | POSIX shell | POSIX shell | Quoting for the shell Claude Code uses on Windows (open) |
+| Hook command | POSIX shell | POSIX shell | Exec form (`command` + `args`, no shell): works with Git Bash and PowerShell (finding 17) |
 | Logs | `~/Library/Logs/aigw-claude-auth.log` (not rotated) | journald | `%LOCALAPPDATA%\aigw-claude-auth\logs`, rotated |
 | Repro | bash 4+ | bash | Non-bash runner needed |
 
@@ -530,7 +530,7 @@ Phases are ordered, not dated; dates need an owner and staffing. The Windows por
 1. **Remaining spikes.** S4 (unknown keys and `AIGW_*` in managed `env`), S5 (desktop app and Cowork), S7 (Windows hook shell, file locking, toast from a hook), S11 (proxy base URL, proxy 498 behavior).
    - Gate: each answer recorded as a finding with a repro scenario.
 2. **Native Windows port.** Lock, process check without `os.kill`, detached worker, rename retry, toast, Task Scheduler entry, hook quoting, non-bash repro runner; tested against Entra ID.
-   - Gate: all offline scenarios pass on Windows.
+   - Gate: all offline scenarios pass on Windows. **Passed 2026-10-26** (client 1.2.0, Windows 11 24H2, Claude Code 2.1.310, `repro/run.py`): `unit headers errors precheck stopfailure proxy` all PASS; the proxy's 7 Unix-socket checks are SKIP (no `AF_UNIX`). Hooks are written in exec form on Windows (finding 17).
 3. **Credential store, sign-in method selection, `doctor`, `inspect`.** Refresh token out of `state.json`; `login_method` precedence, remembered method, in-session PKCE and `--paste`, learned `device_unavailable`; managed-settings findings; full JWT interpretation.
    - Gate: one passing `managed` case per `doctor` finding; sign-in matrix tests pass with the device grant disabled; no secrets in any output.
 4. **More IdP profiles.** Keycloak in CI first (no tenant needed); Okta and Ping once dev tenants exist, including a fixed `redirect_port` and Mode A claims straight from the IdP; Mode B.

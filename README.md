@@ -125,6 +125,22 @@ systemctl --user daemon-reload && systemctl --user enable --now aigw-claude-auth
 claude        # then /login
 ```
 
+On native Windows (Windows PowerShell; Python 3.8+ from python.org as `py -3`), the same steps with Windows paths. The
+config folder is `%APPDATA%\aigw-claude-auth`, and the background refresher is a Task Scheduler task:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin", "$env:APPDATA\aigw-claude-auth" | Out-Null
+Copy-Item client\aigw_claude_auth.py "$env:USERPROFILE\.local\bin\aigw-claude-auth.py"
+Copy-Item client\config.example.json "$env:APPDATA\aigw-claude-auth\config.json"; notepad "$env:APPDATA\aigw-claude-auth\config.json"
+$a = "$env:USERPROFILE\.local\bin\aigw-claude-auth.py"
+py -3 $a login
+py -3 $a install --base-url https://<gateway host>
+py -3 $a task install      # at log on, as you, one instance, restart on failure, pythonw (no window)
+```
+
+On Windows, `install` writes the hooks in Claude Code's exec form (`command` is the absolute `python.exe`, `args` start
+with the script path). That form uses no shell, so the hooks work whether or not Git for Windows is installed (finding 17).
+
 `install` keeps everything else in the settings file, including other headers in `ANTHROPIC_CUSTOM_HEADERS`, other hooks and other keys. It's safe to run again: it replaces only its own entries.
 
 **The background refresher (step 5).** The systemd unit or launchd agent runs `aigw-claude-auth daemon` from login onward:
@@ -132,7 +148,7 @@ claude        # then /login
 - Within `refresh_before` (5 min) of expiry, it renews through the IdP (and broker) and rewrites the settings. Running Claude Code sessions pick that up about 1 s later.
 - After sleep, it catches up within a minute of waking.
 - On failures (IdP unreachable, signed out) it retries with backoff from 30 s to 5 min, keeps a JWT that still works, and writes the sentinel only when the JWT is about to run out. After `aigw-claude-auth login` it carries on by itself.
-- It logs renewals and failures only: `journalctl --user -u aigw-claude-auth` on Linux, `~/Library/Logs/aigw-claude-auth.log` on macOS (never rotated; it grows slowly).
+- It logs renewals and failures only: `journalctl --user -u aigw-claude-auth` on Linux, `~/Library/Logs/aigw-claude-auth.log` on macOS (never rotated; it grows slowly), `%LOCALAPPDATA%\aigw-claude-auth\logs\daemon.log` on Windows (not rotated either).
 - The service manager restarts it if it crashes, but not after a clean stop.
 
 It's optional. Without it, the precheck hook renews before the prompt that needs it, at the cost of a pause of about 3 s. To check it's working: `systemctl --user status aigw-claude-auth` or `launchctl print gui/$(id -u)/aigw-claude-auth | head`, and `aigw-claude-auth status` shows a new fingerprint and expiry after each renewal. On macOS the agent runs `/usr/bin/python3`, which works only with the Xcode Command Line Tools installed (`xcode-select --install`). With a different Python, change the path in the plist.
@@ -201,12 +217,13 @@ Per user:
 ```bash
 systemctl --user disable --now aigw-claude-auth && rm ~/.config/systemd/user/aigw-claude-auth.service   # Linux
 launchctl bootout gui/$(id -u)/aigw-claude-auth && rm ~/Library/LaunchAgents/aigw-claude-auth.plist      # macOS
+py -3 $env:USERPROFILE\.local\bin\aigw-claude-auth.py task remove                                          # Windows
 aigw-claude-auth logout          # forgets the refresh token, writes the sentinel
 ```
 
 Then:
 1. In `~/.claude/settings.json`, remove `ANTHROPIC_BASE_URL`, the `x-portkey-api-key` line in `ANTHROPIC_CUSTOM_HEADERS`, and the two hook entries whose command contains `aigw-claude-auth`.
-2. Delete `~/.config/aigw-claude-auth` and `~/.local/bin/aigw-claude-auth`.
+2. Delete `~/.config/aigw-claude-auth` and `~/.local/bin/aigw-claude-auth` (Windows: `%APPDATA%\aigw-claude-auth` and `%USERPROFILE%\.local\bin\aigw-claude-auth.py`).
 
 On the gateway side, remove the passthrough config and the LB rules if nothing else uses them.
 
@@ -217,7 +234,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | Command | What it does |
 |---|---|
 | `login [--device \| --pkce] [--no-browser]` | Sign in to the IdP. Default: PKCE in a browser on a desktop session, device code over ssh or without a display. `--no-browser` prints the PKCE URL instead of opening it. Stores the refresh token, then writes a JWT |
-| `install [--base-url URL] [--no-hooks] [--hook-command CMD] [--print]` | Add `ANTHROPIC_BASE_URL` and the hooks to the settings file (or print the snippet), then `sync` |
+| `install [--base-url URL] [--no-hooks] [--hook-command CMD] [--print]` | Add `ANTHROPIC_BASE_URL` and the hooks to the settings file (or print the snippet), then `sync`. On Windows the hooks are in exec form; `--hook-command` is still a shell string |
 | `sync [--force] [--quiet]` | Make sure the settings hold a JWT valid for more than `refresh_before` seconds |
 | `daemon [--max-sleep 60]` | Run `sync` ahead of every expiry. It naps at most `--max-sleep` seconds, so it catches up within a minute after a laptop wakes. On failures it backs off from 30 s to 5 min |
 | `token [--force]` | Print a valid JWT on stdout (for curl and scripts); also updates the settings |
@@ -225,9 +242,10 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `hook precheck`, `hook stop-failure` | The two Claude Code hooks. They read the hook payload on stdin and always exit 0 |
 | `hook-login-wait` | Internal: the precheck's background sign-in. It reads the device authorization response on stdin, waits for the user, writes the JWT, notifies and exits |
 | `logout` | Forget the refresh token, write the sentinel |
+| `task install \| remove \| print [--name NAME]` | Windows: register or remove a Task Scheduler task that runs `daemon` at log on (current user, one instance, restart on failure, `pythonw.exe`). `print` shows the task XML and registers nothing, on any OS |
 
 **Files and locking:**
-- `~/.config/aigw-claude-auth/config.json` holds your config. `state.json` holds the refresh token and discovered endpoints, never the JWT, with mode 600. Override the directory with `AIGW_CLAUDE_AUTH_DIR`.
+- `~/.config/aigw-claude-auth/config.json` (Windows: `%APPDATA%\aigw-claude-auth\config.json`) holds your config. `state.json` holds the refresh token and discovered endpoints, never the JWT, with mode 600. Override the directory with `AIGW_CLAUDE_AUTH_DIR`. Mode 600 means nothing on Windows; the folder relies on the profile's default user-only permissions.
 - While a sign-in started by the precheck is pending, `hook-login.json` (mode 600) next to `state.json` holds its user code, URL, expiry and the waiting process's pid. The device code itself is passed to that process on stdin and never written. The process logs to `hook-login.log` there. `status` shows a pending sign-in.
 - The settings file is the first of: `--settings`, `AIGW_CLAUDE_SETTINGS`, `$CLAUDE_CONFIG_DIR/settings.json`, `~/.claude/settings.json`.
 - Every write is atomic (temp file, fsync, rename, mode 600).
@@ -250,7 +268,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `hook_wait` | `3` | Seconds the precheck hook waits after a write, so the request carries the new value |
 | `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard (never with the SaaS gateway, where the sentinel gets a 401 and the OAuth loop) |
 | `hook_login` | `device` | When signed out, the precheck starts a device code sign-in and puts the URL and code into the block message. `off`: the message only says to run `aigw-claude-auth login`. Use `off` if your IdP doesn't allow the device code flow for this client (Entra can block it through Conditional Access) |
-| `notify` | `auto` | Desktop notification after a StopFailure renewal and when the precheck's background sign-in succeeds or fails: `auto` (macOS Notification Center, `notify-send` on Linux), `off`, or a command that gets the message as `$1` |
+| `notify` | `auto` | Desktop notification after a StopFailure renewal and when the precheck's background sign-in succeeds or fails: `auto` (macOS Notification Center, `notify-send` on Linux, a Windows PowerShell toast on Windows), `off`, or a command that gets the message as `$1` |
 | `redirect_uri`, `redirect_port` | `http://127.0.0.1:{port}/`, `0` | PKCE loopback redirect; port `0` picks a free port |
 | `http_timeout` | `30` | Seconds per IdP or broker request, outside hooks |
 | `hook_http_timeout` | `5` | Seconds per request inside hooks (see "Hook time budget" below) |
@@ -274,14 +292,14 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 
 The offline scenarios take about 10 minutes and the live ones about 15, because two live scenarios wait out the OAuth loop.
 
-1. Prerequisites: Python 3.8+, bash 4+ (on macOS: `brew install bash`), curl, Claude Code. For the live scenarios you also need:
+1. Prerequisites: Python 3.8+ and Claude Code. `repro/run.py` is the runner on every OS (`py -3 repro\run.py` on Windows); `repro/run.sh` (bash 4+, curl; on macOS `brew install bash`) carries the same expectations and stays as the reference until it is retired, so change an expectation in both. For the live scenarios you also need:
    - everything in [What you need](#what-you-need);
    - a dedicated Claude Code config dir with a stored login;
    - a prior `aigw-claude-auth login`, or a `TOKEN_COMMAND`.
    Run it outside a coding agent's sandbox: the scenarios listen on 127.0.0.1, and a sandbox that forbids that turns every scenario into `ERROR` with `PermissionError: [Errno 1] Operation not permitted`.
 2. `cp repro/env.example repro/env` and fill it in. The offline scenarios need nothing in it.
-3. `repro/run.sh check` (read-only preflight).
-4. `repro/run.sh all --yes` (or one scenario from `repro/run.sh list`). `stored_login`, `stored_login_proxy`, `live_login` and `client_live` require `--yes` because they:
+3. `repro/run.py check` (read-only preflight).
+4. `repro/run.py all --yes` (or one scenario from `repro/run.py list`). `stored_login`, `stored_login_proxy`, `live_login` and `client_live` require `--yes` because they:
    - rotate the stored login at Anthropic (it stays valid; `stored_login_proxy` should not rotate it, and checks that);
    - replace the `settings.json` in `LOGIN_CONFIG_DIR` for the run, restoring it afterwards. Until then the original sits in `settings.json.repro-backup`, so if a run is killed, the next one restores it.
 
@@ -290,6 +308,7 @@ The offline scenarios take about 10 minutes and the live ones about 15, because 
    - `PASS`: matches Findings.
    - `CHANGED`: Claude Code or the gateway now behaves differently. For example, if a 401 no longer loops for a stored login, the LB guard and the StopFailure hook matter less. If hook timeouts or the settings reload changed, the client needs updating.
    - `ERROR`: the run broke; fix the environment, not the scripts.
+   - `SKIP (windows)`: on Windows, the proxy scenario's Unix-socket tries (no `AF_UNIX` in Windows Python) and `managed` (sudo; not ported).
 
    Details are in `detail/`: request logs with credential fingerprints, and Claude Code's output.
 
@@ -302,6 +321,7 @@ Tested 2026-10-24 against:
 - on 2026-10-25, the `managed` scenario on macOS 26.6 with Claude Code 2.1.308, first with aigw-claude-auth 1.1.0, then with 1.1.1, which fixes the immutable case (finding 11); later the same day with the spike S4 cases (finding 15);
 - on 2026-10-25, by hand, the Claude desktop app 3.6556.2 on macOS 26.6 (finding 16);
 - on 2026-10-25, the `winprobe` probe (spike S7) on an Azure Windows 11 24H2 VM with Claude Code 2.1.310 and Python 3.13.15 installed for all users, three runs: from Windows PowerShell over SSH with and without Git for Windows 2.56, and from cmd.exe in the RDP desktop session with Git (finding 17);
+- on 2026-10-26, aigw-claude-auth 1.2.0 (the Windows port) with `repro/run.py`: the offline scenarios `unit headers errors precheck stopfailure proxy` all `PASS` on the same Windows 11 VM (proxy: 55 observations, 7 Unix-socket ones `SKIP`) and on macOS 26.6 with Claude Code 2.1.308;
 - a hybrid AI Gateway (`gateway_enterprise` 2.29.0) with JWT auth: Mode A, with Entra ID and a token broker, behind an AWS ALB with the guard rules.
 
 Behavior may change in later releases.
@@ -350,15 +370,12 @@ Claude Code itself documents the passthrough this repo uses: with only `ANTHROPI
 Open questions and gaps, not tested here:
 
 - **Claude desktop app and Cowork.** This client can't route them: the app ignores `ANTHROPIC_BASE_URL` from settings (finding 16). See [Claude desktop app and Cowork](#claude-desktop-app-and-cowork) for the documented route, which wasn't run here. Cowork itself wasn't run.
-- **Native Windows** (WSL works: it's Linux). The client needs changes:
-  - file locking without `fcntl`;
-  - a process check that doesn't use `os.kill(pid, 0)`, which terminates the process on Windows;
-  - a detached sign-in worker;
-  - a retry when another process holds the settings file open (not seen with Claude Code in finding 17, but cheap);
-  - notifications;
-  - hook commands that run under both Git Bash and Windows PowerShell 5.1 (finding 17);
-  - a scheduled task instead of systemd or launchd;
-  - a non-bash repro.
+- **Native Windows** (client 1.2.0; WSL works too: it's Linux). The offline scenarios pass on Windows 11, but these weren't run:
+  - any live scenario (real IdP, gateway or stored login) on Windows;
+  - the Task Scheduler task at a real log on, and its restart after a failure (only registered, read back and removed);
+  - user-only permissions on `%APPDATA%\aigw-claude-auth` (no icacls; it relies on the profile's defaults);
+  - a locked-down corporate image (AppLocker, Constrained Language Mode, which can block the toast);
+  - `managed` (not ported) and the proxy's Unix-socket tries (no `AF_UNIX` in Windows Python).
 - **SaaS gateway.** Per the notes above: Mode A only, `defaults.config_id`, no load balancer for the guard, so hooks only and `block_on_failure` stays `true`. No scenario has run against it.
 - **Gateway API keys** instead of a JWT (see [Without a JWT](#without-a-jwt-gateway-api-keys)): service and user keys, a revoked key's 401, and per-user attribution of user keys.
 - **Also untested:**

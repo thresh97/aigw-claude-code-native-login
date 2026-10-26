@@ -728,6 +728,9 @@ USAGE = "\n".join(__doc__.split("\n")[3:8])
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "list"
     args = argv[2:]
+    if any(a != "--yes" for a in args):
+        print(f"one scenario per run; unexpected: {' '.join(a for a in args if a != '--yes')}\n{USAGE}")
+        return 2
     load_env(HERE / "env")
     r = Runner(args)
     try:

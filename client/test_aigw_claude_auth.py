@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -154,6 +155,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         self.idp.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def write_config(self, **over):
         cfg = {"issuer": self.idp.url, "client_id": "cli", "scope": "openid offline_access api://gw/access_as_user",
