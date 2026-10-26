@@ -95,8 +95,24 @@ disable the entry; macOS `uninstall.sh` boots the agent out).
 - macOS: `pkgutil --expand` / `--payload-files`, `plutil -lint`, postinstall and `uninstall.sh` with `DESTDIR` into a temp dir. The pkg was not installed.
 - Linux: `packaging/linux/container-test-deb.sh` (debian:12) and `container-test-rpm.sh` (rockylinux:9) inside `docker run --rm`: files land, the unit is enabled globally, `--version` and `doctor --json` run, a fresh user's first run writes only the JWT line, removal leaves nothing.
 - Windows: `-WhatIf` writes nothing; an install into an alternate `-Root` (task registration skipped), `task.xml` parses, the client, `doctor` and the launcher run from it, and the uninstall into the same root removes everything.
+- Emulated pilot (Linux), 2026-10-26: `packaging/linux/pilot-systemd.sh --fleet <fleet.json> --pkg deb|rpm` installs the package for real in a privileged
+  debian:12 / rockylinux:9 container with systemd as PID 1 (`--privileged --cgroupns=host`, tmpfs on `/run`), logs two users in
+  through `machinectl shell` (a pam_systemd session, held open: with no session logind stops the user manager seconds later), and
+  checks files, the managed drop-in (no `ANTHROPIC_CUSTOM_HEADERS`), the global enable, the user unit, the first-run `settings.json`,
+  `doctor --json`, a second login (user-manager restart), uninstall and `purge-user`. No sign-in and no gateway request. Four runs
+  (deb and rpm, file and proxy mode) passed.
+  - File mode: both users' units active; only the sentinel `x-portkey-api-key` line written; `doctor` 0 errors, 0 warnings (one Info, `server-managed`).
+  - Proxy mode: users got different secrets, each stable across a second login. The proxy port is fixed, so only the first user's
+    proxy listens; the second user's unit exits with "cannot listen ... Address already in use (an aigw-claude-auth proxy is running
+    there but does not accept this user's secret)" and `Restart=on-failure` / `RestartSec=10` retries it forever (never active while the
+    first proxy lives). That user's `doctor` shows Error `proxy-secret`, and their Claude Code would get 498 from the other user's proxy. Proxy mode on a
+    shared Linux host (several simultaneous users) does not work with one fixed `proxy_listen`; a per-user port is needed (open item).
+  - Uninstall: files, unit, global enable and drop-in are removed; the rpm used to leave empty `/etc/claude-code/managed-settings.d` (fixed: the spec owns the dirs).
+    Running daemons were still active after removal (stop at logout: from reading the unit, not observed). `purge-user` must run before removal (the launcher is gone
+    afterwards: "can't open file"); it removes our header lines and `~/.config/aigw-claude-auth` but leaves the `~/.claude/settings.json` file itself. Without purge the user keeps
+    `~/.config/aigw-claude-auth/*` and the header line in `settings.json` (inert without the managed base URL and hooks).
 
-Not covered: real privileged installs, LaunchAgent/systemd/Task Scheduler actually starting at login, the group-principal task
+Not covered: macOS and Windows privileged installs, LaunchAgent/Task Scheduler actually starting at login (systemd is covered above), the group-principal task
 registering and firing, a real MDM push, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
 
 ## What the emulated pilot needs

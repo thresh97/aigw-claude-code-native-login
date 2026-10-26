@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import posixpath
 import re
 import shlex
 import shutil
@@ -369,7 +370,7 @@ def build_linux(fleet, out, rpm=False):
     if rpm:
         rstage = work / "rpm"
         write_stage(rstage, files, paths)
-        spec = RPM_SPEC.format(name=name, ver=ver, rev=rev, stage="/stage", files=f"%dir {paths['install_dir']}\n" + "\n".join(rel))
+        spec = RPM_SPEC.format(name=name, ver=ver, rev=rev, stage="/stage", files=f"%dir {paths['install_dir']}\n%dir {posixpath.dirname(paths['managed'])}\n%dir {posixpath.dirname(posixpath.dirname(paths['managed']))}\n" + "\n".join(rel))
         spec = spec.replace("@POSTINST@", strip_shebang(scripts["postinst"])).replace("@PRERM@", strip_shebang(scripts["prerm"]))
         (work / "pkg.spec").write_text(spec)
         rpmfile = f"{name}-{ver}-{rev}.noarch.rpm"
