@@ -256,6 +256,55 @@ On the gateway config claim: the hybrid gateway reads `defaults.config_slug`, th
 
 For each new provider, confirm with `status` or `inspect` that the token carries the audience, issuer and (Mode A) claims the gateway expects before rollout.
 
+## Mapping IdP groups to gateway workspaces (Mode A)
+
+Fleets need users in different IdP groups to land in different gateway workspaces, each with its own `defaults` (config, metadata) and possibly limits. In Mode A all of that rides in the JWT. Two ways to produce it: the IdP itself, or the broker. **Recommended: the broker**, for one rule set across IdPs and a failure that blocks instead of degrading. The IdP-native way is documented for Okta because some operators won't run a broker for an IdP that can do most of it alone.
+
+**What the claims need** (Portkey's [JWT reference](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt), docs, not run here)
+
+| Claim | Shape | Notes |
+| --- | --- | --- |
+| `portkey_oid`, `portkey_workspace` | string | Required on AI Gateway Cloud |
+| `scope` / `scopes` | string or array | Okta writes `scp`; add `scopes` = `access.scope` (README finding 21) |
+| `defaults` | object: `config_id`, `metadata` | The hybrid gateway reads `defaults.config_slug` (README); the JWT reference lists only `config_id` |
+| `usage_limits` | array of objects: `id`, `type`, `credit_limit`, `status` | Top level, not in `defaults`. "Each unique JWT is tracked separately for token-level limits": with hourly renewal a per-token budget may reset each hour (open question 1) |
+| `rate_limits` | undocumented | |
+| `email_id`, then `sub`, then `uid` | string | User attribution |
+
+**Option 1: the broker (recommended).** The client sends the IdP token to `broker_url`; the broker validates it against the IdP's JWKS, reads the user's groups, looks them up in one ordered rule table (group to `portkey_workspace`, `defaults`, `usage_limits`, `metadata`), and mints the Mode A JWT with its own key. The client needs nothing IdP-specific.
+
+- Fails closed: no broker answer, no JWT, and the precheck blocks the prompt.
+- One table for Entra ID, Okta and the rest; the gateway trusts one signing key.
+- Already deployed for Entra ID (`aigw-entra-jwt-broker`); Okta needs its issuer and group claim added there.
+- Cost: a service to run and secure, holding a signing key.
+
+**Option 2: Okta-native (claim expressions plus a token inline hook).** Flat claims can come from expressions (`isMemberOfGroupName("aigw-eng") ? "ws-eng" : ...`), but expressions can't produce objects (finding 21; [Portkey: JWT authentication with Okta](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta#jwt-authentication-with-okta)), so `defaults` and `usage_limits` need a [token inline hook](https://developer.okta.com/docs/concepts/inline-hooks/): Okta POSTs to your HTTPS endpoint at token issuance and applies the `com.okta.access.patch` commands it returns. A reference hook with a group mapping file is in `gateway/okta-token-hook/`.
+
+- **The hook fails open** (Okta docs): on a 3 s timeout or an error "The Okta process flow continues with the original token returned", with no retry. So:
+  - put **every** Mode A claim in the hook, including `portkey_oid` and `portkey_workspace`, and none in claim expressions; a hook failure, or a user in no mapped group, then yields a token without the required claims, which the gateway refuses. Never pair expression-set workspace claims with hook-set limits: a failed hook would then issue a working token without limits;
+  - keep the hook fast and local (mapping in memory, no calls out).
+- The endpoint must be reachable from the internet by Okta; Okta authenticates its call with a header (Basic) or OAuth 2.0.
+- Attach it in the authorization server's access policy rule ("Use this inline hook").
+- Unconfirmed from the docs: whether the hook fires on refresh grants (the client refreshes hourly; if it doesn't, claims change only at the next full sign-in), and whether patch values may be objects and arrays. Confirm both with Token Preview and a real sign-in before rollout.
+
+**Comparison**
+
+| | Broker | Okta inline hook |
+| --- | --- | --- |
+| On failure | No JWT; prompt blocked | Original token (fail closed only with all Mode A claims in the hook) |
+| IdPs | Any | Okta only |
+| Where the rules live | One table in the broker | The hook's mapping file (plus Okta groups) |
+| Signing key | The broker's | Okta's |
+| Runs where | Yours, reachable from clients | Yours, reachable from Okta (internet) |
+| Client config | `broker_url` | Nothing extra |
+
+**Open questions for Portkey**
+
+1. Are `usage_limits` in a JWT counted per token or per user (`sub`/`email_id`)? If per token, hourly renewal resets them; keep budgets on the workspace or in user-keyed policies until this is answered.
+2. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both, and what applies when `defaults` is absent (workspace default config)?
+3. Is a scope such as `completions.write` required, and is it checked per route?
+4. What shape does `rate_limits` take?
+
 ## Sign-in method selection and in-session re-login (new in v2)
 
 v2 picks the sign-in method from an explicit, overridable order, remembers what worked, and can re-sign-in from inside a Claude Code session with either PKCE or device code. It never assumes the device grant exists. v1.1.1 has a narrower version of this: `login` auto-detects from `SSH_CONNECTION`, `SSH_TTY`, `DISPLAY` and `WAYLAND_DISPLAY` (macOS counts as a GUI); the only override is `--pkce` / `--device` per run; and the in-session path (`hook_login`) is device code or nothing.

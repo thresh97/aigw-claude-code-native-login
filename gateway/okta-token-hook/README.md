@@ -103,7 +103,7 @@ Okta's docs I could read don't show groups in the hook request. The hook looks i
 
 Confirmed from docs (the Okta reference page rendered empty to my fetcher, so these come from Okta's token-hook
 guide, Okta Developer Forum posts and Portkey's Okta page):
-- HTTPS POST to your endpoint, Basic or configured-header auth ([guide](https://developer.okta.com/docs/guides/token-inline-hook/nodejs/main/)); 3 s timeout, fail open (task brief, from Okta docs).
+- HTTPS POST to your endpoint, Basic or configured-header auth ([guide](https://developer.okta.com/docs/guides/token-inline-hook/nodejs/main/)); 3 s timeout, no retries, and on timeout or error "The Okta process flow continues with the original token returned" ([inline hooks concepts](https://developer.okta.com/docs/concepts/inline-hooks/)).
 - Request has `data.context` (`request`, `protocol`, `policy`, `user`) and `data.access.claims` / `.token.lifetime` /
   `.scopes` (a [forum post](https://devforum.okta.com/t/inline-token-hook-issue/23559) quoting an event).
 - Response `com.okta.access.patch` with `add` on `/claims/<name>`, object value ([Portkey Okta page](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta)).
