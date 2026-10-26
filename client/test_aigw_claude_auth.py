@@ -675,7 +675,7 @@ class WindowsMockTests(Base):
         self.assertTrue(root.find("t:Actions/t:Exec/t:Command", ns).text.endswith("python.exe"))
 
     def test_task_print_registers_nothing_and_install_refuses_off_windows(self):
-        with mock.patch("subprocess.run") as run:
+        with mock.patch.object(A, "current_user", return_value="HOST\\me"), mock.patch("subprocess.run") as run:
             code, out, _ = self.run_cli("task", "print")
             self.assertEqual(code, 0)
             self.assertIn("<LogonTrigger>", out)
