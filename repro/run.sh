@@ -35,7 +35,7 @@ finish()  { trap - EXIT; cleanup
 guard()   { [[ " ${ARGS[*]:-} " == *" --yes "* ]] || { echo "ERROR: $1 changes shared state ($2); re-run with --yes"; exit 2; }; }
 
 # ---------------------------------------------------------------- article-specific
-export CLAUDE_BIN MODEL LOGIN_CONFIG_DIR GATEWAY_URL TOKEN_COMMAND LB_GUARD SENTINEL
+export CLAUDE_BIN MODEL LOGIN_CONFIG_DIR GATEWAY_URL TOKEN_COMMAND LB_GUARD SENTINEL GATEWAY_EXTRA_HEADERS
 [[ -n ${AIGW_CLAUDE_AUTH_DIR:-} ]] && export AIGW_CLAUDE_AUTH_DIR
 CLAUDE=${CLAUDE_BIN:-claude}
 CLIENT=$HERE/../client/aigw_claude_auth.py

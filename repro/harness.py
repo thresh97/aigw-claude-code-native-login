@@ -46,6 +46,13 @@ OAUTH = "sk-ant-oat01-mock"     # a dummy; what the mock gateway expects as the 
 PK = "x-portkey-api-key"
 SENTINEL = os.environ.get("SENTINEL") or "expired"
 IS_WIN = sys.platform == "win32"
+# Extra headers for the real gateway (e.g. `x-portkey-config: <config id>`), `Name: value` pairs separated by `;`.
+EXTRA = dict(tuple(x.strip() for x in kv.split(":", 1)) for kv in (os.environ.get("GATEWAY_EXTRA_HEADERS") or "").split(";") if ":" in kv)
+
+
+def with_extra(lines):
+    """ANTHROPIC_CUSTOM_HEADERS text: the given lines plus GATEWAY_EXTRA_HEADERS."""
+    return "\n".join([lines] * bool(lines) + [f"{k}: {v}" for k, v in EXTRA.items()])
 
 
 def observe(key, value):
@@ -894,6 +901,7 @@ def gateway_request(token, oauth=None, extra=None):
     if oauth:
         h["authorization"] = f"Bearer {oauth}"
         h["anthropic-beta"] = "oauth-2025-04-20"
+    h.update(EXTRA)
     h.update(extra or {})
     body = json.dumps({"model": MODEL, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with exactly: LIVE-OK"}]}).encode()
     req = urllib.request.Request(os.environ["GATEWAY_URL"].rstrip("/") + "/v1/messages", data=body, headers=h, method="POST")
@@ -946,7 +954,7 @@ def scenario_live_login(out):
     try:
         for name, t in cases:
             s = {k: v for k, v in json.loads(json.loads(backup.read_text(encoding="utf-8"))["text"] or "{}").items() if k not in ("env", "hooks")}
-            s["env"] = {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {t}"} if t is not None else {}
+            s["env"] = {"ANTHROPIC_CUSTOM_HEADERS": with_extra(f"{PK}: {t}" if t is not None else "")} if t is not None or EXTRA else {}
             claude.write_settings(s)
             b = cred_state(cfg)
             mark = gw.mark()
@@ -986,12 +994,16 @@ def scenario_client_live(out):
         observe("install_exit", r.returncode)
         r = run("sync", "--force")
         observe("sync_exit", r.returncode)
+        if EXTRA:   # the client keeps other lines in ANTHROPIC_CUSTOM_HEADERS
+            s = claude.settings()
+            s["env"]["ANTHROPIC_CUSTOM_HEADERS"] = with_extra(s["env"]["ANTHROPIC_CUSTOM_HEADERS"])
+            claude.write_settings(s)
         tok = header_of(claude.settings())
         status, body, _ = gateway_request(tok, "sk-ant-oat01-invalid")
         observe("gateway_accepts_jwt", "yes" if status != 401 or "anthropic" in body else f"no ({status})")
         observe("turn_fresh", classify(claude.oneshot("Reply with exactly: LIVE-OK")["text"]))
         s = claude.settings()
-        s["env"]["ANTHROPIC_CUSTOM_HEADERS"] = f"{PK}: {jwt(time.time() - 60, kind='gateway')}"   # an expired JWT
+        s["env"]["ANTHROPIC_CUSTOM_HEADERS"] = with_extra(f"{PK}: {jwt(time.time() - 60, kind='gateway')}")   # an expired JWT
         claude.write_settings(s)
         mark = gw.mark()
         t = claude.oneshot("Reply with exactly: LIVE-OK")
