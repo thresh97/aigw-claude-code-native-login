@@ -141,7 +141,7 @@ class Client:
         self.dir.mkdir(parents=True)
         self.idp = idp
         self.cfg = {"issuer": idp.url, "client_id": "cli", "scope": "openid offline_access", "broker_url": idp.url + "/exchange",
-                    "notify": "off", "hook_wait": 3}
+                    "notify": "off", "hook_wait": 3, "secret_store": "file"}   # file: scenarios never touch the real OS store
         self.configure(**cfg)
 
     def configure(self, **kw):
