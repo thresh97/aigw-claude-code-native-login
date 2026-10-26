@@ -300,8 +300,8 @@ Fleets need users in different IdP groups to land in different gateway workspace
 
 **Open questions for Portkey**
 
-1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both, and what applies when `defaults` is absent (workspace default config)?
-2. Is a scope such as `completions.write` required, and is it checked per route?
+1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both? (Without `defaults`, the workspace's default config for user API keys applies: README finding 22.)
+2. Is a scope such as `completions.write` required, and is it checked per route? (Not required on the hybrid gateway for `/v1/messages`: finding 22. SaaS and other routes not tested.)
 3. What shape does `rate_limits` take?
 
 ## Sign-in method selection and in-session re-login (new in v2)
@@ -484,7 +484,7 @@ The tested fleet recipe from v1.1.1 is: hooks and `ANTHROPIC_BASE_URL` in Claude
 **Gateway side (once)**
 
 1. Create the passthrough config: it forwards the caller's `authorization` and `anthropic-beta` to Anthropic; its `api_key` is a placeholder. Bind it to the credential (JWT `defaults.config_slug` on hybrid, `config_id` on SaaS) or make it the workspace default.
-2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker. The JWKS URL is per org (one org per tenant service group) and takes a comma-separated list, so a broker and an IdP can be trusted side by side (operator's statement; not yet run).
+2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker. The JWKS URL is per org (one org per tenant service group) and takes a comma-separated list, so a broker and an IdP can be trusted side by side (with both listed, Okta's JWT is accepted: README finding 22; the broker's JWT not re-sent).
 3. Optional, hybrid only: the LB guard. On an L7 load balancer, answer the sentinel with 498 "expired", forward any other header value, answer a missing header on OAuth requests (`anthropic-beta` contains `oauth-2025-04-20`) with 498 "missing", forward the rest.
 
 **Client side**
