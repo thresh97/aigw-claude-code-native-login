@@ -1,0 +1,35 @@
+{
+  "_comment": "PLACEHOLDERS ONLY. First matching rule wins (file order). Replace every <value>.",
+  "rules": [
+    {
+      "group": "aigw-research",
+      "claims": {
+        "portkey_oid": "<portkey org uuid>",
+        "portkey_workspace": "<research workspace slug>",
+        "defaults": {
+          "config_id": "<config id, e.g. pc-research-xxxx>",
+          "config_slug": "<config slug, hybrid gateway>",
+          "metadata": { "team": "research", "environment": "<env>" }
+        }
+      }
+    },
+    {
+      "group": "aigw-eng",
+      "email_id_from_login": true,
+      "claims": {
+        "portkey_oid": "<portkey org uuid>",
+        "portkey_workspace": "<eng workspace slug>",
+        "defaults": {
+          "config_id": "<config id, e.g. pc-eng-xxxx>",
+          "config_slug": "<config slug, hybrid gateway>",
+          "metadata": { "team": "eng", "environment": "<env>" }
+        },
+        "usage_limits": [
+          { "id": "<limit id>", "type": "cost", "credit_limit": 100, "status": "active" }
+        ],
+        "rate_limits": "<shape undocumented: any JSON the gateway expects is passed through as is>"
+      }
+    }
+  ],
+  "default": null
+}
