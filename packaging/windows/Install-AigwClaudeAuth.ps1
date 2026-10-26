@@ -30,13 +30,15 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$Root = '',
-    [string]$PayloadDir = (Join-Path $PSScriptRoot 'payload'),
+    [string]$PayloadDir = '',
     [switch]$SkipTask,
     [switch]$ForceTaskWithRoot,
     [switch]$AddToPath
 )
 $ErrorActionPreference = 'Stop'
 $TaskName = 'aigw-claude-auth-fleet'
+# not a param default: with powershell -File (Intune, ssh) $PSScriptRoot is still empty while defaults are evaluated (PS 5.1)
+if (-not $PayloadDir) { $PayloadDir = Join-Path $PSScriptRoot 'payload' }
 
 function Resolve-Target([string]$path) {
     if ($Root -eq '') { return $path }

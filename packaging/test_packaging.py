@@ -331,6 +331,9 @@ class WindowsPayload(unittest.TestCase):
                 text = ps.read_bytes()
                 text.decode("ascii")                      # Windows PowerShell 5.1 reads BOM-less files as ANSI: keep them ASCII
                 self.assertIn(b"SupportsShouldProcess", text)
+                # `powershell -File` (Intune, ssh) evaluates param defaults before $PSScriptRoot is set (PS 5.1)
+                param_block = text.decode().split("param(", 1)[1].split("\n)", 1)[0]
+                self.assertNotIn("$PSScriptRoot", param_block, ps.name)
 
 
 if __name__ == "__main__":
