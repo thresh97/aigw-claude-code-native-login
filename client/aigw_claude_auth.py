@@ -13,10 +13,16 @@ keeps it fresh:
                 block the prompt when no JWT can be had. When signed out, it starts a device code sign-in in the
                 background and puts the URL and code into the block message, so the user can sign in from the session
   hook stop-failure  StopFailure hook: after a gateway auth failure, force a refresh so the retry works, and notify
+  proxy         run the local proxy in the foreground (mode "proxy"; the daemon does this in the background)
   token         print a valid JWT on stdout (for scripts and curl)
   status        show where the JWT comes from and when it expires (never the token itself)
   install       add ANTHROPIC_BASE_URL and the two hooks to the settings file (or print them for managed settings)
   logout        forget the refresh token and put the sentinel into the settings
+
+Two modes (`mode` in the config). file (default): the JWT lives in Claude Code's settings, as above. proxy: a local
+proxy on 127.0.0.1 adds the JWT to each request (Claude Code reaches it through ANTHROPIC_BASE_URL), keeps the JWT in
+memory only, answers a gateway refusal with 498 and streams responses through; `install` writes the proxy's address
+and a per-user secret instead of a JWT. See "Mode 2" below.
 
 Where the JWT comes from (config file, see README):
   * an OIDC IdP whose token the gateway accepts directly (Portkey "Mode B"), or
@@ -33,7 +39,10 @@ Windows process check, a PowerShell toast and a Task Scheduler task on Windows).
 import argparse
 import base64
 import hashlib
+import hmac
+import http.client
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -41,6 +50,8 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -51,6 +62,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zlib
 from xml.sax.saxutils import escape as xml_escape
 from contextlib import contextmanager
 from pathlib import Path
@@ -87,6 +99,9 @@ DEFAULTS = {
     "redirect_port": 0,                # 0 = any free port (fine for Entra and most IdPs); set if the IdP pins the port
     "secret_store": "auto",            # where the refresh token lives: auto (OS credential store, else file) | file (state.json)
     "debug_until": 0,                  # epoch seconds; while in the future, each renewal logs an `inspect` summary (`inspect --debug on` sets it in state.json)
+    "mode": "file",                    # file (the JWT goes into settings.json) | proxy (a local proxy injects it; see "Mode 2")
+    "proxy_listen": "127.0.0.1:18787", # proxy mode: loopback address and a fixed port (install writes ANTHROPIC_BASE_URL from it)
+    "gateway_url": "",                 # proxy mode: the gateway the proxy forwards to (file mode keeps it in ANTHROPIC_BASE_URL)
     "http_timeout": 30,
     "hook_http_timeout": 5,            # per request inside a hook: Claude Code gives up on a hook after HOOK_TIMEOUT s and
                                        # then sends the prompt anyway, so discovery + refresh + broker + hook_wait must fit
@@ -145,6 +160,11 @@ def load_config(path):
         raise AuthError("secret_store must be auto or file")
     if not cfg["sentinel"]:
         raise AuthError("sentinel must not be empty (an empty header can't be told apart from a missing one)")
+    if cfg["mode"] not in ("file", "proxy"):
+        raise AuthError("mode must be file or proxy")
+    parse_listen(cfg["proxy_listen"])                   # refuses a non-loopback address, whatever the mode
+    if cfg["gateway_url"] and urllib.parse.urlsplit(str(cfg["gateway_url"])).scheme not in ("http", "https"):
+        raise AuthError("gateway_url must be an http:// or https:// URL")
     return cfg
 
 
@@ -290,31 +310,48 @@ class Settings:
         raw = (data.get("env") or {}).get("ANTHROPIC_CUSTOM_HEADERS", "")
         return [l for l in raw.split("\n") if l.strip()]
 
-    def get(self):
-        for line in self._lines(self.load()):
-            name, _, value = line.partition(":")
-            if name.strip().lower() == self.header.lower():
+    def get_line(self, name, data=None):
+        for line in self._lines(self.load() if data is None else data):
+            n, _, value = line.partition(":")
+            if n.strip().lower() == name.lower():
                 return value.strip()
         return ""
 
+    def get(self):
+        return self.get_line(self.header)
+
     def put(self, value):
-        data = self.load()
-        lines = [l for l in self._lines(data) if l.partition(":")[0].strip().lower() != self.header.lower()]
-        lines.append(f"{self.header}: {value}")
-        data.setdefault("env", {})["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(lines)
-        write_private(self.path, json.dumps(data, indent=2) + "\n")
+        self.apply(put_lines={self.header: value})
 
     def merge(self, base_url=None, hook_command=None):
         """Add ANTHROPIC_BASE_URL and our two hooks; replaces earlier entries of ours, keeps everything else."""
+        return self.apply(base_url=base_url, hook_command=hook_command)
+
+    def apply(self, base_url=None, hook_command=None, put_lines=None, drop_lines=(), drop_base_url=None):
+        """One atomic write: ANTHROPIC_BASE_URL (or drop it, when drop_base_url(current) says so), our hooks, and header
+        lines in ANTHROPIC_CUSTOM_HEADERS (put_lines {name: value}; drop_lines [name]). Everything else stays as it is."""
         data = self.load()
+        env = data.setdefault("env", {})
         if base_url:
-            data.setdefault("env", {})["ANTHROPIC_BASE_URL"] = base_url
+            env["ANTHROPIC_BASE_URL"] = base_url
+        elif drop_base_url and env.get("ANTHROPIC_BASE_URL") and drop_base_url(env["ANTHROPIC_BASE_URL"]):
+            del env["ANTHROPIC_BASE_URL"]
         if hook_command:
             hooks = data.setdefault("hooks", {})
             for event, sub in (("UserPromptSubmit", "precheck"), ("StopFailure", "stop-failure")):
                 entries = [e for e in hooks.get(event, []) if not MARKER.search(json.dumps(e))]
                 entries.append(hook_entry(hook_command, sub))
                 hooks[event] = entries
+        if put_lines or drop_lines:
+            names = {n.lower() for n in list(put_lines or {}) + list(drop_lines)}
+            lines = [l for l in self._lines(data) if l.partition(":")[0].strip().lower() not in names]
+            lines += [f"{n}: {v}" for n, v in (put_lines or {}).items()]
+            if lines:
+                env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(lines)
+            else:
+                env.pop("ANTHROPIC_CUSTOM_HEADERS", None)
+        if not env:
+            data.pop("env", None)
         write_private(self.path, json.dumps(data, indent=2) + "\n")
         return data
 
@@ -844,7 +881,10 @@ def sync(cfg, state, settings, force=False, idp=None):
     Returns ok=False when no fresh JWT could be had. The current value is replaced by the sentinel only if it is
     no longer usable (less than 30 s left), so a short IdP outage doesn't throw away a JWT that still works.
     idp: an IdP token from a sign-in that just happened, used instead of a refresh.
+    Proxy mode: the proxy holds the JWT, so this asks it to renew (nothing is written to the settings).
     """
+    if cfg["mode"] == "proxy":
+        return sync_proxy(cfg, state, force, idp)
     with state.lock():
         state.migrate()
         current = settings.get()
@@ -1391,13 +1431,21 @@ def cmd_inspect(a, cfg, state, settings):
         if a.debug == "off":
             print("debug: off")
             return 0
-    if a.fresh:
-        with state.lock():
-            token = TokenSource(cfg, state).gateway_jwt()      # minted, not written to the settings
-        print("(fresh token: minted from the source, not written to the settings; a rotated refresh token is kept)")
+    if a.fresh and a.live:
+        raise AuthError("--fresh and --live are different views: pick one")
+    if a.live or (cfg["mode"] == "proxy" and not a.fresh):
+        # the token stays in the proxy; it sends back the rows and verdicts
+        body = proxy_call(cfg, state, "GET", CONTROL_PREFIX + "inspect" + ("?claims=1" if a.show_claims else ""))
+        rows, problems = [tuple(r) for r in body["rows"]], list(body["problems"])
+        print("(live: asked the running proxy; the token never leaves it)")
     else:
-        token = settings.get()
-    rows, problems = inspect_token(token, cfg, show_claims=a.show_claims)
+        if a.fresh:
+            with state.lock():
+                token = TokenSource(cfg, state).gateway_jwt()      # minted, not written to the settings
+            print("(fresh token: minted from the source, not written to the settings; a rotated refresh token is kept)")
+        else:
+            token = settings.get()
+        rows, problems = inspect_token(token, cfg, show_claims=a.show_claims)
     for k, v in rows:
         print(f"{k:18} {v}")
     until = debug_active(cfg, state)
@@ -1405,8 +1453,683 @@ def cmd_inspect(a, cfg, state, settings):
         print(f"{'debug':18} ON until {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}: each renewal logs a summary; turn off with `inspect --debug off`")
     for p in problems:
         print(f"{'PROBLEM':18} {p}")
-    # TODO(phase 4, proxy mode): `inspect --live` asks the running proxy over its control channel; not built yet.
     return 1 if problems else 0
+
+
+# --------------------------------------------------------------------------------------------- Mode 2: local proxy
+# `mode: proxy`. A user-space process on loopback adds the gateway header to each request Claude Code sends (through
+# ANTHROPIC_BASE_URL) and forwards it to `gateway_url`. The JWT lives in this process's memory only.
+#
+# Threat model (local exposure). Any process that can reach the loopback port would otherwise get the user's JWT
+# injected into requests it makes. So: (1) the listener is bound to a loopback address only (parse_listen refuses
+# anything else); (2) every request needs a per-user secret in the `x-aigw-local` header, compared in constant time.
+# `install` writes the secret into the user's settings (env.ANTHROPIC_CUSTOM_HEADERS), which Claude Code sends on each
+# request; the secret is also in the state dir (proxy-secret, mode 600), so the proxy and the CLI commands read it.
+# A local process running as the same user can read both files and so can use the proxy: that is the same trust as
+# reading settings.json in file mode. Another user on a shared host can't, nor can a web page in a browser (it can't
+# send the header without a CORS preflight, which the proxy never approves). Without the secret the proxy answers 498
+# with a fixed text that says nothing about tokens, upstream or configuration. (A 401 would send a stored login into
+# its OAuth refresh loop, a 403 isn't shown as clearly.) The secret header is stripped before forwarding.
+# The control channel (`/_aigw/...`: status, inspect, renew, forget) is on the same listener behind the same secret and
+# never returns the token.
+
+LOCAL_HEADER = "x-aigw-local"
+CONTROL_PREFIX = "/_aigw/"
+GUARD_MESSAGES = {   # the same bodies as the load balancer rules (gateway/alb-guard-ingress.yaml, repro/mock_gateway.py)
+    "expired": "AI gateway token expired and could not be refreshed. Sign in to the gateway again, then retry.",
+    "missing": "AI gateway token missing (no x-portkey-api-key). Sign in to the gateway, then retry.",
+}
+LOCAL_DENIED = "AI gateway local proxy: request not authorized. Run `aigw-claude-auth install` to refresh the Claude Code settings."
+HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
+STREAM_CHUNK = 64 * 1024
+MAX_401_BODY = 64 * 1024
+
+
+def parse_listen(text):
+    """(host, port) from proxy_listen, loopback only. 'localhost' means 127.0.0.1. Port 0 = any free port."""
+    host, sep, port = str(text).strip().rpartition(":")
+    if not sep or not port.isdigit() or int(port) > 65535:
+        raise AuthError(f"proxy_listen must look like 127.0.0.1:18787, not {text!r}")
+    host = host.strip("[]")
+    if host.lower() == "localhost":
+        host = "127.0.0.1"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise AuthError(f"proxy_listen host must be a loopback IP address (127.0.0.1 or ::1), not {host!r}")
+    if not ip.is_loopback:
+        raise AuthError(f"proxy_listen must be a loopback address (127.0.0.1 or ::1): {host} would expose the gateway JWT to the network")
+    return str(ip), int(port)
+
+
+def fmt_hostport(host, port):
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def proxy_hostport(cfg):
+    return fmt_hostport(*parse_listen(cfg["proxy_listen"]))
+
+
+def proxy_base_url(cfg):
+    """The ANTHROPIC_BASE_URL that reaches the proxy. Needs a fixed port so the value in the settings stays valid."""
+    if parse_listen(cfg["proxy_listen"])[1] == 0:
+        raise AuthError("proxy_listen needs a fixed port (not 0): install writes it into ANTHROPIC_BASE_URL")
+    return "http://" + proxy_hostport(cfg)
+
+
+def is_proxy_url(cfg, url):
+    try:
+        return urllib.parse.urlsplit(str(url)).netloc == proxy_hostport(cfg)
+    except (AuthError, ValueError):
+        return False
+
+
+def short_fp(token):
+    """Fingerprint for the access log, the same format the mock gateway uses: length and a short hash."""
+    return f"len{len(token)}:{hashlib.sha256(token.encode()).hexdigest()[:10]}" if token else None
+
+
+def secret_file(state):
+    return state.dir / "proxy-secret"
+
+
+def proxy_secret(state, create=False):
+    """The per-user secret ('' if there is none yet). create: make one (mode 600, under the state lock)."""
+    def read():
+        try:
+            v = secret_file(state).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        return v if len(v) >= 32 else ""
+    v = read()
+    if v or not create:
+        return v
+    with state.lock():
+        v = read()
+        if not v:
+            v = secrets.token_urlsafe(32)
+            write_private(secret_file(state), v + "\n")
+        return v
+
+
+def secret_matches(expected, given):
+    return bool(expected) and given is not None and hmac.compare_digest(expected.encode("utf-8", "replace"), str(given).encode("utf-8", "replace"))
+
+
+class JwtHolder:
+    """The gateway JWT, in memory. Renewed from the configured source like `sync` does (under the state lock, because a
+    refresh token rotates), ahead of expiry by the daemon loop, on demand in the request path as a fallback."""
+
+    def __init__(self, cfg, state, cooldown=10):
+        self.cfg, self.state, self.cooldown = cfg, state, cooldown
+        self.token = ""
+        self.lock = threading.Lock()
+        self.renewed_at = 0
+        self.last_error = ""
+        self.retry_at = 0.0            # request path: no new attempt before this (monotonic), so an IdP outage costs one slow request
+        self.last_forced = -1e9        # monotonic time of the last renewal forced by a refusal
+
+    def usable(self, tok=None):
+        tok = self.token if tok is None else tok
+        return bool(tok) and seconds_left(tok) > 0
+
+    def _mint(self):
+        """Mint and install a new JWT (caller holds self.lock). Returns (ok, message)."""
+        try:
+            with self.state.lock():
+                self.state.migrate()
+                new = TokenSource(self.cfg, self.state).gateway_jwt()
+        except AuthError as e:
+            return self._failed(str(e))
+        except Exception as e:                                  # a bug must not take the proxy down
+            return self._failed(f"{type(e).__name__}: {e}")
+        left = seconds_left(new)
+        if left < 60:
+            return self._failed("refusing to use it: " + ("the new JWT has no exp claim" if left < 0 else f"the new JWT expires in {left}s"))
+        self.token, self.renewed_at, self.last_error = new, int(time.time()), ""
+        try:
+            debug_summary(self.cfg, self.state, new)
+        except Exception:
+            pass
+        return True, f"renewed the JWT ({fingerprint(new)})"
+
+    def _failed(self, msg):
+        self.last_error = msg
+        self.retry_at = time.monotonic() + 10
+        return False, msg
+
+    def renew(self, force=False):
+        """(ok, changed, message). Not forced: only when less than refresh_before is left."""
+        with self.lock:
+            if not force and seconds_left(self.token) > self.cfg["refresh_before"]:
+                return True, False, f"current JWT still valid ({fingerprint(self.token)})"
+            ok, msg = self._mint()
+            if not ok and self.usable():
+                return False, False, msg + " (the current JWT is kept)"
+            return ok, ok, msg
+
+    def get(self):
+        """The JWT for a request, or None when there is no usable one (the caller fails closed)."""
+        tok = self.token
+        if seconds_left(tok) > self.cfg["refresh_before"]:
+            return tok
+        with self.lock:
+            if seconds_left(self.token) <= self.cfg["refresh_before"] and time.monotonic() >= self.retry_at:
+                self._mint()
+            return self.token if self.usable() else None
+
+    def renew_after_refusal(self, used):
+        """The gateway refused `used`. A different, usable JWT to retry with, or None (nothing new to try)."""
+        with self.lock:
+            if self.token != used and self.usable():
+                return self.token                               # another request already renewed it
+            if time.monotonic() - self.last_forced < self.cooldown:
+                return None
+            self.last_forced = time.monotonic()
+            self._mint()
+            return self.token if self.token != used and self.usable() else None
+
+    def forget(self):
+        with self.lock:
+            self.token, self.renewed_at = "", 0
+            self.retry_at = 0.0
+
+
+def classify_401(data, encoding=""):
+    """'gateway' for the gateway's own refusal (a Portkey Error body), 'other' for anything else, Anthropic's relayed 401
+    included (it carries "provider":"anthropic")."""
+    enc = (encoding or "").lower()
+    if "gzip" in enc or "deflate" in enc:
+        try:
+            data = zlib.decompress(data, 47)
+        except zlib.error:
+            pass
+    compact = data.replace(b" ", b"")
+    if b"Portkey Error:" in data and b'"provider":"anthropic"' not in compact:
+        return "gateway"
+    return "other"
+
+
+class Upstream:
+    """Connections to the gateway: TLS verified against the system store, HTTPS_PROXY / HTTP_PROXY / NO_PROXY honored
+    (loopback upstreams are never proxied)."""
+
+    def __init__(self, url, timeout=600):
+        u = urllib.parse.urlsplit(url)
+        self.scheme, self.host = u.scheme, u.hostname
+        self.port = u.port or (443 if u.scheme == "https" else 80)
+        self.base = u.path.rstrip("/")
+        self.netloc = (f"[{u.hostname}]" if ":" in u.hostname else u.hostname) + (f":{u.port}" if u.port else "")
+        self.timeout = timeout
+        self.ctx = ssl.create_default_context() if u.scheme == "https" else None
+
+    def _proxy(self):
+        try:
+            if ipaddress.ip_address(self.host).is_loopback or self.host == "localhost":
+                return None
+        except ValueError:
+            if self.host == "localhost":
+                return None
+        try:
+            if urllib.request.proxy_bypass(self.host):
+                return None
+            found = urllib.request.getproxies().get(self.scheme)
+        except Exception:
+            return None
+        return urllib.parse.urlsplit(found) if found else None
+
+    def connect(self):
+        """(connection, request-target function)."""
+        px = self._proxy()
+        if px is None:
+            if self.scheme == "https":
+                return http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout, context=self.ctx), lambda p: self.base + p
+            return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout), lambda p: self.base + p
+        auth = {}
+        if px.username:
+            cred = f"{urllib.parse.unquote(px.username)}:{urllib.parse.unquote(px.password or '')}"
+            auth = {"Proxy-Authorization": "Basic " + base64.b64encode(cred.encode()).decode()}
+        phost, pport = px.hostname, px.port or (443 if px.scheme == "https" else 80)
+        if self.scheme == "https":
+            conn = http.client.HTTPSConnection(phost, pport, timeout=self.timeout, context=self.ctx) if px.scheme == "https" \
+                else http.client.HTTPConnection(phost, pport, timeout=self.timeout)
+            conn.set_tunnel(self.host, self.port, headers=auth)
+            return conn, lambda p: self.base + p
+        conn = http.client.HTTPConnection(phost, pport, timeout=self.timeout)
+        return conn, lambda p: f"http://{self.netloc}{self.base}{p}"
+
+
+class ProxyServer:
+    """The Mode 2 proxy. start() binds and serves in a thread; stop() ends it."""
+
+    def __init__(self, cfg, state, settings, access_log=None, renew_cooldown=10):
+        if not cfg.get("gateway_url"):
+            raise AuthError("proxy mode needs gateway_url in the config (the gateway the proxy forwards to)")
+        self.cfg, self.state, self.settings = cfg, state, settings
+        self.listen = parse_listen(cfg["proxy_listen"])
+        self.up = Upstream(cfg["gateway_url"], timeout=600)
+        self.up_hostport = (self.up.host, self.up.port)
+        if self.up_hostport == (self.listen[0], self.listen[1]) and self.listen[1]:
+            raise AuthError("gateway_url points at the proxy itself")
+        self.header = cfg["header"].lower()
+        self.holder = JwtHolder(cfg, state, renew_cooldown)
+        self.secret = proxy_secret(state, create=True)
+        self.access_log, self.log_lock = access_log, threading.Lock()
+        self.stats, self.stats_lock = {}, threading.Lock()
+        self.last_outcome, self.started = "", time.time()
+        self.blocked = None                 # a preflight Error (dict): every request is answered 498 with it
+        self.blocked_checked = 0.0
+        self.signin_msg, self.signin_at = "", 0.0
+        self.srv, self.port = None, 0
+
+    # -- local secret
+    def authorized(self, given):
+        if secret_matches(self.secret, given):
+            return True
+        fresh = proxy_secret(self.state)                        # `install` may have made a new one since we started
+        if fresh and fresh != self.secret:
+            self.secret = fresh
+            return secret_matches(fresh, given)
+        return False
+
+    # -- fail closed
+    def no_jwt_message(self):
+        msg = GUARD_MESSAGES["expired"]
+        cfg = self.cfg
+        if cfg["token_command"] or effective_hook_login(cfg) == "off" or self.state.get_refresh_token():
+            return msg
+        if time.time() - self.signin_at > 20:                   # the pending sign-in is reused; don't probe the IdP per request
+            self.signin_at = time.time()
+            self.signin_msg = ""
+            try:
+                hcfg = dict(cfg, http_timeout=min(cfg["http_timeout"], cfg["hook_http_timeout"]))
+                self.signin_msg = hook_login_reason(hcfg, self.state, self.settings)
+            except Exception as e:
+                log(f"could not start a sign-in from the proxy: {e}")
+        return f"{msg} {self.signin_msg}".strip()
+
+    def check_blocked(self):
+        """The daemon loop sets self.blocked from the preflight; while it is set, look again every 5 s so a fix takes effect."""
+        if self.blocked and time.time() - self.blocked_checked > 5:
+            self.blocked_checked = time.time()
+            errors = preflight_errors(self.cfg, self.state, self.settings)
+            self.blocked = errors[0] if errors else None
+        return self.blocked
+
+    # -- accounting
+    def record(self, entry):
+        with self.stats_lock:
+            self.stats[str(entry["status"])] = self.stats.get(str(entry["status"]), 0) + 1
+            if entry.get("outcome"):
+                self.last_outcome = entry["outcome"]
+        if self.access_log:
+            with self.log_lock:
+                self.access_log.write(json.dumps({k: v for k, v in entry.items() if k != "outcome"}) + "\n")
+                self.access_log.flush()
+        elif entry["note"] or entry["status"] >= 500:           # the daemon is quiet unless something is off
+            log(f"{entry['method']} {entry['path']} -> {entry['status']} {entry['note']} ({entry['ms']} ms, token {entry['token']})")
+
+    # -- control channel
+    def status(self):
+        tok = self.holder.token
+        claims = jwt_claims(tok) if tok else {}
+        return {"version": VERSION, "pid": os.getpid(), "listen": fmt_hostport(self.listen[0], self.port),
+                "uptime": int(time.time() - self.started), "mode": "proxy",
+                "gateway": f"{self.up.scheme}://{self.up.netloc}", "jwt": fingerprint(tok) if tok else "none",
+                "usable": self.holder.usable(), "seconds_left": seconds_left(tok) if tok else -1,
+                "renewed_at": self.holder.renewed_at, "last_error": self.holder.last_error, "last_outcome": self.last_outcome,
+                "blocked": self.blocked["id"] if self.blocked else "", "requests": dict(self.stats),
+                "claims": {k: str(claims[k]) for k in ("iss", "sub", "portkey_workspace") if k in claims}}
+
+    def inspect(self, show_claims=False):
+        tok = self.holder.token
+        if tok:
+            rows, problems = inspect_token(tok, self.cfg, show_claims=show_claims)
+        else:
+            rows = [("token", "none (the proxy holds no JWT)")]
+            problems = ["the proxy holds no JWT" + (f": {self.holder.last_error}" if self.holder.last_error else "")]
+        rows += [("proxy", f"pid {os.getpid()}, up {int(time.time() - self.started)}s, gateway {self.up.scheme}://{self.up.netloc}"),
+                 ("last outcome", self.last_outcome or "no refusal seen"),
+                 ("renewed", _when(self.holder.renewed_at) if self.holder.renewed_at else "never")]
+        return {"rows": rows, "problems": problems}
+
+    def control(self, method, path):
+        u = urllib.parse.urlsplit(path)
+        name, q = u.path[len(CONTROL_PREFIX):], urllib.parse.parse_qs(u.query)
+        if name == "status" and method == "GET":
+            return 200, self.status()
+        if name == "inspect" and method == "GET":
+            return 200, self.inspect(show_claims="claims" in q)
+        if name == "renew" and method == "POST":
+            ok, changed, msg = self.holder.renew(force="force" in q)
+            return 200, {"ok": ok, "changed": changed, "message": msg}
+        if name == "forget" and method == "POST":
+            self.holder.forget()
+            return 200, {"ok": True, "changed": True, "message": "the proxy forgot its JWT"}
+        return 404, {"type": "error", "error": {"type": "not_found", "message": "unknown control path"}}
+
+    # -- the listener
+    def start(self):
+        ps = self
+
+        class Server(http.server.ThreadingHTTPServer):
+            address_family = socket.AF_INET6 if ":" in ps.listen[0] else socket.AF_INET
+            allow_reuse_address = not is_windows()              # on Windows SO_REUSEADDR would let a second instance bind the same port
+            daemon_threads = True
+            request_queue_size = 128
+
+            def server_bind(self):
+                if is_windows() and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                super().server_bind()
+
+            def handle_error(self, request, client_address):    # Claude Code drops idle keep-alive connections
+                pass
+
+        self.srv = Server(self.listen, self._handler())
+        self.port = self.srv.server_address[1]
+        write_private(self.state.dir / "proxy.json", json.dumps({"pid": os.getpid(), "host": self.listen[0], "port": self.port}) + "\n")
+        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
+        return self.port
+
+    def stop(self):
+        if self.srv:
+            self.srv.shutdown()
+            self.srv.server_close()
+        try:
+            if json.loads((self.state.dir / "proxy.json").read_text(encoding="utf-8")).get("pid") == os.getpid():
+                (self.state.dir / "proxy.json").unlink()
+        except (OSError, ValueError):
+            pass
+
+    def _handler(self):
+        ps = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            timeout = 600
+
+            def log_message(self, *a):
+                pass
+
+            # -- replies
+            def reply(self, code, body, ctype="application/json", extra=None):
+                data = body if isinstance(body, bytes) else json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+
+            def refuse(self, message, kind="gateway_token_error"):      # the 498 the load balancer guard would send
+                self.reply(498, {"type": "error", "error": {"type": kind, "message": message}})
+                return 498
+
+            # -- request body (Messages requests are JSON with a Content-Length; chunked is handled for completeness)
+            def read_body(self):
+                if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                    parts = []
+                    while True:
+                        size = int((self.rfile.readline(1024).split(b";")[0].strip() or b"0"), 16)
+                        if size == 0:
+                            while self.rfile.readline(1024).strip():     # trailers
+                                pass
+                            return b"".join(parts)
+                        parts.append(self.rfile.read(size))
+                        self.rfile.readline(4)
+                n = self.headers.get("Content-Length")
+                if n is None:
+                    return None
+                return self.rfile.read(int(n)) if int(n) > 0 else b""
+
+            # -- one request
+            def handle_any(self):
+                t0 = time.time()
+                token, note, outcome = None, "", ""
+                try:
+                    if not ps.authorized(self.headers.get(LOCAL_HEADER)):
+                        self.close_connection = True            # the body is not read
+                        status, note = self.refuse(LOCAL_DENIED, "proxy_auth_error"), "local-secret"
+                    elif self.path.startswith(CONTROL_PREFIX):
+                        code, obj = ps.control(self.command, self.path)
+                        self.reply(code, obj)
+                        return                                  # control calls are not requests to the gateway
+                    else:
+                        status, note, outcome, token = self.forward()
+                except ValueError:                              # an unreadable Content-Length or chunk size
+                    self.close_connection = True
+                    status, note = self.refuse("bad request", "invalid_request_error"), "bad-request"
+                except (BrokenPipeError, ConnectionError, socket.timeout) as e:
+                    self.close_connection = True
+                    status, note = 0, f"client-error:{type(e).__name__}"
+                ps.record({"t": round(t0, 3), "ms": round((time.time() - t0) * 1000), "method": self.command,
+                           "path": self.path.split("?")[0], "status": status, "note": note, "token": short_fp(token), "outcome": outcome})
+
+            def forward(self):
+                self._started = False
+                blocked = ps.check_blocked()
+                body = self.read_body()
+                if blocked:
+                    return self.refuse(block_message([blocked]), "gateway_config_error"), f"blocked:{blocked['id']}", "", None
+                token = ps.holder.get()
+                if token is None:
+                    return self.refuse(ps.no_jwt_message()), "no-token", "no JWT", None
+                try:
+                    return self.relay(body, token)
+                except (OSError, http.client.HTTPException) as e:
+                    if getattr(self, "_started", False):
+                        self.close_connection = True
+                        return 0, f"upstream-error-mid-stream:{type(e).__name__}", "", token
+                    self.reply(502, {"type": "error", "error": {"type": "proxy_error", "message": "could not reach the gateway"}})
+                    return 502, f"upstream-error:{type(e).__name__}", "", token
+
+            def send_upstream(self, body, token):
+                fwd = {}
+                drop = {h for h in (self.headers.get("Connection") or "").lower().replace(" ", "").split(",") if h}
+                for k, v in self.headers.items():
+                    kl = k.lower()
+                    if kl not in HOP_BY_HOP and kl not in drop and kl not in (ps.header, LOCAL_HEADER):
+                        fwd[k] = v
+                fwd[ps.cfg["header"]] = token
+                fwd["Host"] = ps.up.netloc
+                conn, target = ps.up.connect()
+                try:
+                    conn.request(self.command, target(self.path), body=body, headers=fwd)
+                    return conn, conn.getresponse()
+                except BaseException:
+                    conn.close()
+                    raise
+
+            def relay(self, body, token):
+                self._started = False
+                conn, resp = self.send_upstream(body, token)
+                try:
+                    note, outcome = "", ""
+                    if resp.status == 401:
+                        data = resp.read(MAX_401_BODY)
+                        if classify_401(data, resp.getheader("Content-Encoding")) == "other":
+                            self.pass_small(resp, data)
+                            return 401, "passthrough-401", "anthropic 401 (passed through)", token
+                        # the gateway refused our JWT: renew and retry once, else turn it into 498
+                        conn.close()
+                        fresh = ps.holder.renew_after_refusal(token)
+                        if fresh is None:
+                            return self.refuse(GUARD_MESSAGES["expired"]), "gateway-401->498", "gateway refused the JWT (Portkey Error)", token
+                        token = fresh
+                        conn, resp = self.send_upstream(body, token)
+                        note = "renewed-retry"
+                        if resp.status == 401:
+                            data = resp.read(MAX_401_BODY)
+                            if classify_401(data, resp.getheader("Content-Encoding")) == "gateway":
+                                return self.refuse(GUARD_MESSAGES["expired"]), "gateway-401->retry->498", "gateway refused the renewed JWT (Portkey Error)", token
+                            self.pass_small(resp, data)
+                            return 401, note + ":passthrough-401", "anthropic 401 (passed through)", token
+                    self.stream(resp)
+                    return resp.status, note, "", token
+                finally:
+                    conn.close()
+
+            def pass_small(self, resp, data):
+                self.reply(resp.status, data, resp.getheader("Content-Type", "application/json"),
+                           {k: v for k, v in resp.getheaders() if k.lower() in ("request-id", "x-should-retry", "content-encoding", "retry-after")})
+
+            def stream(self, resp):
+                """Send the response as it arrives: read1 returns whatever is there, not 'wait for the buffer to fill'."""
+                self._started = True
+                self.send_response(resp.status)
+                length = resp.getheader("Content-Length")
+                bodyless = self.command == "HEAD" or resp.status in (204, 304) or resp.status < 200
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP_BY_HOP:
+                        self.send_header(k, v)
+                chunked = length is None and not bodyless
+                if length is not None:
+                    self.send_header("Content-Length", length)
+                elif chunked:
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.flush()
+                if bodyless:
+                    return
+                while True:
+                    data = resp.read1(STREAM_CHUNK)
+                    if not data:
+                        break
+                    self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n" if chunked else data)
+                    self.wfile.flush()
+                if chunked:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+
+            do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = do_PATCH = do_OPTIONS = handle_any
+
+        return Handler
+
+
+def proxy_endpoint(cfg, state):
+    """(host, port) of the proxy, or None. Port 0 in proxy_listen: the running proxy wrote its port to proxy.json."""
+    host, port = parse_listen(cfg["proxy_listen"])
+    if port == 0:
+        try:
+            info = json.loads((state.dir / "proxy.json").read_text(encoding="utf-8"))
+            host, port = info["host"], int(info["port"])
+        except (OSError, ValueError, KeyError):
+            return None
+    return host, port
+
+
+def probe_proxy(cfg, state, timeout=2):
+    """Is the proxy up on proxy_listen? ('running', status dict) | ('down', '') | ('secret', detail) | ('taken', detail)."""
+    where = proxy_endpoint(cfg, state)
+    if where is None:
+        return "down", ""
+    host, port = where
+    try:
+        status, body = control_call(host, port, proxy_secret(state), "GET", CONTROL_PREFIX + "status", timeout)
+    except ConnectionRefusedError:
+        return "down", ""
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        return "taken", f"it did not answer like the proxy ({type(e).__name__})"
+    if status == 200 and isinstance(body, dict) and body.get("mode") == "proxy":
+        return "running", body
+    if status == 498 and isinstance(body, dict) and (body.get("error") or {}).get("type") == "proxy_auth_error":
+        return "secret", "an aigw-claude-auth proxy is running there but does not accept this user's secret (proxy-secret in the state dir)"
+    return "taken", f"it answered HTTP {status}"
+
+
+def control_call(host, port, secret, method, path, timeout=5):
+    """One request to the proxy's control channel on loopback, never through an HTTP proxy. Returns (status, parsed JSON)."""
+    conn = http.client.HTTPConnection(f"[{host}]" if ":" in host else host, port, timeout=timeout)
+    try:
+        conn.request(method, path, headers={LOCAL_HEADER: secret or "", "Content-Length": "0"} if method == "POST" else {LOCAL_HEADER: secret or ""})
+        resp = conn.getresponse()
+        raw = resp.read(1 << 20)
+        return resp.status, json.loads(raw.decode("utf-8", "replace") or "null")
+    finally:
+        conn.close()
+
+
+def proxy_call(cfg, state, method, path, timeout=5):
+    """Ask the running proxy. AuthError when it isn't there. The answer never holds the JWT."""
+    kind, info = probe_proxy(cfg, state, timeout=2)
+    if kind == "down":
+        raise AuthError("the proxy is not running: start the daemon (`aigw-claude-auth daemon`, or the launchd / systemd / Task Scheduler entry) or run `aigw-claude-auth proxy`")
+    if kind != "running":
+        raise AuthError(f"proxy_listen {cfg['proxy_listen']} is not our proxy: {info}")
+    host, port = proxy_endpoint(cfg, state)
+    status, body = control_call(host, port, proxy_secret(state), method, path, timeout)
+    if status != 200:
+        raise AuthError(f"the proxy refused the request (HTTP {status})")
+    return body
+
+
+def sync_proxy(cfg, state, force=False, idp=None):
+    """`sync` in proxy mode: ask the running proxy to renew (it holds the JWT). Nothing is written to the settings."""
+    try:
+        body = proxy_call(cfg, state, "POST", CONTROL_PREFIX + "renew" + ("?force=1" if force else ""),
+                          timeout=cfg["http_timeout"] + 10)
+    except AuthError as e:
+        if idp is not None:         # a sign-in just finished and stored the refresh token; the proxy will use it when it starts
+            return Result(True, False, f"signed in; {e}")
+        return Result(False, False, str(e))
+    return Result(bool(body.get("ok")), bool(body.get("changed")), str(body.get("message", "")))
+
+
+def run_proxy(cfg, state, settings, max_sleep=60, access_log=None):
+    """The proxy as a foreground process (`proxy`) or as the daemon in proxy mode: serve, and renew ahead of every expiry."""
+    stop = threading.Event()
+    daemon_console_fix()
+    try:
+        ps = ProxyServer(cfg, state, settings, access_log=access_log)
+        port = ps.start()
+    except OSError as e:
+        kind, info = probe_proxy(cfg, state)
+        if kind == "running":
+            log(f"the proxy is already running (pid {info.get('pid')}); this instance exits")
+            return 0                            # exit 0: launchd and systemd do not restart a successful exit
+        raise AuthError(f"cannot listen on {cfg['proxy_listen']}: {e}" + (f" ({info})" if info else ""))
+    install_stop_signals(stop)
+    log(f"proxy listening on {fmt_hostport(ps.listen[0], port)} -> {cfg['gateway_url']} (settings {settings.path})")
+    backoff, blocked_by = 30, None
+    try:
+        while not stop.is_set():
+            errors = preflight_errors(cfg, state, settings)     # a config Error: answer 498 with it, renew nothing, retry later
+            ps.blocked, ps.blocked_checked = (errors[0] if errors else None), time.time()
+            if errors:
+                if blocked_by != errors[0]["message"]:
+                    log(f"blocking requests: {errors[0]['message']} ({errors[0]['id']})")
+                    blocked_by = errors[0]["message"]
+                stop.wait(max(5, min(60, max_sleep)))
+                continue
+            blocked_by = None
+            ok, changed, msg = ps.holder.renew()
+            if changed or not ok:
+                log(msg)
+            if ok:
+                backoff = 30
+                wait = seconds_left(ps.holder.token) - cfg["refresh_before"]
+            else:
+                wait, backoff = backoff, min(backoff * 2, 300)
+            stop.wait(max(5, min(wait, max_sleep)))
+    finally:
+        ps.stop()
+    log("proxy stopped")
+    return 0
+
+
+def install_stop_signals(stop):
+    for name in ("SIGTERM", "SIGINT", "SIGBREAK"):              # SIGBREAK exists on Windows only
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: stop.set())
+
+
+def daemon_console_fix():
+    if is_windows() and sys.stderr is None:                     # started by Task Scheduler through pythonw: no console
+        log_dir().mkdir(parents=True, exist_ok=True)
+        sys.stderr = open(log_dir() / "daemon.log", "a", encoding="utf-8", buffering=1)
 
 
 # --------------------------------------------------------------------------------------------- commands
@@ -1454,6 +2177,15 @@ def browser_available():
 
 
 def cmd_logout(a, cfg, state, settings):
+    if cfg["mode"] == "proxy":
+        with state.lock():
+            state.drop_refresh_token()
+        try:
+            proxy_call(cfg, state, "POST", CONTROL_PREFIX + "forget")
+        except AuthError:
+            pass                                # not running: it holds nothing
+        log("signed out; the proxy no longer holds a JWT and answers 498 until you sign in")
+        return 0
     with state.lock():
         state.drop_refresh_token()
         settings.put(cfg["sentinel"])
@@ -1468,6 +2200,11 @@ def cmd_sync(a, cfg, state, settings):
 
 
 def cmd_token(a, cfg, state, settings):
+    if cfg["mode"] == "proxy":              # the proxy keeps its JWT to itself: mint one for the caller, write nothing
+        with state.lock():
+            token = TokenSource(cfg, state).gateway_jwt()
+        print(token)
+        return 0
     r = sync(cfg, state, settings, force=a.force)
     if not r.ok:
         log(r.message)
@@ -1479,11 +2216,23 @@ def cmd_token(a, cfg, state, settings):
 def cmd_status(a, cfg, state, settings):
     loc = state.token_location()
     source = "token_command" if cfg["token_command"] else ("IdP + broker" if cfg["broker_url"] else "IdP token as the JWT")
-    rows = [("version", VERSION), ("settings", str(settings.path)), ("header", cfg["header"]), ("source", source),
+    rows = [("version", VERSION), ("mode", cfg["mode"]), ("settings", str(settings.path)), ("header", cfg["header"]), ("source", source),
             ("signed in", "yes" if loc else ("n/a" if cfg["token_command"] else "no")),
-            ("refresh token", loc or "none"),
-            ("jwt", fingerprint(settings.get()) if settings.get() != cfg["sentinel"] else "sentinel (no usable JWT)")]
-    claims = jwt_claims(settings.get())
+            ("refresh token", loc or "none")]
+    if cfg["mode"] == "proxy":
+        kind, info = probe_proxy(cfg, state)
+        rows.append(("proxy", f"running on {info['listen']}, pid {info['pid']}, up {info['uptime']}s" if kind == "running"
+                     else "NOT RUNNING (start the daemon)" if kind == "down" else f"PROBLEM: {info}"))
+        rows.append(("jwt", (info["jwt"] if info["jwt"] != "none" else "none (the proxy holds no JWT)") + " (in the proxy's memory)" if kind == "running" else "unknown"))
+        if kind == "running":
+            if info.get("last_outcome"):
+                rows.append(("last outcome", info["last_outcome"]))
+            if info.get("last_error"):
+                rows.append(("last error", info["last_error"]))
+        claims = info.get("claims", {}) if kind == "running" else {}
+    else:
+        rows.append(("jwt", fingerprint(settings.get()) if settings.get() != cfg["sentinel"] else "sentinel (no usable JWT)"))
+        claims = jwt_claims(settings.get())
     for k in ("iss", "sub", "portkey_workspace"):
         if k in claims:
             rows.append((f"jwt {k}", str(claims[k])))
@@ -1495,14 +2244,21 @@ def cmd_status(a, cfg, state, settings):
     return 0
 
 
+def cmd_proxy(a, cfg, state, settings):
+    """The proxy in the foreground, for debugging (the daemon runs it in proxy mode). Logs every request to stderr."""
+    if cfg["mode"] != "proxy":
+        log("note: mode is file in the config; running the proxy anyway")
+        cfg = dict(cfg, mode="proxy")
+    sink = open(a.access_log, "a", encoding="utf-8") if a.access_log and a.access_log != "-" else sys.stderr
+    return run_proxy(cfg, state, settings, a.max_sleep, access_log=sink)
+
+
 def cmd_daemon(a, cfg, state, settings):
+    if cfg["mode"] == "proxy":
+        return run_proxy(cfg, state, settings, a.max_sleep)
     stop = threading.Event()
-    if is_windows() and sys.stderr is None:                 # started by Task Scheduler through pythonw: no console
-        log_dir().mkdir(parents=True, exist_ok=True)
-        sys.stderr = open(log_dir() / "daemon.log", "a", encoding="utf-8", buffering=1)
-    for name in ("SIGTERM", "SIGINT", "SIGBREAK"):          # SIGBREAK exists on Windows only
-        if hasattr(signal, name):
-            signal.signal(getattr(signal, name), lambda *_: stop.set())
+    daemon_console_fix()
+    install_stop_signals(stop)
     backoff, blocked_by = 30, None
     log(f"daemon started (settings {settings.path})")
     while not stop.is_set():
@@ -1563,6 +2319,8 @@ def hook_precheck(cfg, state, settings):
     if errors:
         print(json.dumps({"decision": "block", "reason": block_message(errors)}))
         return 0
+    if cfg["mode"] == "proxy":
+        return hook_precheck_proxy(cfg, state, settings)
     try:
         r = sync(cfg, state, settings)
     except Exception as e:                                  # a bug, or the settings file can't be written
@@ -1582,17 +2340,44 @@ def hook_precheck(cfg, state, settings):
         log(r.message)
         return 0
     if cfg["block_on_failure"]:
-        reason = f"AI gateway: {r.message}"
-        if effective_hook_login(cfg) != "off" and not cfg["token_command"] and not state.get_refresh_token():
-            try:
-                reason = hook_login_reason(cfg, state, settings)
-            except Exception as e:                          # fall back to the plain message
-                log(f"could not start a sign-in from the hook: {e}")
-        print(json.dumps({"decision": "block", "reason": reason}))
+        print(json.dumps({"decision": "block", "reason": block_reason(cfg, state, settings, r)}))
     else:
         log(r.message)
         if r.changed:          # we just wrote the sentinel: let the request carry it, so a load balancer rule answers 498
             time.sleep(cfg["hook_wait"])
+    return 0
+
+
+def block_reason(cfg, state, settings, r):
+    """The precheck's block message for a failed renewal: the sign-in prompt when the user is signed out."""
+    reason = f"AI gateway: {r.message}"
+    if effective_hook_login(cfg) != "off" and not cfg["token_command"] and not state.get_refresh_token():
+        try:
+            reason = hook_login_reason(cfg, state, settings)
+        except Exception as e:                              # fall back to the plain message
+            log(f"could not start a sign-in from the hook: {e}")
+    return reason
+
+
+def hook_precheck_proxy(cfg, state, settings):
+    """Proxy mode: the proxy renews by itself, so the precheck only makes sure it has a JWT. No settings reload to wait for."""
+    try:
+        st = proxy_call(cfg, state, "GET", CONTROL_PREFIX + "status", timeout=cfg["hook_http_timeout"])
+    except AuthError as e:                                  # not running: Claude Code would only see connection errors
+        print(json.dumps({"decision": "block", "reason": f"AI gateway: {e}"}))
+        return 0
+    if st["usable"] and st["seconds_left"] > cfg["refresh_before"]:
+        return 0
+    r = sync(cfg, state, settings)
+    if r.ok:
+        return 0
+    if st["usable"]:                                        # renewal failed, but what the proxy holds still works for now
+        log(r.message)
+        return 0
+    if cfg["block_on_failure"]:
+        print(json.dumps({"decision": "block", "reason": block_reason(cfg, state, settings, r)}))
+    else:
+        log(r.message)
     return 0
 
 
@@ -1720,14 +2505,42 @@ def cmd_install(a, cfg, state, settings):
     hook = a.hook_command or default_hook_command()
     if not MARKER.search(hook if isinstance(hook, str) else json.dumps(hook)):
         raise AuthError("--hook-command must contain 'aigw-claude-auth' or 'aigw_claude_auth' so later installs can find and replace it")
+    proxy = cfg["mode"] == "proxy"
+    if proxy:
+        if a.base_url:
+            raise AuthError("mode is proxy: ANTHROPIC_BASE_URL is the proxy's address; the gateway URL is `gateway_url` in the config (--base-url is for file mode)")
+        if not cfg["gateway_url"]:
+            raise AuthError("mode is proxy: set gateway_url in the config (the gateway the proxy forwards to)")
+        base_url = proxy_base_url(cfg)
+    else:
+        base_url = a.base_url
     if a.print:
         snippet = {"hooks": {"UserPromptSubmit": [hook_entry(hook, "precheck")], "StopFailure": [hook_entry(hook, "stop-failure")]}}
-        if a.base_url:
-            snippet["env"] = {"ANTHROPIC_BASE_URL": a.base_url}
+        if base_url:
+            snippet["env"] = {"ANTHROPIC_BASE_URL": base_url}
         print(json.dumps(snippet, indent=2))
+        if proxy:
+            log(f"the per-user secret ({LOCAL_HEADER}) is not part of this snippet: `install` writes it into each user's own settings")
         return 0
-    settings.merge(base_url=a.base_url, hook_command=None if a.no_hooks else hook)
+    hook_cmd = None if a.no_hooks else hook
+    if proxy:
+        # one write: the proxy's address, the local secret, no JWT (a JWT left over from file mode is removed)
+        settings.apply(base_url=base_url, hook_command=hook_cmd, put_lines={LOCAL_HEADER: proxy_secret(state, create=True)}, drop_lines=[cfg["header"]])
+        log(f"updated {settings.path} (ANTHROPIC_BASE_URL {base_url}, local secret, no JWT)")
+        kind, info = probe_proxy(cfg, state)
+        if kind != "running":
+            log("the proxy is not running yet: start the daemon (launchd / systemd / Task Scheduler entry, or `aigw-claude-auth daemon`)")
+            return 0
+        r = sync(cfg, state, settings)
+        log(r.message)
+        return 0 if r.ok else 1
+    # file mode; a proxy address and local secret left over from proxy mode are removed (the gateway URL replaces the address)
+    back = a.base_url or cfg["gateway_url"] or None
+    was_proxy = is_proxy_url(cfg, (settings.load().get("env") or {}).get("ANTHROPIC_BASE_URL", ""))
+    settings.apply(base_url=back, hook_command=hook_cmd, drop_lines=[LOCAL_HEADER], drop_base_url=lambda u: is_proxy_url(cfg, u))
     log(f"updated {settings.path}")
+    if was_proxy and not back:
+        log("removed the proxy's ANTHROPIC_BASE_URL; run install again with --base-url <gateway URL> (or set gateway_url in the config)")
     r = sync(cfg, state, settings)
     log(r.message)
     return 0 if r.ok else 1
@@ -1742,7 +2555,7 @@ def task_xml(user, python, script):
     exe = str(pyw if pyw.exists() else python)
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Keeps the gateway JWT in Claude Code's settings fresh (aigw-claude-auth daemon)</Description></RegistrationInfo>
+  <RegistrationInfo><Description>Keeps the gateway JWT fresh (aigw-claude-auth daemon; in proxy mode it is the local proxy Claude Code talks to)</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{xml_escape(user)}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>{xml_escape(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
@@ -2076,10 +2889,11 @@ def chk_managed_invalid(ctx):
 
 @check("managed-custom-headers")
 def chk_headers(ctx):
-    if ctx["cfg"].get("mode", "file") == "proxy":
-        ctx["na"]["managed-custom-headers"] = "proxy mode does not use ANTHROPIC_CUSTOM_HEADERS"
-        return
     if "ANTHROPIC_CUSTOM_HEADERS" in ctx_env(ctx, "managed"):
+        if ctx["cfg"]["mode"] == "proxy":
+            return [finding("managed-custom-headers", "Error",
+                            f"managed settings ({ctx['managed_info']['source']}) define env.ANTHROPIC_CUSTOM_HEADERS; it replaces the user's value, so the per-user secret ({LOCAL_HEADER}) is not sent and the proxy refuses every request",
+                            "remove it from managed settings (README finding 11)")]
         return [finding("managed-custom-headers", "Error",
                         f"managed settings ({ctx['managed_info']['source']}) define env.ANTHROPIC_CUSTOM_HEADERS; it replaces the user's value, so the JWT is not sent",
                         "remove it from managed settings and keep the JWT in the user's settings.json (README finding 11)")]
@@ -2137,15 +2951,49 @@ def chk_base_url(ctx):
     if m and u and m.rstrip("/") != u.rstrip("/"):
         out.append(finding("base-url-mismatch", "Error", f"managed ANTHROPIC_BASE_URL ({m}) differs from the user's ({u}); the managed value wins",
                            "make them equal, or remove the user's"))
-    if ctx["cfg"].get("mode", "file") == "proxy":
-        listen = str(ctx["cfg"].get("proxy_listen", ""))
-        url = m or u or ""
-        hostport = urllib.parse.urlsplit(url).netloc
-        if listen and not listen.endswith(":0") and hostport and hostport != listen:
-            out.append(finding("proxy-listen", "Error", f"ANTHROPIC_BASE_URL ({url}) is not proxy_listen ({listen}); requests bypass the proxy",
-                               "set ANTHROPIC_BASE_URL to the proxy address"))
+    if ctx["cfg"]["mode"] == "proxy":
+        out += proxy_findings(ctx, m or u or "")
     else:
-        ctx["na"]["proxy-listen"] = "n/a until mode 2 (proxy)"
+        ctx["na"]["proxy-listen"] = "mode is file"
+    return out
+
+
+def proxy_findings(ctx, url):
+    """Mode 2: does Claude Code reach the proxy, is it running, does the settings carry the local secret and no JWT."""
+    cfg, state, out = ctx["cfg"], ctx["state"], []
+    try:
+        listen = proxy_hostport(cfg)
+    except AuthError as e:
+        return [finding("proxy-listen", "Error", str(e), "fix proxy_listen in the helper config")]
+    port0 = parse_listen(cfg["proxy_listen"])[1] == 0
+    hostport = urllib.parse.urlsplit(url).netloc
+    if not url:
+        out.append(finding("proxy-listen", "Error", f"ANTHROPIC_BASE_URL is not set; Claude Code bypasses the proxy ({listen})", "aigw-claude-auth install"))
+    elif not port0 and hostport != listen:
+        out.append(finding("proxy-listen", "Error", f"ANTHROPIC_BASE_URL ({url}) is not proxy_listen ({listen}); requests bypass the proxy",
+                           "set ANTHROPIC_BASE_URL to the proxy address (aigw-claude-auth install)"))
+    if not cfg["gateway_url"]:
+        out.append(finding("proxy-gateway-url", "Error", "mode is proxy but gateway_url is not set; the proxy has nowhere to forward to", "set gateway_url in the helper config"))
+    elif urllib.parse.urlsplit(cfg["gateway_url"]).netloc == listen:
+        out.append(finding("proxy-gateway-url", "Error", "gateway_url points at the proxy itself", "set gateway_url to the gateway"))
+    kind, info = probe_proxy(cfg, state)
+    if kind == "down":
+        out.append(finding("proxy-not-running", "Error", f"the proxy is not running on {listen}; Claude Code's requests fail with connection errors",
+                           "start the daemon (launchd / systemd / Task Scheduler entry, or `aigw-claude-auth daemon`)"))
+    elif kind == "taken":
+        out.append(finding("proxy-port-taken", "Error", f"something else is listening on {listen}: {info}", "free the port or set another proxy_listen (then run install)"))
+    elif kind == "secret":
+        out.append(finding("proxy-secret", "Error", info, "stop that proxy, or point proxy_listen at a free port"))
+    if "ANTHROPIC_CUSTOM_HEADERS" not in ctx_env(ctx, "managed"):       # a managed value is the managed-custom-headers finding
+        want, have = proxy_secret(state), ctx["settings"].get_line(LOCAL_HEADER, ctx["user"])
+        if not have or (want and have != want):
+            out.append(finding("proxy-secret", "Error", f"the settings carry no {LOCAL_HEADER} secret that matches this user's" if not have
+                               else f"the {LOCAL_HEADER} secret in the settings differs from the one in the state dir; the proxy refuses requests",
+                               "aigw-claude-auth install"))
+    jwt_in = ctx["jwt"]
+    if jwt_in and jwt_in != cfg["sentinel"]:
+        out.append(finding("proxy-jwt-in-settings", "Warning", "mode is proxy but a JWT is still in settings.json (left over from file mode)",
+                           "aigw-claude-auth install removes it"))
     return out
 
 
@@ -2194,7 +3042,7 @@ def chk_conflict(ctx):
         if not name.startswith("AIGW_"):
             continue
         key = name[5:].lower()
-        if key not in DEFAULTS and key != "mode":
+        if key not in DEFAULTS:
             out.append(finding("managed-unknown-key", "Warning", f"managed env {name} is not a config key", "check the spelling"))
         elif key in raw and str(raw[key]) != str(value):
             sev = "Error" if key in ("mode", "issuer", "client_id", "header") else "Warning"
@@ -2391,10 +3239,14 @@ def main(argv=None):
     sub.add_parser("status", help="where the JWT comes from and when it expires")
     p = sub.add_parser("inspect", help="decode the JWT: header, times, claims, verdicts against the config (never the token)")
     p.add_argument("--fresh", action="store_true", help="mint a token from the source without writing it, and decode that")
+    p.add_argument("--live", action="store_true", help="ask the running proxy about the JWT it holds (proxy mode; the token never leaves it)")
     p.add_argument("--show-claims", action="store_true", help="show sub, email, groups and other personal claims (redacted by default)")
     p.add_argument("--debug", choices=["on", "off"], help="log an inspect summary at each renewal for 24 h (on) or stop (off)")
     p = sub.add_parser("daemon", help="renew ahead of every expiry until stopped")
     p.add_argument("--max-sleep", type=int, default=60, help="longest nap in seconds (bounds the catch-up after sleep)")
+    p = sub.add_parser("proxy", help="run the local proxy in the foreground (mode proxy's daemon does this; this is for debugging)")
+    p.add_argument("--max-sleep", type=int, default=60, help="longest nap in seconds between renewal checks")
+    p.add_argument("--access-log", help="append one JSON line per request here ('-' or omitted: stderr); status, latency and token fingerprint only")
     p = sub.add_parser("hook", help="for Claude Code hooks; reads the hook JSON on stdin")
     p.add_argument("event", choices=["precheck", "stop-failure"])
     p = sub.add_parser("hook-login-wait", help="internal: the precheck hook's background sign-in (device code JSON on stdin)")
@@ -2423,7 +3275,7 @@ def main(argv=None):
         state.store = make_store(cfg, cdir)
         settings = Settings(a.settings or default_settings_path(), cfg["header"])
         handler = {"login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "token": cmd_token, "status": cmd_status, "inspect": cmd_inspect,
-                   "daemon": cmd_daemon, "hook": cmd_hook, "hook-login-wait": cmd_hook_login_wait, "install": cmd_install, "task": cmd_task}[a.cmd]
+                   "daemon": cmd_daemon, "proxy": cmd_proxy, "hook": cmd_hook, "hook-login-wait": cmd_hook_login_wait, "install": cmd_install, "task": cmd_task}[a.cmd]
         return handler(a, cfg, state, settings)
     except AuthError as e:
         if a.cmd == "hook":                                  # hooks must never fail Claude Code's turn

@@ -36,7 +36,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path[:0] = [str(HERE), str(ROOT / "client"), str(HERE / "keycloak")]
 import mock_gateway  # noqa: E402
-import proxy_prototype  # noqa: E402
+import aigw_claude_auth as client_mod  # noqa: E402
 from test_aigw_claude_auth import FakeIdP, jwt  # noqa: E402
 
 CLIENT = ROOT / "client" / "aigw_claude_auth.py"
@@ -561,22 +561,55 @@ def scenario_stored_login(out):
 
 
 class Proxy:
-    """repro/proxy_prototype.py in this process, in front of a gateway, with its token in a file (as the client would keep it)."""
+    """The client's real proxy (aigw_claude_auth.ProxyServer, mode 2) in this process, in front of a gateway. Its JWT
+    comes from a token_command that prints a file, so a scenario decides what the next renewal returns; the proxy
+    keeps what it got in memory, as in production."""
 
-    def __init__(self, out, upstream):
+    def __init__(self, out, upstream, cooldown=0):
         self.log = out / "proxy.log.jsonl"
         self.log.touch()
         self.dir = Path(tempfile.mkdtemp(prefix="aigw-proxy-"))     # the token file stays out of the results dir
         self.token_file = self.dir / "gateway.token"
-        self.srv = proxy_prototype.serve(self.token_file, upstream, log=open(self.log, "a", encoding="utf-8"))
-        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        reader = self.dir / "print_token.py"
+        reader.write_text("import sys\ntry:\n    t = open(sys.argv[1], encoding='utf-8').read().strip()\nexcept OSError:\n    t = ''\n"
+                          "print(t)\nsys.exit(0 if t else 1)\n", encoding="utf-8")
+        argv = [sys.executable, str(reader), str(self.token_file)]
+        command = subprocess.list2cmdline(argv) if IS_WIN else " ".join(shlex.quote(a) for a in argv)
+        config = self.dir / "config.json"
+        config.write_text(json.dumps({"token_command": command, "gateway_url": upstream, "mode": "proxy", "proxy_listen": "127.0.0.1:0",
+                                      "notify": "off", "hook_login": "off", "secret_store": "file"}), encoding="utf-8")
+        self.cfg = client_mod.load_config(config)
+        self.cfg["_config_path"] = str(config)
+        self.state = client_mod.State(self.dir / "state")
+        self.ps = client_mod.ProxyServer(self.cfg, self.state, client_mod.Settings(self.dir / "settings.json", PK),
+                                         access_log=open(self.log, "a", encoding="utf-8"), renew_cooldown=cooldown)
+        self.port = self.ps.start()
+        self.secret = client_mod.proxy_secret(self.state)
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.local_header = client_mod.LOCAL_HEADER
 
     def set_token(self, value):
-        """value None: the file is gone."""
+        """What the next renewal returns. value None: the file is gone."""
         if value is None:
             self.token_file.unlink(missing_ok=True)
         else:
             self.token_file.write_text(value, encoding="utf-8")
+
+    def control(self, method, path, secret=None):
+        """(status, body bytes) from the control channel."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+        try:
+            conn.request(method, path, headers={self.local_header: self.secret if secret is None else secret})
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+    def use(self, value):
+        """Make the proxy hold `value` (renewed from the file), or nothing if the file can't give a usable token."""
+        self.set_token(value)
+        self.control("POST", "/_aigw/forget")
+        self.control("POST", "/_aigw/renew?force=1")
 
     def rows(self, since=0):
         rows = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
@@ -586,7 +619,7 @@ class Proxy:
         return len(self.rows())
 
     def close(self):
-        self.srv.shutdown()
+        self.ps.stop()
         rmtree(self.dir)
 
 
@@ -646,17 +679,18 @@ def socket_try(out, name, good, base_url, env=None, settings_env=None, timeout=1
 
 
 def scenario_proxy(out):
-    """Claude Code (CLAUDE_CODE_OAUTH_TOKEN login) through the prototype local proxy (repro/proxy_prototype.py), in front
-    of the mock gateway: header injection, streaming, gateway 401 -> 498, Anthropic 401 passed through, fail closed;
-    then whether Claude Code can reach a Unix socket (S11)."""
+    """Claude Code (CLAUDE_CODE_OAUTH_TOKEN login) through the client's local proxy (mode 2), in front of the mock
+    gateway: the per-user secret header, header injection, streaming, renew-and-retry, gateway 401 -> 498, Anthropic 401
+    passed through, fail closed, the control channel; then whether Claude Code can reach a Unix socket (S11)."""
     gw = Gateway(out)
     claude = Claude(out, "http://unset", env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
     good, clients = fresh_jwt(), fresh_jwt(sub="client-supplied")
     proxy = Proxy(out, gw.url)
-    proxy.set_token(good)
+    proxy.use(good)
     claude.env["ANTHROPIC_BASE_URL"] = proxy.url
-    # the settings still carry a (different, valid-looking) JWT of their own: the proxy must replace it
-    claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{PK}: {clients}"}, "hooks": {"StopFailure": [capture_hook(out, "stopfailure")]}})
+    # the settings carry the per-user secret (what `install` writes) and a different, valid-looking JWT: the proxy must replace it
+    claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{proxy.local_header}: {proxy.secret}\n{PK}: {clients}"},
+                           "hooks": {"StopFailure": [capture_hook(out, "stopfailure")]}})
     try:
         try:
             claude.start()
@@ -671,15 +705,30 @@ def scenario_proxy(out):
             observe("normal_authorization", "oauth" if h.get("authorization") == mock_gateway.fingerprint(f"Bearer {OAUTH}") else "other")
             observe("normal_beta_passed", "yes" if "oauth-2025-04-20" in (h.get("anthropic-beta") or "") else "no")
             observe("normal_streamed", "yes" if reqs and reqs[0].get("stream") is True else "no")
+            observe("normal_secret_stripped", "yes" if reqs and proxy.local_header not in h and proxy.secret not in json.dumps(h) else "no")
             observe("normal_proxy_logged_fingerprint", "yes" if prow and prow[0]["token"] == mock_gateway.fingerprint(good) else "no")
-            # --- token rotated in the file: the next request carries it, no restart
+            # --- a new JWT from the source (here a renewal; the daemon does it ahead of expiry): the next request carries it
             renewed = fresh_jwt(sub="renewed")
-            proxy.set_token(renewed)
+            proxy.use(renewed)
             mark = gw.mark()
             t = claude.turn("after the token file changed")
             reqs = gw.messages(mark)
             observe("renewed_result", classify(t["text"]))
             observe("renewed_header_injected", "yes" if reqs and reqs[0]["headers"].get(PK) == mock_gateway.fingerprint(renewed) else "no")
+            # --- the gateway refuses the JWT in use and the source has a fresh one: renew, retry once, the turn succeeds
+            retry_jwt = fresh_jwt(sub="after-refusal")
+            gw.set(revoked=[mock_gateway.fingerprint(renewed)], oauth=OAUTH, force=None)
+            proxy.set_token(retry_jwt)             # the proxy still holds `renewed`, which the gateway now refuses
+            mark, pmark = gw.mark(), proxy.mark()
+            t = claude.turn("case retry")
+            reqs, rows = gw.messages(mark), proxy.rows(pmark)
+            observe("retry_result", classify(t["text"]))
+            observe("retry_attempts", len(rows))
+            observe("retry_upstream_requests", len(reqs))
+            observe("retry_first_try_refused_jwt", "yes" if reqs and reqs[0]["headers"].get(PK) == mock_gateway.fingerprint(renewed) else "no")
+            observe("retry_second_try_fresh_jwt", "yes" if len(reqs) == 2 and reqs[1]["headers"].get(PK) == mock_gateway.fingerprint(retry_jwt) else "no")
+            observe("retry_proxy_status", ",".join(sorted({str(r["status"]) for r in rows})) or "none")
+            observe("retry_proxy_note", ",".join(sorted({r["note"] or "-" for r in rows})) or "none")
             # --- the gateway refuses the JWT (Portkey 401), Anthropic refuses the login (relayed 401), no usable token
             cases = [
                 ("portkey401", dict(revoked=[mock_gateway.fingerprint(good)]), good),
@@ -691,7 +740,7 @@ def scenario_proxy(out):
             for name, ctl, token in cases:
                 gw.set(revoked=[], oauth=OAUTH, force=None)
                 gw.set(**ctl)
-                proxy.set_token(token)
+                proxy.use(token)
                 seen = len(payloads(out, "stopfailure"))
                 mark, pmark = gw.mark(), proxy.mark()
                 t = claude.turn(f"case {name}")
@@ -708,17 +757,37 @@ def scenario_proxy(out):
                 p = payloads(out, "stopfailure")[seen:]
                 observe(f"{name}_stopfailure_error", p[0].get("error") if p else "none")
             gw.set(revoked=[], oauth=OAUTH, force=None)
-            proxy.set_token(good)
+            proxy.use(good)
             observe("recovery", classify(claude.turn("recovery")["text"]))
         finally:
             claude.cleanup()
+        # --- the secret: without it, or with a wrong one, the proxy answers 498 and nothing reaches the gateway
+        mark = gw.mark()
+        for name, secret in (("missing", None), ("wrong", "not-the-secret")):
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=30)
+            headers = {"content-type": "application/json", "authorization": f"Bearer {OAUTH}"}
+            if secret:
+                headers[proxy.local_header] = secret
+            conn.request("POST", "/v1/messages", json.dumps({"model": MODEL, "max_tokens": 8, "messages": [{"role": "user", "content": "x"}]}), headers)
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", "replace")
+            observe(f"secret_{name}_status", resp.status)
+            observe(f"secret_{name}_leaks", "no" if not any(x in body.lower() for x in (proxy.secret.lower(), "portkey", "jwt", gw.url)) else "yes")
+            conn.close()
+        observe("secret_upstream_requests", len(gw.messages(mark)))
+        # --- the control channel: the summary of the JWT in memory, never the token
+        status, body = proxy.control("GET", "/_aigw/inspect")
+        observe("control_inspect_status", status)
+        observe("control_inspect_token_absent", "yes" if good not in body.decode("utf-8", "replace") and good.split(".")[2] not in body.decode("utf-8", "replace") else "no")
+        observe("control_inspect_fingerprint", "yes" if f"len {len(good)} sha256 {hashlib.sha256(good.encode()).hexdigest()[:10]}" in body.decode("utf-8", "replace") else "no")
+        observe("control_without_secret_status", proxy.control("GET", "/_aigw/status", secret="nope")[0])
         # --- SSE passes through as it arrives: the mock sends chunked SSE 0.6 s apart; read it through the proxy
         gw.set(chunked_sse=0.6)
-        conn = http.client.HTTPConnection("127.0.0.1", proxy.srv.server_address[1], timeout=30)
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=30)
         body = json.dumps({"model": MODEL, "stream": True, "max_tokens": 8, "messages": [{"role": "user", "content": "x"}]})
         t0 = time.time()
         conn.request("POST", "/v1/messages", body, {"content-type": "application/json", "authorization": f"Bearer {OAUTH}",
-                                                    "anthropic-beta": "oauth-2025-04-20"})
+                                                    "anthropic-beta": "oauth-2025-04-20", proxy.local_header: proxy.secret})
         resp = conn.getresponse()
         observe("sse_status", resp.status)
         observe("sse_chunked", "yes" if resp.getheader("Transfer-Encoding") == "chunked" else "no")
@@ -754,7 +823,7 @@ def scenario_proxy(out):
 
 
 def scenario_stored_login_proxy(out):
-    """A stored `claude login` (LOGIN_CONFIG_DIR) through the prototype proxy and the mock gateway: a gateway 401 becomes
+    """A stored `claude login` (LOGIN_CONFIG_DIR) through the client's proxy and the mock gateway: a gateway 401 becomes
     498 at the proxy, so Claude Code makes one attempt and leaves the login alone (compare stored_login: 13 attempts
     and a rotated login without the proxy); no usable token fails the same way without reaching the gateway.
     Rotates the real login at Anthropic if the proxy does not work, so only run it on purpose."""
@@ -764,18 +833,18 @@ def scenario_stored_login_proxy(out):
     backup = borrow_settings(claude.settings_file)
     good = fresh_jwt()
     proxy = Proxy(out, gw.url)
-    proxy.set_token(good)
+    proxy.use(good)
     claude.env["ANTHROPIC_BASE_URL"] = proxy.url
     try:
         before = cred_state(cfg)
         observe("login_present", "yes" if before.get("exists") else "no")
-        claude.write_settings({})          # no JWT in the settings: the proxy supplies it
+        claude.write_settings({"env": {"ANTHROPIC_CUSTOM_HEADERS": f"{proxy.local_header}: {proxy.secret}"}})   # no JWT: the proxy supplies it
         claude.start()
         observe("baseline", classify(claude.turn("baseline")["text"]))
         for name, ctl, token in (("portkey401", dict(revoked=[mock_gateway.fingerprint(good)]), good), ("notoken", {}, SENTINEL)):
             gw.set(force=None, revoked=[])
             gw.set(**ctl)
-            proxy.set_token(token)
+            proxy.use(token)
             b = cred_state(cfg)
             mark, pmark = gw.mark(), proxy.mark()
             t = claude.turn(f"case {name}")
@@ -789,7 +858,7 @@ def scenario_stored_login_proxy(out):
             observe(f"{name}_login_rotated", "yes" if a.get("refresh") != b.get("refresh") else "no")
             observe(f"{name}_login_still_valid", "yes" if login_valid(a) else "no")
         gw.set(force=None, revoked=[])
-        proxy.set_token(good)
+        proxy.use(good)
         observe("recovery", classify(claude.turn("recovery")["text"]))
     finally:
         claude.stop()

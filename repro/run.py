@@ -45,11 +45,11 @@ DESCRIBE = {
     'stopfailure':
         'stopfailure: after the gateway refuses a JWT that still looks valid, the StopFailure hook renews it and notifies, and the retry works; an Anthropic-side failure is left alone. Mock gateway, fake IdP. Changes: nothing. About 1 min.',
     'proxy':
-        'proxy: Claude Code (CLAUDE_CODE_OAUTH_TOKEN login) through the prototype local proxy (proxy_prototype.py) in front of the mock gateway: the gateway header injected and a client-supplied one stripped, a renewed token picked up, SSE passed through as it arrives, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token failing closed; then which Unix socket base URLs Claude Code can use (spike S11). Mock gateway. Changes: nothing. About 3 min.',
+        'proxy: Claude Code (CLAUDE_CODE_OAUTH_TOKEN login) through the real local proxy of the client (mode 2) in front of the mock gateway: the per-user secret header required and stripped, the gateway header injected and a client-supplied one stripped, a renewed token picked up, SSE passed through as it arrives, a refused JWT renewed and retried once, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token failing closed, the control channel; then which Unix socket base URLs Claude Code can use (spike S11). Mock gateway. Changes: nothing. About 3 min.',
     'stored_login':
         'stored_login: a stored `claude login` (LOGIN_CONFIG_DIR) against the mock gateway: 498 fails at once and leaves the login alone; a gateway 401 runs the OAuth refresh loop (about 4 min). Changes: rotates the stored login at Anthropic, swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 4 min.',
     'stored_login_proxy':
-        'stored_login_proxy: a stored `claude login` (LOGIN_CONFIG_DIR) through the prototype local proxy and the mock gateway: a refused JWT (gateway 401) becomes 498 at the proxy and fails in one attempt without the OAuth loop; no usable token fails the same way without reaching the gateway. Changes: rotates the stored login at Anthropic if the proxy did not work, swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 1 min.',
+        'stored_login_proxy: a stored `claude login` (LOGIN_CONFIG_DIR) through the real local proxy of the client and the mock gateway: a refused JWT (gateway 401) becomes 498 at the proxy and fails in one attempt without the OAuth loop; no usable token fails the same way without reaching the gateway. Changes: rotates the stored login at Anthropic if the proxy did not work, swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 1 min.',
     'gateway':
         "gateway: the real gateway, request by request: missing, garbage and tampered JWTs and the sentinel are refused by the gateway (or the LB guard); a valid JWT, also with a Bearer prefix, reaches Anthropic with the caller's own login (passthrough). Changes: nothing (one model call on your plan if LOGIN_CONFIG_DIR is set). Under 1 min.",
     'live_login':
@@ -173,11 +173,20 @@ normal_client_header_stripped yes
 normal_authorization oauth
 normal_beta_passed yes
 normal_streamed yes
+normal_secret_stripped yes
 normal_proxy_logged_fingerprint yes
-# the token file changes: the next request carries the new token
+# a new JWT from the source (a renewal): the next request carries it
 renewed_result ok
 renewed_header_injected yes
-# the gateway refuses the JWT (Portkey 401): the proxy answers 498, so one attempt (direct 401: 2 attempts, finding 5)
+# the gateway refuses the JWT in use and the source has a fresh one: the proxy renews and retries once, the turn succeeds
+retry_result ok
+retry_attempts 1
+retry_upstream_requests 2
+retry_first_try_refused_jwt yes
+retry_second_try_fresh_jwt yes
+retry_proxy_status 200
+retry_proxy_note renewed-retry
+# the gateway refuses the JWT (Portkey 401) and the source has nothing new: the proxy answers 498, so one attempt (direct 401: 2 attempts, finding 5)
 portkey401_attempts 1
 portkey401_upstream_requests 1
 portkey401_proxy_status 498
@@ -195,11 +204,11 @@ anthropic401_fast yes
 anthropic401_message anthropic
 anthropic401_498_shown no
 anthropic401_stopfailure_error authentication_failed
-# no usable token (file missing, empty, sentinel): 498 from the proxy, nothing sent upstream
+# no usable token (the source gives nothing: file missing, empty, sentinel): 498 from the proxy, nothing sent upstream
 notoken_missing_attempts 1
 notoken_missing_upstream_requests 0
 notoken_missing_proxy_status 498
-notoken_missing_proxy_note no-token:missing
+notoken_missing_proxy_note no-token
 notoken_missing_fast yes
 notoken_missing_message gateway-token
 notoken_missing_498_shown yes
@@ -207,7 +216,7 @@ notoken_missing_stopfailure_error unknown
 notoken_empty_attempts 1
 notoken_empty_upstream_requests 0
 notoken_empty_proxy_status 498
-notoken_empty_proxy_note no-token:missing
+notoken_empty_proxy_note no-token
 notoken_empty_fast yes
 notoken_empty_message gateway-token
 notoken_empty_498_shown yes
@@ -215,12 +224,23 @@ notoken_empty_stopfailure_error unknown
 notoken_sentinel_attempts 1
 notoken_sentinel_upstream_requests 0
 notoken_sentinel_proxy_status 498
-notoken_sentinel_proxy_note no-token:expired
+notoken_sentinel_proxy_note no-token
 notoken_sentinel_fast yes
 notoken_sentinel_message gateway-token
 notoken_sentinel_498_shown yes
 notoken_sentinel_stopfailure_error unknown
 recovery ok
+# the per-user secret: without it or with a wrong one the proxy answers 498 and nothing reaches the gateway
+secret_missing_status 498
+secret_missing_leaks no
+secret_wrong_status 498
+secret_wrong_leaks no
+secret_upstream_requests 0
+# the control channel summarizes the JWT in memory, never the token, and needs the secret
+control_inspect_status 200
+control_inspect_token_absent yes
+control_inspect_fingerprint yes
+control_without_secret_status 498
 # chunked SSE, events 0.6 s apart, read through the proxy: the first event arrives at once, the stream is chunked and whole
 sse_status 200
 sse_chunked yes

@@ -1,4 +1,7 @@
-# systemd user unit: keeps the gateway JWT in Claude Code's settings fresh in the background.
+# systemd user unit: keeps the gateway JWT fresh in the background. In file mode it renews the JWT in Claude Code's
+# settings; in proxy mode (`mode: proxy` in the config) the same `daemon` command IS the local proxy, so it must always
+# run: enabled at login, Restart=on-failure brings it back after a crash within RestartSec (a clean exit, such as a
+# second instance finding the port taken, is not restarted).
 # Install:  cp aigw-claude-auth.service ~/.config/systemd/user/ && systemctl --user daemon-reload
 #           systemctl --user enable --now aigw-claude-auth
 # Logs:     journalctl --user -u aigw-claude-auth
@@ -12,7 +15,7 @@ After=network-online.target
 ExecStart=/usr/bin/env python3 %h/.local/bin/aigw-claude-auth daemon
 # Environment=CLAUDE_CONFIG_DIR=%h/.claude
 Restart=on-failure
-RestartSec=30
+RestartSec=10
 
 [Install]
 WantedBy=default.target

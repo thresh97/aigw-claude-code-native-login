@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd agent: keeps the gateway JWT in Claude Code's settings fresh in the background (macOS).
+  launchd agent: keeps the gateway JWT fresh in the background (macOS). In file mode it renews the JWT in Claude Code's
+  settings; in proxy mode (`mode: proxy` in the config) the same `daemon` command IS the local proxy, so it must always
+  run: RunAtLoad starts it at login, KeepAlive restarts it after a crash or kill (a clean exit, such as a second
+  instance finding the port taken, is not restarted), ThrottleInterval is the shortest gap between restarts.
   Install:  sed "s#HOME_DIR#$HOME#g" aigw-claude-auth.plist > ~/Library/LaunchAgents/aigw-claude-auth.plist
             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/aigw-claude-auth.plist
   Remove:   launchctl bootout gui/$(id -u)/aigw-claude-auth && rm ~/Library/LaunchAgents/aigw-claude-auth.plist
@@ -24,7 +27,7 @@
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardErrorPath</key><string>HOME_DIR/Library/Logs/aigw-claude-auth.log</string>
   <key>StandardOutPath</key><string>HOME_DIR/Library/Logs/aigw-claude-auth.log</string>
 </dict>

@@ -14,7 +14,7 @@ Guidance for coding agents running or changing this repo. Read README.md first.
   of the gateway. Both are shared infrastructure: get the operator's go-ahead first.
 - **Offline scenarios** (`unit headers errors precheck stopfailure proxy`; `run.sh` or `run.py`): local only. Throwaway HOME, config dir and fake
   IdP under the run's results dir; a mock gateway on 127.0.0.1. Dummy credentials only. `proxy` also starts
-  `repro/proxy_prototype.py` on 127.0.0.1 (its token file is a fake JWT in a throwaway dir) and a mock gateway listening
+  the client's real proxy (mode 2, in the harness process) on 127.0.0.1 (its JWT comes from a token file with a fake JWT in a throwaway dir) and a mock gateway listening
   on a Unix socket in a throwaway dir.
 - **`keycloak`**: local only, needs Docker. Starts `quay.io/keycloak/keycloak:26.4.7` on 127.0.0.1 (container `aigw-kc*`,
   removed with its volumes afterwards), creates a test user with a random password kept in memory, and drives the
@@ -30,7 +30,7 @@ Guidance for coding agents running or changing this repo. Read README.md first.
   the original is kept in `settings.json.repro-backup` (mode 600) until then, so after a killed run the next run of
   one of these scenarios restores it. `client_live` also
   refreshes the client's sign-in in `AIGW_CLAUDE_AUTH_DIR`. `stored_login_proxy` runs the stored login through the
-  prototype proxy and should not rotate it (that is what it checks); if the proxy did not work, it does.
+  client's proxy (mode 2) and should not rotate it (that is what it checks); if the proxy did not work, it does.
 - **`managed`** (needs `--yes` and sudo): writes the OS managed-settings file (`/Library/Application Support/ClaudeCode/`
   or `/etc/claude-code/`) as root for each case, and files in `managed-settings.d/` for the drop-in cases. It removes
   what it wrote, and the directories too if it created them. Refuses if a managed-settings file or a drop-in exists. Every Claude Code on the machine reads that file while a case runs; the scenario's

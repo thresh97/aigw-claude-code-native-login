@@ -1023,13 +1023,11 @@ class DoctorTests(Base):
         self.assertNotIn("base-url-mismatch", self.doctor()[2])
 
     def test_proxy_listen_mismatch_when_mode_is_proxy(self):
-        # `mode` and `proxy_listen` are read from the helper config when mode 2 exists; the check is ready for them
         self.user_settings({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:9999"}})
-        with mock.patch.dict(A.DEFAULTS, {"mode": "file", "proxy_listen": "127.0.0.1:0"}):
-            self.write_config(mode="proxy", proxy_listen="127.0.0.1:8123")
-            self.assertEqual(self.doctor()[2]["proxy-listen"], "Error")
-            self.write_config(mode="proxy", proxy_listen="127.0.0.1:9999")
-            self.assertNotIn("proxy-listen", self.doctor()[2])
+        self.write_config(mode="proxy", gateway_url="http://gw.example", proxy_listen="127.0.0.1:8123")
+        self.assertEqual(self.doctor()[2]["proxy-listen"], "Error")
+        self.write_config(mode="proxy", gateway_url="http://gw.example", proxy_listen="127.0.0.1:9999")
+        self.assertNotIn("proxy-listen", self.doctor()[2])
 
     def test_settings_file_mismatch(self):
         self.clean_user()
@@ -1987,6 +1985,863 @@ class InspectTests(Base):
         self.run_cli("inspect", "--debug", "on")
         self.assertEqual(self.run_cli("inspect", "--debug", "off")[1].strip(), "debug: off")
         self.assertNotIn("debug_until", A.State(self.state_dir).load())
+
+
+# --------------------------------------------------------------------------------------------- Mode 2: the local proxy
+
+def free_port():
+    import socket
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+class FakeGateway:
+    """The gateway as the proxy sees it: records requests; answers 200, a Portkey 401 for a refused JWT, Anthropic's 401,
+    or a chunked SSE stream whose second half waits for the test (so 'the first chunk arrived early' is not a timing guess)."""
+
+    def __init__(self):
+        self.requests = []               # {"headers": {lower: value}, "path", "body"}
+        self.lock = threading.Lock()
+        self.refused = set()             # JWTs the gateway refuses (Portkey 401)
+        self.refuse_all = False
+        self.anthropic_401 = False
+        self.release = threading.Event()  # the SSE reply sends its second chunk when this is set
+        self.barrier = None               # a threading.Barrier: the SSE reply waits for all parties (concurrency)
+        self.gzip_401 = False
+        gw = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def send(self, code, obj, extra=None):
+                data = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n)
+                hdrs = {k.lower(): v for k, v in self.headers.items()}
+                with gw.lock:
+                    gw.requests.append({"headers": hdrs, "path": self.path, "body": body})
+                key = hdrs.get("x-portkey-api-key", "")
+                if gw.anthropic_401:
+                    return self.send(401, {"error": {"message": "anthropic error: Invalid bearer token", "type": "authentication_error"},
+                                           "provider": "anthropic"}, {"request-id": "req_x", "x-should-retry": "false"})
+                if gw.refuse_all or key in gw.refused or not key:
+                    msg = json.dumps({"status": "failure", "message": "Portkey Error: JWT verification failed. Error Code: 03"}).encode()
+                    if gw.gzip_401:
+                        import gzip
+                        return self.send(401, gzip.compress(msg), {"Content-Encoding": "gzip"})
+                    return self.send(401, msg)
+                if self.path.startswith("/stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    for i, piece in enumerate((b"event: one\ndata: 1\n\n", b"event: two\ndata: 2\n\n")):
+                        if i:
+                            if gw.barrier:
+                                gw.barrier.wait(10)
+                            gw.release.wait(10)
+                        self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
+                    return
+                self.send(200, {"ok": True, "echo": body.decode("utf-8", "replace")})
+
+            def do_GET(self):
+                with gw.lock:
+                    gw.requests.append({"headers": {k.lower(): v for k, v in self.headers.items()}, "path": self.path, "body": b""})
+                self.send(200, {"ok": True})
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        self.srv.handle_error = lambda *a: None
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.release.set()
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class ProxyBase(Base):
+    """A running proxy (in this process) in front of a FakeGateway, signed in to the FakeIdP."""
+
+    signed_in = True
+
+    def setUp(self):
+        super().setUp()
+        self.gw = FakeGateway()
+        self.addCleanup(self.gw.close)
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.configure()
+        if self.signed_in:
+            self.sign_in()
+        self.start_proxy()
+
+    def configure(self, **over):
+        self.write_config(**dict(dict(mode="proxy", gateway_url=self.gw.url, proxy_listen="127.0.0.1:0"), **over))
+
+    def load(self):
+        cfg = A.load_config(self.config_path)
+        cfg["_config_path"] = str(self.config_path)
+        return cfg
+
+    def start_proxy(self, **kw):
+        self.cfg = self.load()
+        self.state = A.State(self.state_dir)
+        self.settings = A.Settings(self.settings_path, self.cfg["header"])
+        self.ps = A.ProxyServer(self.cfg, self.state, self.settings, renew_cooldown=kw.pop("renew_cooldown", 0), **kw)
+        self.port = self.ps.start()
+        self.addCleanup(self.ps.stop)
+        self.secret = A.proxy_secret(self.state)
+        return self.ps
+
+    def restart_proxy(self, **kw):
+        self.ps.stop()
+        return self.start_proxy(**kw)
+
+    def call(self, method="POST", path="/v1/messages", body=b'{"model":"m","stream":false}', headers=None, secret=True, port=None):
+        """One request through the proxy: (status, response headers, body bytes)."""
+        import http.client
+        h = {"Content-Type": "application/json", "Authorization": "Bearer sk-ant-oat01-user", "anthropic-beta": "oauth-2025-04-20"}
+        if secret:
+            h[A.LOCAL_HEADER] = self.secret if secret is True else secret
+        h.update(headers or {})
+        c = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=20)
+        try:
+            c.request(method, path, body=body if method == "POST" else None, headers=h)
+            r = c.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+        finally:
+            c.close()
+
+    def renew(self):
+        self.assertTrue(self.ps.holder.renew(force=True)[0])
+        return self.ps.holder.token
+
+    def idp_posts(self):
+        return len([c for c in self.idp.calls if c[0] == "POST"])
+
+
+class ProxyForwardTests(ProxyBase):
+    def test_injects_the_jwt_and_strips_client_values(self):
+        tok = self.renew()
+        status, _, body = self.call(headers={"x-portkey-api-key": "client-supplied", "X-Portkey-Api-Key": "again"})
+        self.assertEqual(status, 200)
+        seen = self.gw.requests[0]["headers"]
+        self.assertEqual(seen["x-portkey-api-key"], tok)
+        self.assertNotIn("client-supplied", json.dumps(seen))
+        self.assertNotIn(A.LOCAL_HEADER, seen, "the local secret must not reach the gateway")
+        self.assertEqual(seen["authorization"], "Bearer sk-ant-oat01-user")
+        self.assertEqual(seen["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(seen["host"], self.gw.url.split("//")[1])
+        self.assertEqual(json.loads(body)["echo"], '{"model":"m","stream":false}')
+
+    def test_the_gateway_path_prefix_is_kept(self):
+        self.configure(gateway_url=self.gw.url + "/anthropic/")
+        self.restart_proxy()
+        self.renew()
+        self.call(path="/v1/messages?beta=true")
+        self.assertEqual(self.gw.requests[0]["path"], "/anthropic/v1/messages?beta=true")
+
+    def test_the_first_request_renews_when_the_daemon_has_not_yet(self):
+        self.assertEqual(self.ps.holder.token, "")
+        self.assertEqual(self.call()[0], 200)
+        self.assertEqual(A.jwt_claims(self.gw.requests[0]["headers"]["x-portkey-api-key"])["kind"], "gateway")
+
+    def test_the_jwt_is_never_written_to_the_settings(self):
+        tok = self.renew()
+        self.call()
+        self.assertFalse(self.settings_path.exists() and tok in self.settings_path.read_text())
+        for f in self.state_dir.iterdir():
+            self.assertNotIn(tok, f.read_text(errors="replace"), f.name)
+
+    def test_get_is_forwarded(self):
+        self.renew()
+        self.assertEqual(self.call("GET", "/v1/models")[0], 200)
+        self.assertEqual(self.gw.requests[0]["path"], "/v1/models")
+
+    def test_an_upstream_connection_failure_is_a_502_without_details(self):
+        self.renew()
+        self.gw.close()
+        status, _, body = self.call()
+        self.assertEqual(status, 502)
+        self.assertNotIn(self.gw.url.encode(), body)
+
+    def test_no_af_unix_anywhere(self):                       # Windows Python has none
+        self.assertNotIn("AF_UNIX", Path(A.__file__).read_text())
+
+    def test_it_also_serves_with_windows_socket_options(self):
+        with mock.patch.object(A, "is_windows", return_value=True):
+            self.restart_proxy()
+        self.assertEqual(self.call()[0], 200)
+
+
+class ProxySecretTests(ProxyBase):
+    def test_a_request_needs_the_secret(self):
+        self.renew()
+        for secret in (False, "wrong", self.secret[:-1], self.secret + "x", ""):
+            status, _, body = self.call(secret=secret)
+            self.assertEqual(status, 498, secret)
+            err = json.loads(body)["error"]
+            self.assertEqual(err["type"], "proxy_auth_error")
+            for leak in (self.secret, self.ps.holder.token, self.gw.url, "portkey", "jwt"):
+                self.assertNotIn(leak.lower(), body.decode().lower())
+        self.assertEqual(self.gw.requests, [], "nothing may reach the gateway without the secret")
+        self.assertEqual(self.call()[0], 200)
+
+    def test_the_comparison_is_constant_time(self):
+        with mock.patch("hmac.compare_digest", wraps=__import__("hmac").compare_digest) as cmp:
+            self.call(secret="wrong")
+        self.assertTrue(cmp.called)
+
+    def test_the_secret_file_is_private_and_stable(self):
+        f = self.state_dir / "proxy-secret"
+        self.assertGreaterEqual(len(f.read_text().strip()), 32)
+        if sys.platform != "win32":
+            self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
+        self.assertEqual(A.proxy_secret(A.State(self.state_dir), create=True), self.secret)
+
+    def test_a_secret_made_after_start_is_picked_up(self):
+        (self.state_dir / "proxy-secret").write_text("n" * 40 + "\n")
+        self.assertEqual(self.call(secret="n" * 40)[0], 200)
+
+    def test_options_preflight_from_a_web_page_is_refused(self):
+        status, _, _ = self.call("OPTIONS", secret=False, headers={"Origin": "http://evil.example", "Access-Control-Request-Headers": A.LOCAL_HEADER})
+        self.assertEqual(status, 498)
+
+
+class ProxyStreamTests(ProxyBase):
+    def test_sse_reaches_the_client_before_the_upstream_finishes(self):
+        import http.client
+        self.renew()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        c.request("POST", "/stream", body=b"{}", headers={A.LOCAL_HEADER: self.secret, "Content-Type": "application/json"})
+        r = c.getresponse()
+        self.assertEqual(r.getheader("Transfer-Encoding"), "chunked")
+        first = r.read1(65536)                               # the upstream is still waiting for gw.release
+        self.assertIn(b"event: one", first)
+        self.assertFalse(self.gw.release.is_set())
+        self.gw.release.set()
+        rest = r.read()
+        self.assertIn(b"event: two", first + rest)
+        c.close()
+
+    def test_several_simultaneous_streams(self):
+        import http.client
+        n = 8
+        self.renew()
+        self.gw.barrier = threading.Barrier(n)               # every upstream reply waits until all n are in flight at once
+        results, firsts = [None] * n, [None] * n
+
+        def one(i):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            c.request("POST", "/stream", body=b"{}", headers={A.LOCAL_HEADER: self.secret})
+            r = c.getresponse()
+            firsts[i] = r.read1(65536)                       # first chunk, while the others are all still open
+            results[i] = (r.status, firsts[i] + r.read())
+            c.close()
+
+        threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        time.sleep(0.5)
+        self.gw.release.set()
+        for t in threads:
+            t.join(30)
+        for i in range(n):
+            self.assertEqual(results[i][0], 200, i)
+            self.assertIn(b"event: one", firsts[i])
+            self.assertIn(b"event: two", results[i][1])
+        self.assertEqual(len(self.gw.requests), n)
+
+    def test_plain_json_with_content_length_is_not_rechunked(self):
+        self.renew()
+        status, headers, body = self.call()
+        self.assertEqual((status, "transfer-encoding" in headers), (200, False))
+        self.assertEqual(int(headers["content-length"]), len(body))
+
+
+class ProxyRefusalTests(ProxyBase):
+    def test_gateway_401_renews_and_retries_once(self):
+        old = self.renew()
+        self.gw.refused.add(old)
+        posts = self.idp_posts()
+        status, _, body = self.call()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(len(self.gw.requests), 2)
+        first, second = (r["headers"]["x-portkey-api-key"] for r in self.gw.requests)
+        self.assertEqual(first, old)
+        self.assertNotEqual(second, old)
+        self.assertEqual(second, self.ps.holder.token)
+        self.assertGreater(self.idp_posts(), posts)
+        self.assertEqual(self.call()[0], 200, "the renewed JWT is kept for the next request")
+
+    def test_still_refused_after_the_retry_is_a_498_like_the_lb_guard(self):
+        self.renew()
+        self.gw.refuse_all = True
+        status, _, body = self.call()
+        self.assertEqual(status, 498)
+        self.assertEqual(json.loads(body), {"type": "error", "error": {"type": "gateway_token_error", "message": A.GUARD_MESSAGES["expired"]}})
+        self.assertEqual(len(self.gw.requests), 2, "one try and one retry, no more")
+
+    def test_nothing_new_to_try_is_not_a_retry(self):
+        f = self.tmp / "same-jwt"
+        f.write_text(jwt(time.time() + 3600, kind="gateway"))
+        self.configure(client_id="", issuer="", broker_url="", token_command=f"type {f}" if sys.platform == "win32" else f"cat {f}")
+        self.restart_proxy()
+        self.renew()
+        self.gw.refuse_all = True
+        status, _, _ = self.call()
+        self.assertEqual((status, len(self.gw.requests)), (498, 1), "the source returned the same refused JWT")
+
+    def test_renewals_forced_by_refusals_are_rate_limited(self):
+        self.restart_proxy(renew_cooldown=60)
+        self.renew()
+        self.gw.refuse_all = True
+        self.call()
+        n = self.idp_posts()
+        self.assertEqual(self.call()[0], 498)
+        self.assertEqual(self.idp_posts(), n, "no IdP traffic inside the cooldown")
+
+    def test_anthropics_401_is_passed_through_unchanged(self):
+        self.renew()
+        self.gw.anthropic_401 = True
+        posts = self.idp_posts()
+        status, headers, body = self.call()
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["provider"], "anthropic")
+        self.assertEqual(headers.get("request-id"), "req_x")
+        self.assertEqual(headers.get("x-should-retry"), "false")
+        self.assertEqual(len(self.gw.requests), 1, "no retry")
+        self.assertEqual(self.idp_posts(), posts, "no renewal")
+
+    def test_a_gzipped_gateway_401_is_still_recognised(self):
+        self.renew()
+        self.gw.refuse_all = self.gw.gzip_401 = True
+        self.assertEqual(self.call()[0], 498)
+
+    def test_classify_401(self):
+        self.assertEqual(A.classify_401(b'{"status":"failure","message":"Portkey Error: x"}'), "gateway")
+        self.assertEqual(A.classify_401(b'{"error":{"message":"anthropic error: bad"},"provider":"anthropic"}'), "other")
+        self.assertEqual(A.classify_401(b'{"error":{"message":"Portkey Error: x"},"provider": "anthropic"}'), "other")
+        self.assertEqual(A.classify_401(b"unauthorized"), "other")
+
+    def test_the_498_text_matches_the_lb_guard_everywhere(self):
+        root = Path(A.__file__).resolve().parent.parent
+        for f in ("repro/mock_gateway.py", "gateway/alb-guard-ingress.yaml"):
+            p = root / f
+            if p.exists():
+                text = p.read_text()
+                for msg in A.GUARD_MESSAGES.values():
+                    self.assertIn(msg, text, f)
+
+
+class ProxyFailClosedTests(ProxyBase):
+    signed_in = False
+
+    def test_no_jwt_answers_498_without_contacting_the_gateway_and_starts_a_sign_in(self):
+        self.idp.device_pending = 10**6                       # the user doesn't finish
+        status, _, body = self.call()
+        self.assertEqual(status, 498)
+        msg = json.loads(body)["error"]["message"]
+        self.assertTrue(msg.startswith(A.GUARD_MESSAGES["expired"]))
+        self.assertIn("ABCD-EFGH", msg)
+        self.assertEqual(self.gw.requests, [])
+        pending = json.loads(self.state_dir.joinpath("hook-login.json").read_text())
+        self.addCleanup(lambda: os.kill(pending["pid"], 15))
+        self.assertNotIn("dev-1", msg)                         # the device code stays secret
+        n = len([c for c in self.idp.calls if c[1] == "/device"])
+        self.call()
+        self.assertEqual(len([c for c in self.idp.calls if c[1] == "/device"]), n, "the pending sign-in is reused")
+
+    def test_finishing_the_sign_in_makes_the_proxy_work(self):
+        self.idp.device_pending = 2
+        self.assertEqual(self.call()[0], 498)
+        end = time.time() + 25
+        while time.time() < end:
+            if self.call()[0] == 200:
+                break
+            time.sleep(0.3)
+        else:
+            log = self.state_dir / "hook-login.log"
+            self.fail("the proxy never got a JWT after the sign-in; " + (log.read_text() if log.exists() else "no log"))
+        self.assertTrue(self.gw.requests)
+
+    def test_hook_login_off_gives_a_plain_498(self):
+        self.configure(hook_login="off")
+        self.restart_proxy()
+        status, _, body = self.call()
+        self.assertEqual((status, json.loads(body)["error"]["message"]), (498, A.GUARD_MESSAGES["expired"]))
+        self.assertFalse(self.state_dir.joinpath("hook-login.json").exists())
+
+    def test_an_idp_outage_with_a_refresh_token_is_498_not_a_hang(self):
+        self.sign_in()
+        self.idp.refresh_error = "temporarily_unavailable"
+        t0 = time.time()
+        for _ in range(3):
+            self.assertEqual(self.call()[0], 498)
+        self.assertLess(time.time() - t0, 5)
+        self.assertEqual(len([c for c in self.idp.calls if c[0] == "POST" and c[2] == "refresh_token"]), 1, "retried at most once per backoff")
+
+    def test_a_config_error_blocks_with_its_message(self):
+        self.ps.blocked = {"id": "hook-binary-missing", "message": "the hook is gone", "fix": "re-run install", "severity": "Error"}
+        self.ps.blocked_checked = time.time() + 3600
+        status, _, body = self.call()
+        self.assertEqual(status, 498)
+        self.assertIn("the hook is gone", body.decode())
+        self.assertEqual(self.gw.requests, [])
+
+
+class ProxyControlTests(ProxyBase):
+    def ask(self, method, path, secret=True):
+        status, _, body = self.call(method, path, body=b"", secret=secret)
+        return status, body
+
+    def test_status_and_inspect_never_hold_the_token(self):
+        tok = self.renew()
+        for path in ("/_aigw/status", "/_aigw/inspect", "/_aigw/inspect?claims=1"):
+            status, body = self.ask("GET", path)
+            self.assertEqual(status, 200)
+            self.assertNotIn(tok, body.decode())
+            self.assertNotIn(tok.split(".")[2], body.decode())
+        st = json.loads(self.ask("GET", "/_aigw/status")[1])
+        self.assertEqual((st["mode"], st["usable"]), ("proxy", True))
+        self.assertIn(A.fingerprint(tok).split(" expires")[0], st["jwt"])
+
+    def test_the_control_channel_needs_the_secret(self):
+        self.renew()
+        for method, path in (("GET", "/_aigw/status"), ("GET", "/_aigw/inspect"), ("POST", "/_aigw/renew"), ("POST", "/_aigw/forget")):
+            self.assertEqual(self.ask(method, path, secret=False)[0], 498, path)
+            self.assertEqual(self.ask(method, path, secret="nope")[0], 498, path)
+        self.assertTrue(self.ps.holder.usable())
+
+    def test_unknown_control_path(self):
+        self.assertEqual(self.ask("GET", "/_aigw/nothing")[0], 404)
+
+    def test_renew_and_forget(self):
+        old = self.renew()
+        st, body = self.ask("POST", "/_aigw/renew")
+        self.assertEqual((st, json.loads(body)["changed"]), (200, False), "still valid: not renewed")
+        st, body = self.ask("POST", "/_aigw/renew?force=1")
+        self.assertEqual(json.loads(body)["changed"], True)
+        self.assertNotEqual(self.ps.holder.token, old)
+        self.ask("POST", "/_aigw/forget")
+        self.assertEqual(self.ps.holder.token, "")
+
+    def test_inspect_live_from_the_cli(self):
+        tok = self.renew()
+        code, out, err = self.run_cli("inspect", "--live")
+        self.assertEqual(code, 0, err)
+        self.assertIn("asked the running proxy", out)
+        self.assertIn("pid", out)
+        self.assertNotIn(tok, out + err)
+        # without --live, proxy mode asks the proxy as well
+        self.assertIn("asked the running proxy", self.run_cli("inspect")[1])
+
+    def test_inspect_live_without_a_proxy(self):
+        self.ps.stop()
+        code, out, err = self.run_cli("inspect", "--live")
+        self.assertEqual(code, 1)
+        self.assertIn("not running", err)
+
+    def test_status_shows_the_proxy(self):
+        self.renew()
+        code, out, _ = self.run_cli("status")
+        self.assertEqual(code, 0)
+        self.assertIn("running on 127.0.0.1:", out)
+        self.assertIn("in the proxy's memory", out)
+        self.assertNotIn(self.ps.holder.token, out)
+
+    def test_sync_asks_the_proxy_and_writes_nothing(self):
+        code, _, err = self.run_cli("sync", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.ps.holder.usable())
+        self.assertFalse(self.settings_path.exists())
+
+    def test_token_mints_without_writing(self):
+        code, out, _ = self.run_cli("token")
+        self.assertEqual((code, A.jwt_claims(out.strip()).get("kind")), (0, "gateway"))
+        self.assertFalse(self.settings_path.exists())
+
+    def test_logout_makes_the_proxy_forget(self):
+        self.renew()
+        code, _, _ = self.run_cli("logout")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ps.holder.token, "")
+        self.assertFalse(self.settings_path.exists())
+        self.assertNotIn("refresh_token", A.State(self.state_dir).load())
+
+
+class ProxyConfigTests(Base):
+    def test_only_loopback_addresses_are_accepted(self):
+        for bad in ("0.0.0.0:8000", "192.168.1.5:8000", "[::]:8000", "example.com:8000", "8000", "127.0.0.1", "127.0.0.1:99999", "10.0.0.1:1", ":80"):
+            with self.assertRaises(A.AuthError, msg=bad):
+                A.parse_listen(bad)
+            self.write_config(proxy_listen=bad)
+            with self.assertRaises(A.AuthError, msg=bad):
+                A.load_config(self.config_path)
+        self.assertEqual(A.parse_listen("127.0.0.1:18787"), ("127.0.0.1", 18787))
+        self.assertEqual(A.parse_listen("localhost:5"), ("127.0.0.1", 5))
+        self.assertEqual(A.parse_listen("[::1]:5"), ("::1", 5))
+        self.assertEqual(A.parse_listen("127.0.0.1:0"), ("127.0.0.1", 0))
+
+    def test_the_proxy_command_refuses_a_non_loopback_address(self):
+        self.write_config(mode="proxy", gateway_url="http://gw.example", proxy_listen="0.0.0.0:18787")
+        code, _, err = self.run_cli("proxy")
+        self.assertEqual(code, 1)
+        self.assertIn("loopback", err)
+
+    def test_defaults(self):
+        self.assertEqual((A.DEFAULTS["mode"], A.DEFAULTS["proxy_listen"], A.DEFAULTS["gateway_url"]), ("file", "127.0.0.1:18787", ""))
+        self.write_config(mode="bogus")
+        with self.assertRaises(A.AuthError):
+            A.load_config(self.config_path)
+
+    def test_proxy_needs_a_gateway_url(self):
+        self.write_config(mode="proxy")
+        code, _, err = self.run_cli("install")
+        self.assertEqual(code, 1)
+        self.assertIn("gateway_url", err)
+
+    def test_the_example_config_only_has_known_keys(self):
+        ex = json.loads((Path(A.__file__).resolve().parent / "config.example.json").read_text())
+        self.assertFalse(set(ex) - set(A.DEFAULTS))
+
+
+class ProxyUpstreamTests(unittest.TestCase):
+    """TLS verification and HTTPS_PROXY / NO_PROXY for the connection to the gateway (no network: only how it is set up)."""
+
+    def conn(self, url, **env):
+        with mock.patch.dict(os.environ, env):
+            for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
+                if k not in env:
+                    os.environ.pop(k, None)             # an empty lowercase variable would override the uppercase one
+            return A.Upstream(url).connect()
+
+    def test_https_verifies_certificates_against_the_system_store(self):
+        import ssl
+        up = A.Upstream("https://gw.example.com/base")
+        self.assertEqual((up.ctx.verify_mode, up.ctx.check_hostname), (ssl.CERT_REQUIRED, True))
+        c, target = self.conn("https://gw.example.com/base")
+        self.assertEqual((c.host, c.port, target("/v1/messages")), ("gw.example.com", 443, "/base/v1/messages"))
+
+    def test_https_proxy_is_honored_with_a_tunnel(self):
+        c, target = self.conn("https://gw.example.com", HTTPS_PROXY="http://user:pw@proxy.local:3128")
+        self.assertEqual((c.host, c.port, c._tunnel_host, c._tunnel_port), ("proxy.local", 3128, "gw.example.com", 443))
+        self.assertIn("Proxy-Authorization", c._tunnel_headers)
+        self.assertEqual(target("/v1/messages"), "/v1/messages")
+
+    def test_no_proxy_and_loopback_bypass_it(self):
+        c, _ = self.conn("https://gw.example.com", HTTPS_PROXY="http://proxy.local:3128", NO_PROXY="example.com")
+        self.assertEqual(c.host, "gw.example.com")
+        c, _ = self.conn("http://127.0.0.1:8787", HTTP_PROXY="http://proxy.local:3128")
+        self.assertEqual((c.host, c.port), ("127.0.0.1", 8787))
+
+    def test_http_upstream_through_a_proxy_uses_the_absolute_uri(self):
+        c, target = self.conn("http://gw.example.com:8080/x", HTTP_PROXY="http://proxy.local:3128")
+        self.assertEqual((c.host, c.port, target("/v1/messages")), ("proxy.local", 3128, "http://gw.example.com:8080/x/v1/messages"))
+
+
+class ProxyInstallTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.port = free_port()
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sign_in()
+
+    def settings_data(self):
+        return json.loads(self.settings_path.read_text())
+
+    def headers(self):
+        return (self.settings_data().get("env") or {}).get("ANTHROPIC_CUSTOM_HEADERS", "")
+
+    def test_install_in_proxy_mode_writes_the_base_url_the_secret_and_no_jwt(self):
+        self.settings_path.write_text(json.dumps({"model": "opus", "env": {"ANTHROPIC_CUSTOM_HEADERS": "x-team: blue\nx-portkey-api-key: " + jwt(time.time() + 3600)}}))
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{self.port}")
+        code, _, err = self.run_cli("install")
+        self.assertEqual(code, 0, err)
+        d = self.settings_data()
+        self.assertEqual(d["env"]["ANTHROPIC_BASE_URL"], f"http://127.0.0.1:{self.port}")
+        self.assertEqual(d["model"], "opus")
+        lines = d["env"]["ANTHROPIC_CUSTOM_HEADERS"].split("\n")
+        self.assertIn("x-team: blue", lines)
+        self.assertIn(f"{A.LOCAL_HEADER}: {A.proxy_secret(A.State(self.state_dir))}", lines)
+        self.assertFalse([l for l in lines if l.lower().startswith("x-portkey-api-key")], "the JWT must be gone")
+        self.assertTrue(hook_words(d["hooks"]["UserPromptSubmit"][0]["hooks"][0]).endswith("hook precheck"))
+        self.assertEqual(self.run_cli("install")[0], 0)           # idempotent, same secret
+        self.assertEqual(self.settings_data(), d)
+
+    def test_install_in_proxy_mode_refuses_base_url_and_port_zero(self):
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{self.port}")
+        self.assertIn("gateway_url", self.run_cli("install", "--base-url", "https://x.example")[2])
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen="127.0.0.1:0")
+        code, _, err = self.run_cli("install")
+        self.assertEqual(code, 1)
+        self.assertIn("fixed port", err)
+
+    def test_install_print_has_no_secret(self):
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{self.port}")
+        code, out, err = self.run_cli("install", "--print")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["env"], {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{self.port}"})
+        self.assertFalse(self.state_dir.joinpath("proxy-secret").exists())
+
+    def test_switching_modes_cleans_up_the_other_modes_entries(self):
+        self.write_config(mode="file", proxy_listen=f"127.0.0.1:{self.port}", gateway_url="")
+        self.assertEqual(self.run_cli("install", "--base-url", "https://gw.example.com")[0], 0)
+        self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+        # file -> proxy
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{self.port}")
+        self.assertEqual(self.run_cli("install")[0], 0)
+        self.assertEqual(self.header(), "", "the JWT is gone from the settings")
+        self.assertIn(A.LOCAL_HEADER, self.headers())
+        self.assertEqual(self.settings_data()["env"]["ANTHROPIC_BASE_URL"], f"http://127.0.0.1:{self.port}")
+        # proxy -> file
+        self.write_config(mode="file", proxy_listen=f"127.0.0.1:{self.port}", gateway_url="https://gw.example.com")
+        self.assertEqual(self.run_cli("install", "--base-url", "https://gw.example.com")[0], 0)
+        self.assertNotIn(A.LOCAL_HEADER, self.headers())
+        self.assertEqual(self.settings_data()["env"]["ANTHROPIC_BASE_URL"], "https://gw.example.com")
+        self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+
+    def test_back_to_file_without_a_base_url_removes_the_proxy_address(self):
+        self.settings_path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{self.port}", "ANTHROPIC_CUSTOM_HEADERS": f"{A.LOCAL_HEADER}: abc"}}))
+        self.write_config(mode="file", proxy_listen=f"127.0.0.1:{self.port}")
+        code, _, err = self.run_cli("install")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("ANTHROPIC_BASE_URL", self.settings_data()["env"])
+        self.assertIn("--base-url", err)
+
+    def test_file_mode_install_is_unchanged(self):
+        self.assertEqual(self.run_cli("install", "--base-url", "https://gw.example.com")[0], 0)
+        self.assertEqual(self.settings_data()["env"]["ANTHROPIC_BASE_URL"], "https://gw.example.com")
+        self.assertFalse(self.state_dir.joinpath("proxy-secret").exists())
+        self.assertNotIn(A.LOCAL_HEADER, self.headers())
+
+
+class ProxyDoctorTests(ProxyBase):
+    """Doctor against a proxy-mode configuration. The proxy in setUp listens on a free port; settings come from install."""
+
+    def setUp(self):
+        self.port_wanted = free_port()
+        super().setUp()
+
+    def configure(self, **over):
+        self.write_config(**dict(dict(mode="proxy", gateway_url=self.gw.url, proxy_listen=f"127.0.0.1:{self.port_wanted}"), **over))
+
+    def installed(self):
+        self.assertEqual(self.run_cli("install")[0], 0)
+
+    def doctor(self):
+        code, out, _ = self.run_cli("doctor", "--json")
+        return {f["id"]: f for f in json.loads(out)["findings"]}
+
+    def test_a_clean_proxy_setup(self):
+        self.installed()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.settings_path.parent)}):
+            ids = self.doctor()
+        self.assertEqual({k: v["severity"] for k, v in ids.items() if v["severity"] != "Info"}, {})
+
+    def test_base_url_that_is_not_the_proxy(self):
+        self.installed()
+        d = json.loads(self.settings_path.read_text())
+        d["env"]["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9"
+        self.settings_path.write_text(json.dumps(d))
+        self.assertEqual(self.doctor()["proxy-listen"]["severity"], "Error")
+        d["env"].pop("ANTHROPIC_BASE_URL")
+        self.settings_path.write_text(json.dumps(d))
+        self.assertIn("not set", self.doctor()["proxy-listen"]["message"])
+        self.managed.mkdir(parents=True, exist_ok=True)
+        (self.managed / "managed-settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://gw.example"}}))
+        self.assertEqual(self.doctor()["proxy-listen"]["severity"], "Error")
+        (self.managed / "managed-settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{self.port_wanted}"}}))
+        self.assertNotIn("proxy-listen", self.doctor())
+
+    def test_proxy_not_running_and_port_taken(self):
+        self.installed()
+        self.assertNotIn("proxy-not-running", self.doctor())
+        self.assertNotIn("proxy-port-taken", self.doctor())
+        self.ps.stop()
+        self.assertEqual(self.doctor()["proxy-not-running"]["severity"], "Error")
+        import socket
+        sk = socket.socket()
+        self.addCleanup(sk.close)
+        sk.bind(("127.0.0.1", self.port_wanted))
+        sk.listen(5)
+        ids = self.doctor()
+        self.assertNotIn("proxy-not-running", ids)
+        self.assertEqual(ids["proxy-port-taken"]["severity"], "Error")
+
+    def test_a_jwt_left_in_the_settings_is_a_warning(self):
+        self.installed()
+        self.put_header(jwt(time.time() + 3600))
+        self.assertEqual(self.doctor()["proxy-jwt-in-settings"]["severity"], "Warning")
+        self.run_cli("install")
+        self.assertNotIn("proxy-jwt-in-settings", self.doctor())
+
+    def test_missing_or_wrong_local_secret(self):
+        self.installed()
+        d = json.loads(self.settings_path.read_text())
+        d["env"]["ANTHROPIC_CUSTOM_HEADERS"] = f"{A.LOCAL_HEADER}: wrong"
+        self.settings_path.write_text(json.dumps(d))
+        self.assertEqual(self.doctor()["proxy-secret"]["severity"], "Error")
+        d["env"].pop("ANTHROPIC_CUSTOM_HEADERS")
+        self.settings_path.write_text(json.dumps(d))
+        self.assertIn("no x-aigw-local", self.doctor()["proxy-secret"]["message"])
+
+    def test_managed_custom_headers_hide_the_secret(self):
+        self.installed()
+        self.managed.mkdir(parents=True, exist_ok=True)
+        (self.managed / "managed-settings.json").write_text(json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}}))
+        ids = self.doctor()
+        self.assertEqual(ids["managed-custom-headers"]["severity"], "Error")
+        self.assertIn(A.LOCAL_HEADER, ids["managed-custom-headers"]["message"])
+
+    def test_gateway_url_missing(self):
+        self.write_config(mode="proxy", gateway_url="", proxy_listen=f"127.0.0.1:{self.port_wanted}")
+        self.assertEqual(self.doctor()["proxy-gateway-url"]["severity"], "Error")
+
+
+class ProxyHookTests(ProxyDoctorTests):
+    """The hooks in proxy mode (the settings come from install, so the doctor gate is clean)."""
+
+    def setUp(self):
+        super().setUp()
+        self.installed()
+        env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.settings_path.parent)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_precheck_is_silent_when_the_proxy_has_a_jwt(self):
+        self.renew()
+        t0 = time.time()
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        self.assertEqual((code, out), (0, ""))
+        self.assertLess(time.time() - t0, 2, "no settings reload to wait for")
+
+    def test_precheck_makes_the_proxy_renew(self):
+        self.ps.holder.forget()
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        self.assertEqual((code, out), (0, ""))
+        self.assertTrue(self.ps.holder.usable())
+        self.assertFalse(self.header(), "nothing is written to the settings")
+
+    def test_precheck_blocks_when_the_proxy_is_down(self):
+        self.ps.stop()
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        d = json.loads(out)
+        self.assertEqual(d["decision"], "block")
+        self.assertIn("proxy", d["reason"])
+
+    def test_precheck_blocks_with_the_sign_in_when_signed_out(self):
+        self.state_dir.joinpath("state.json").write_text("{}")
+        self.ps.holder.forget()
+        self.idp.device_pending = 10**6
+        code, out, err = self.run_cli("hook", "precheck", stdin="{}")
+        self.assertTrue(out, err)
+        d = json.loads(out)
+        self.assertEqual(d["decision"], "block")
+        self.assertIn("ABCD-EFGH", d["reason"])
+        pending = json.loads(self.state_dir.joinpath("hook-login.json").read_text())
+        self.addCleanup(lambda: os.kill(pending["pid"], 15))
+
+    def test_stop_failure_forces_a_renewal_in_the_proxy(self):
+        old = self.renew()
+        payload = json.dumps({"last_assistant_message": "API Error: 498 AI gateway token expired"})
+        code, _, err = self.run_cli("hook", "stop-failure", stdin=payload)
+        self.assertEqual(code, 0)
+        self.assertNotEqual(self.ps.holder.token, old)
+        self.assertFalse(self.header())
+
+
+class ProxyDaemonTests(Base):
+    def test_the_daemon_serves_renews_and_stops_on_signal(self):
+        gw = FakeGateway()
+        self.addCleanup(gw.close)
+        self.sign_in()
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_config(mode="proxy", gateway_url=gw.url, proxy_listen=f"127.0.0.1:{free_port()}")
+        self.assertEqual(self.run_cli("install")[0], 0)       # the settings the doctor gate wants: base URL and local secret
+        installed = self.settings_path.read_text()
+        seen = {}
+
+        def client():
+            import http.client
+            end = time.time() + 15
+            while time.time() < end:
+                try:
+                    info = json.loads(self.state_dir.joinpath("proxy.json").read_text())
+                    secret = A.proxy_secret(A.State(self.state_dir))
+                    if not secret:
+                        raise OSError
+                    c = http.client.HTTPConnection("127.0.0.1", info["port"], timeout=5)
+                    c.request("POST", "/v1/messages", body=b"{}", headers={A.LOCAL_HEADER: secret})
+                    r = c.getresponse()
+                    seen["status"], seen["pid"] = r.status, info["pid"]
+                    r.read()
+                    c.close()
+                    if r.status == 200:
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.2)
+            __import__("signal").raise_signal(__import__("signal").SIGTERM)
+
+        threading.Thread(target=client, daemon=True).start()
+        code, _, err = self.run_cli("daemon", "--max-sleep", "5")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen.get("status"), 200, err)
+        self.assertEqual(seen["pid"], os.getpid())
+        self.assertIn("proxy listening", err)
+        self.assertIn("proxy stopped", err)
+        self.assertFalse(self.state_dir.joinpath("proxy.json").exists(), "the endpoint file is removed on exit")
+        self.assertEqual(self.settings_path.read_text(), installed, "the daemon never writes the settings in proxy mode")
+
+    def test_a_second_instance_exits_quietly(self):
+        gw = FakeGateway()
+        self.addCleanup(gw.close)
+        port = free_port()
+        self.write_config(mode="proxy", gateway_url=gw.url, proxy_listen=f"127.0.0.1:{port}")
+        cfg = A.load_config(self.config_path)
+        first = A.ProxyServer(cfg, A.State(self.state_dir), A.Settings(self.settings_path, cfg["header"]))
+        first.start()
+        self.addCleanup(first.stop)
+        code, _, err = self.run_cli("daemon", "--max-sleep", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("already running", err)
+
+    def test_a_blocked_proxy_looks_again_and_a_fix_clears_it(self):
+        gw = FakeGateway()
+        self.addCleanup(gw.close)
+        self.sign_in()
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_config(mode="proxy", gateway_url=gw.url, proxy_listen="127.0.0.1:0")
+        cfg = A.load_config(self.config_path)
+        cfg["_config_path"] = str(self.config_path)
+        ps = A.ProxyServer(cfg, A.State(self.state_dir), A.Settings(self.settings_path, cfg["header"]))
+        ps.start()
+        self.addCleanup(ps.stop)
+        ps.blocked = {"id": "x", "message": "boom", "fix": "f", "severity": "Error"}
+        ps.blocked_checked = 0                                # due for a re-check: the doctor has no Error now
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", ps.port, timeout=10)
+        with mock.patch.object(A, "preflight_errors", return_value=[]):
+            c.request("POST", "/v1/messages", body=b"{}", headers={A.LOCAL_HEADER: ps.secret})
+            self.assertEqual(c.getresponse().status, 200)
+        self.assertIsNone(ps.blocked)
 
 
 if __name__ == "__main__":

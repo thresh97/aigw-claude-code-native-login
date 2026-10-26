@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Prototype of the v2 "Mode 2" local injecting proxy (docs/design-v2.md), for spike S11. Not the final client code.
+"""SUPERSEDED by the client's real proxy (client/aigw_claude_auth.py: `mode: proxy`, ProxyServer; the `proxy` and
+`stored_login_proxy` scenarios run that one now). Kept as the record of spike S11; nothing in the repo runs it any more.
+
+Prototype of the v2 "Mode 2" local injecting proxy (docs/design-v2.md), for spike S11. Not the final client code.
 
 Claude Code points ANTHROPIC_BASE_URL at this proxy. For each request it:
   - removes any client-supplied gateway header, and adds its own from the token file (re-read on every request);

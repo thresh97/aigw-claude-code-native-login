@@ -3,5 +3,8 @@
   "client_id": "<public client app id>",
   "scope": "openid offline_access api://<broker api app>/access_as_user",
   "idp_token": "access_token",
-  "broker_url": "https://<broker>/token/exchange"
+  "broker_url": "https://<broker>/token/exchange",
+  "mode": "file",
+  "proxy_listen": "127.0.0.1:18787",
+  "gateway_url": ""
 }
