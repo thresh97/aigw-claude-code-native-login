@@ -131,6 +131,8 @@ systemctl --user daemon-reload && systemctl --user enable --now aigw-claude-auth
 claude        # then /login
 ```
 
+**Fleet packages.** For many machines, build packages from one fleet file with `packaging/build.py` (macOS `.pkg`, Linux `.deb`/`.rpm`, a Windows PowerShell installer; see [packaging/README.md](packaging/README.md)). They install the client, a managed-settings drop-in (`managed-settings.d/50-aigw-claude-auth.json`: base URL, hooks, `allowedProviders`, `AIGW_*` env, never `ANTHROPIC_CUSTOM_HEADERS`) and a login-time background entry for all users. At each login that entry runs `install --no-hooks` for the user (the JWT line in file mode, the user's own proxy secret in proxy mode) and then the daemon; the user only signs in once. Unsigned and offline-tested so far: no real install, no pilot yet.
+
 On native Windows (Windows PowerShell; Python 3.8+ from python.org as `py -3`), the same steps with Windows paths. The
 config folder is `%APPDATA%\aigw-claude-auth`, and the background refresher is a Task Scheduler task:
 
