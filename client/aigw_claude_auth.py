@@ -60,7 +60,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -1343,6 +1343,10 @@ def inspect_token(token, cfg, show_claims=False, now=None):
         for k in ("config_slug", "config_id"):
             if k in d:
                 rows.append((f"defaults.{k}", str(d[k])))
+    flat = sorted(k for k in claims if k.startswith("defaults."))
+    if flat:   # Okta claim expressions can't nest: a claim named "defaults.config_slug" stays a flat key (finding 21)
+        problems.append(f"{', '.join(flat)}: a flat claim name with a dot, not a nested defaults object; the gateway "
+                        "reads only defaults.<key> inside a defaults object (Okta: use a token inline hook or a broker)")
     # the rest
     shown = {"iss", "aud", "iat", "nbf", "exp", "portkey_oid", "portkey_workspace", "defaults"}
     for k in PERSONAL_CLAIMS:

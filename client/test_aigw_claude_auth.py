@@ -1887,6 +1887,15 @@ class InspectTests(Base):
             self.assertIn(want, out)
         self.assertIn(A.fingerprint(tok), out)
 
+    def test_flat_dotted_defaults_claim_is_a_problem(self):
+        # Okta emits a claim named "defaults.config_slug" as a flat key (finding 21)
+        tok = self.gw(portkey_oid="oid-1", portkey_workspace="ws-1", **{"defaults.config_slug": "pc-main"},
+                      iss="https://broker.example", iat=int(time.time()))
+        code, out, err = self.inspect(tok)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("PROBLEM", out)
+        self.assertIn("not a nested defaults object", out)
+
     def test_never_prints_the_token_or_signature(self):
         tok = self.gw(sub="alice-sub")
         _, out, err = self.inspect(tok)
