@@ -53,6 +53,8 @@ def purge_user(client, base):
     if settings.path.exists():
         settings.apply(drop_lines=[cfg["header"], client.LOCAL_HEADER], drop_base_url=lambda u: client.is_proxy_url(cfg, u))
     shutil.rmtree(str(client.config_dir()), ignore_errors=True)
+    if client.is_windows():     # the Task Scheduler daemon's log folder (a running daemon may still hold its log open)
+        shutil.rmtree(str(client.log_dir().parent), ignore_errors=True)
     log(f"removed our header lines from {settings.path} and the directory {client.config_dir()}")
     return 0
 
