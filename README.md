@@ -84,7 +84,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 ### 1.1 Gateway
 
 1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get: bound to the credential (the JWT's `defaults.config_slug` on a hybrid gateway or `defaults.config_id` on SaaS, or the API key), or as the workspace default (see What you need).
-2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens.
+2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens. The JWKS URL setting is per org and takes a comma-separated list, so one gateway can trust a broker and an IdP at once (the operator's statement; not yet run here).
 
 ### 1.2 Optional: answer token problems at the load balancer
 

@@ -484,7 +484,7 @@ The tested fleet recipe from v1.1.1 is: hooks and `ANTHROPIC_BASE_URL` in Claude
 **Gateway side (once)**
 
 1. Create the passthrough config: it forwards the caller's `authorization` and `anthropic-beta` to Anthropic; its `api_key` is a placeholder. Bind it to the credential (JWT `defaults.config_slug` on hybrid, `config_id` on SaaS) or make it the workspace default.
-2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker.
+2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker. The JWKS URL is per org (one org per tenant service group) and takes a comma-separated list, so a broker and an IdP can be trusted side by side (operator's statement; not yet run).
 3. Optional, hybrid only: the LB guard. On an L7 load balancer, answer the sentinel with 498 "expired", forward any other header value, answer a missing header on OAuth requests (`anthropic-beta` contains `oauth-2025-04-20`) with 498 "missing", forward the rest.
 
 **Client side**
