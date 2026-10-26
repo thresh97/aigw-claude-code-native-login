@@ -13,6 +13,7 @@ or touched. The client (client/aigw_claude_auth.py) runs as the hooks, exactly a
 fake IdP and token broker (from the client's tests).
 """
 import argparse
+import base64
 import hashlib
 import http.client
 import json
@@ -33,7 +34,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-sys.path[:0] = [str(HERE), str(ROOT / "client")]
+sys.path[:0] = [str(HERE), str(ROOT / "client"), str(HERE / "keycloak")]
 import mock_gateway  # noqa: E402
 import proxy_prototype  # noqa: E402
 from test_aigw_claude_auth import FakeIdP, jwt  # noqa: E402
@@ -1220,6 +1221,253 @@ def scenario_managed(out):
     finally:
         if managed:
             managed.close()
+
+
+# --------------------------------------------------------------------------------------------- keycloak
+
+KC_WORKSPACE = "00000000-0000-4000-8000-00000000aaaa"       # the hardcoded claim values in keycloak/realm-aigw-test.json
+KC_CONFIG_ID = "00000000-0000-4000-8000-00000000bbbb"
+KC_CONFIG_SLUG = "aigw-passthrough-test"
+
+
+class KcClient:
+    """The client's config and state in a throwaway dir, pointed at the local Keycloak (no fake IdP, no broker)."""
+
+    def __init__(self, base, name, kcs, client_id, **cfg):
+        self.dir = base / name
+        self.dir.mkdir(parents=True)
+        self.kcs = kcs
+        self.settings = self.dir / "settings.json"
+        self.cfg = {"issuer": kcs.issuer, "client_id": client_id, "scope": "openid offline_access", "notify": "off", "hook_wait": 3,
+                    "secret_store": "file", **cfg}       # file: never the real login Keychain
+        self.configure()
+
+    def configure(self, **kw):
+        self.cfg.update(kw)
+        (self.dir / "config.json").write_text(json.dumps(self.cfg), encoding="utf-8")
+
+    def env(self):
+        return dict(os.environ, AIGW_CLAUDE_AUTH_DIR=str(self.dir), AIGW_CLAUDE_SETTINGS=str(self.settings))
+
+    def run(self, *args):
+        return subprocess.run([sys.executable, str(CLIENT), *args], env=self.env(), capture_output=True, encoding="utf-8", errors="replace", timeout=90)
+
+    def login(self, method="device"):
+        """`login` with the user's side done by kc.Keycloak.browse. Returns exit code, whether the sign-in prompt named a
+        Keycloak URL, the final page's text and the client's stderr (which carries the prompt and never a token)."""
+        flags = ["--device"] if method == "device" else ["--pkce", "--no-browser"]
+        p = subprocess.Popen([sys.executable, str(CLIENT), "login", *flags], env=self.env(), stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+        watchdog = threading.Timer(120, p.kill)
+        watchdog.start()
+        page = ""
+        try:
+            first = ""
+            for _ in range(6):                               # the prompt may follow a status line ("signing in with device ...")
+                line = p.stderr.readline()
+                first += line
+                m = re.search(r"(https?://\S+)", line)
+                if m or not line:
+                    break
+            if m and m.group(1).startswith(self.kcs.base):
+                try:
+                    page = self.kcs.browse(m.group(1))
+                except Exception as e:                       # noqa: BLE001
+                    page = f"browse failed: {type(e).__name__}"
+            rest = p.stderr.read()
+            rc = p.wait()
+        finally:
+            watchdog.cancel()
+            if p.poll() is None:
+                p.kill()
+        return {"rc": rc, "prompt": bool(m and m.group(1).startswith(self.kcs.base)), "page": page, "err": mask_tokens(first + rest)}
+
+    def state(self):
+        try:
+            return json.loads((self.dir / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def refresh_token(self):
+        return self.state().get("refresh_token") or ""
+
+    def token(self, force=False):
+        p = self.run("token", *(["--force"] if force else []))
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def mask_tokens(text):
+    return re.sub(r"[A-Za-z0-9+/_=.-]{40,}", "<masked>", text)
+
+
+def yn(cond):
+    return "yes" if cond else "no"
+
+
+def claims_of(token):
+    seg = token.split(".")[1] if token.count(".") >= 2 else ""
+    try:
+        return json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+    except ValueError:
+        return {}
+
+
+def scenario_keycloak(out):
+    """The client against a local Keycloak (Docker, dev mode, realm aigw-test): device and PKCE sign-in with the user's
+    side done over HTTP, Mode A claims straight from the IdP (protocol mappers, no broker), refresh and offline_access
+    behavior, Claude Code sending the IdP's JWT to the mock gateway, and Mode B (the plain IdP token)."""
+    import kc as kcmod
+    kcs = kcmod.Keycloak(os.environ)
+    gw = claude = tmp = None
+    try:
+        kcs.start()
+        observe("keycloak_version", kcs.version())
+        tmp = Path(tempfile.mkdtemp(prefix="aigw-kc-"))
+        te = f"{kcs.issuer}/protocol/openid-connect/token"
+
+        def raw_refresh(client_id, refresh_token):
+            return kcmod.call("POST", te, form={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token})[0]
+
+        # ---- Mode A, device code flow, offline_access
+        a = KcClient(tmp, "a", kcs, "aigw-cli")
+        r = a.login("device")
+        observe("device_prompt", yn(r["prompt"]))
+        observe("device_login_exit", r["rc"])
+        observe("device_page_confirms", yn(r["rc"] == 0 and "success" in r["page"].lower()))
+        rt1 = a.refresh_token()
+        observe("login_stores_refresh_token", yn(bool(rt1)))
+        observe("state_file_mode", oct(os.stat(a.dir / "state.json").st_mode & 0o777) if sys.platform != "win32" else "600")
+        tok = a.token()
+        c = claims_of(tok)
+        observe("token_is_jwt", yn(bool(c)))
+        observe("claim_iss_is_issuer", yn(c.get("iss") == kcs.issuer))
+        observe("claim_aud_has_gateway", yn("aigw-gateway" in (c.get("aud") if isinstance(c.get("aud"), list) else [c.get("aud")])))
+        observe("claim_defaults_keys", ",".join(sorted(c.get("defaults") or {})))
+        observe("claim_defaults_nested_object", yn(isinstance(c.get("defaults"), dict) and "defaults.config_slug" not in c))
+        observe("claim_config_slug", yn((c.get("defaults") or {}).get("config_slug") == KC_CONFIG_SLUG))
+        observe("claim_config_id", yn((c.get("defaults") or {}).get("config_id") == KC_CONFIG_ID))
+        observe("claim_portkey_workspace", yn(c.get("portkey_workspace") == KC_WORKSPACE))
+        observe("claim_portkey_oid_is_user_id", yn(c.get("portkey_oid") == kcs.user_id and c.get("sub") == kcs.user_id))
+        observe("claim_kind", c.get("kind", "missing"))
+        observe("token_lifetime_s", (c.get("exp", 0) - c.get("iat", 0)))
+        observe("token_second_call_cached", yn(a.token() == tok))
+        observe("refresh_token_typ", claims_of(rt1).get("typ", "unknown"))
+        observe("settings_holds_token", yn(header_of(json.loads(a.settings.read_text(encoding="utf-8"))) == tok) if a.settings.exists() else "no-settings")
+
+        ins = a.run("inspect")
+        observe("inspect_exit", ins.returncode)
+        observe("inspect_problem_lines", sum(1 for line in ins.stdout.splitlines() if line.startswith("PROBLEM")))
+        observe("inspect_shows_workspace", yn(KC_WORKSPACE in ins.stdout))
+        observe("inspect_leaks_token", yn(tok in ins.stdout or tok in ins.stderr))
+
+        # ---- refresh: Keycloak's default (old refresh tokens stay valid), then with "Revoke Refresh Token" on
+        tok2 = a.token(force=True)
+        rt2 = a.refresh_token()
+        observe("refresh_gives_new_jwt", yn(bool(tok2) and tok2 != tok))
+        observe("refresh_token_replaced_by_client", yn(bool(rt2) and rt2 != rt1))
+        observe("old_refresh_token_still_valid_default", yn(raw_refresh("aigw-cli", rt1) == 200))
+        observe("realm_revoke_set", kcs.set_realm(revokeRefreshToken=True))
+        tok3 = a.token(force=True)
+        rt3 = a.refresh_token()
+        observe("revoke_on_client_refresh_ok", yn(bool(tok3)))
+        observe("revoke_on_client_stores_new_token", yn(bool(rt3) and rt3 != rt2))
+        # presenting an already-used refresh token is treated as theft: it is refused and the whole chain is revoked
+        observe("revoke_on_old_token_rejected", raw_refresh("aigw-cli", rt2))
+        observe("revoke_on_reuse_kills_current_token", yn(not a.token(force=True)))
+        kcs.set_realm(revokeRefreshToken=False)
+        observe("relogin_after_reuse_exit", a.login("device")["rc"])
+
+        # ---- Claude Code sends that JWT to the mock gateway (Mode A from the IdP, broker_url empty)
+        gw = Gateway(out)
+        claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH})
+        ca = KcClient(claude.tmp, "aigw-claude-auth", kcs, "aigw-cli")
+        claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(ca.dir)
+        observe("modea_broker_url_empty", yn(ca.cfg.get("broker_url", "") == ""))
+        ca.settings = claude.settings_file
+        observe("modea_login_exit", ca.login("device")["rc"])
+        r = ca.run("install", "--base-url", gw.url)
+        observe("modea_install_exit", r.returncode)
+        jwt_a = header_of(claude.settings())
+        observe("modea_settings_has_jwt", yn(claims_of(jwt_a).get("iss") == kcs.issuer))
+        claude.start()
+        mark = gw.mark()
+        t = claude.turn("hello")
+        reqs = gw.messages(mark)
+        observe("modea_turn", classify(t["text"]))
+        observe("modea_gateway_got_idp_jwt", yn(bool(reqs) and reqs[0]["headers"].get(PK) == mock_gateway.fingerprint(jwt_a)))
+        observe("modea_authorization_oauth", yn(bool(reqs) and reqs[0]["headers"].get("authorization") == mock_gateway.fingerprint(f"Bearer {OAUTH}")))
+        claude.stop()
+
+        # ---- Mode B: a client without the custom mappers; the plain IdP token reaches a gateway that trusts the IdP
+        gw.set(kind=None)
+        claude.proc = None
+        claude.lines = queue.Queue()
+        cb = KcClient(claude.tmp, "aigw-claude-auth-b", kcs, "aigw-plain")
+        claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(cb.dir)
+        cb.settings = claude.settings_file
+        observe("modeb_login_exit", cb.login("device")["rc"])
+        observe("modeb_install_exit", cb.run("install", "--base-url", gw.url).returncode)
+        jwt_b = header_of(claude.settings())
+        cbc = claims_of(jwt_b)
+        observe("modeb_jwt_differs_from_modea", yn(bool(jwt_b) and jwt_b != jwt_a))
+        observe("modeb_claim_iss_is_issuer", yn(cbc.get("iss") == kcs.issuer))
+        observe("modeb_no_portkey_claims", yn(not any(k in cbc for k in ("portkey_oid", "portkey_workspace", "defaults", "kind"))))
+        observe("modeb_has_sub_and_azp", yn(bool(cbc.get("sub")) and cbc.get("azp") == "aigw-plain"))
+        claude.start()
+        mark = gw.mark()
+        t = claude.turn("hello again")
+        reqs = gw.messages(mark)
+        observe("modeb_turn", classify(t["text"]))
+        observe("modeb_gateway_got_idp_jwt", yn(bool(reqs) and reqs[0]["headers"].get(PK) == mock_gateway.fingerprint(jwt_b)))
+        claude.stop()
+        gw.set(kind="gateway")
+        claude.proc = None
+        claude.lines = queue.Queue()
+
+        # ---- the browser flow (PKCE S256, loopback redirect on any port), and a client that has PKCE enforced
+        p = KcClient(tmp, "pkce", kcs, "aigw-cli")
+        r = p.login("pkce")
+        observe("pkce_login_exit", r["rc"])
+        observe("pkce_loopback_port_accepted", yn(r["rc"] == 0))
+        observe("pkce_stores_refresh_token", yn(bool(p.refresh_token())))
+        e = KcClient(tmp, "pkce-required-device", kcs, "aigw-pkce-required")
+        r = e.login("device")
+        observe("pkce_enforced_device_login_exit", r["rc"])
+        observe("pkce_enforced_device_error", "code_challenge_method" if "code_challenge_method" in r["err"] else "other")
+        e2 = KcClient(tmp, "pkce-required-pkce", kcs, "aigw-pkce-required")
+        observe("pkce_enforced_pkce_login_exit", e2.login("pkce")["rc"])
+
+        # ---- offline_access: the offline refresh token survives an SSO logout; a normal one does not
+        n = KcClient(tmp, "normal", kcs, "aigw-cli", scope="openid")
+        r = n.login("device")
+        observe("normal_login_exit", r["rc"])
+        rtn = n.refresh_token()
+        observe("normal_refresh_token_typ", claims_of(rtn).get("typ", "unknown"))
+        observe("normal_refresh_before_logout", yn(bool(n.token(force=True))))
+        before = kcs.sessions()
+        observe("sessions_before_logout", f"sso{'+' if before[0] > 0 else '0'},offline{'+' if before[1] > 0 else '0'}")
+        observe("sso_sessions_deleted", kcs.end_sso_sessions())
+        after = kcs.sessions()
+        observe("sessions_after_sso_end", f"sso{'+' if after[0] > 0 else '0'},offline{'+' if after[1] > 0 else '0'}")
+        r = n.run("sync", "--force")
+        observe("normal_refresh_after_sso_end_exit", r.returncode)
+        observe("normal_refresh_after_sso_end_message", "sign-in-expired" if "sign-in expired" in r.stderr else mask_tokens(r.stderr.strip())[:80])
+        r = a.run("sync", "--force")
+        observe("offline_refresh_after_sso_end_exit", r.returncode)
+        observe("offline_jwt_after_sso_end", yn(bool(a.token())))
+        # the admin API's "logout user" also sets the user's not-before: that revokes offline tokens too
+        time.sleep(3)                                  # not-before is whole seconds: tokens from this second would still pass
+        observe("admin_logout_status", kcs.logout_user())
+        r = a.run("sync", "--force")
+        observe("offline_refresh_after_admin_logout_exit", r.returncode)
+        observe("offline_refresh_after_admin_logout_message", "sign-in-expired" if "sign-in expired" in r.stderr else mask_tokens(r.stderr.strip())[:80])
+    finally:
+        if claude:
+            claude.cleanup()
+        if gw:
+            gw.close()
+        kcs.stop()
+        if tmp:
+            rmtree(tmp)
 
 
 SCENARIOS ={name[len("scenario_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("scenario_")}

@@ -1,0 +1,14 @@
+# For trying the realm by hand; the keycloak scenario starts its own container (kc.py) and does not use this file.
+#   KEYCLOAK_ADMIN_PASSWORD=<pick one> docker compose up      then http://127.0.0.1:8080/realms/aigw-test
+# Create a test user in the admin console (realm aigw-test) with email, first and last name. Throwaway only:
+# dev mode, plain http, bound to 127.0.0.1.
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: start-dev --import-realm
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      - ./realm-aigw-test.json:/opt/keycloak/data/import/realm-aigw-test.json:ro

@@ -88,7 +88,8 @@ def decide(headers, ctl):
     claims = jwt_payload(key)
     if claims is None:
         return portkey_401("JWT verification failed: malformed token")
-    if claims.get("kind") != "gateway" or fingerprint(key) in ctl.get("revoked", []):
+    want_kind = ctl.get("kind", "gateway")      # "kind": null in the control file accepts any JWT (Mode B: a plain IdP token)
+    if (want_kind is not None and claims.get("kind") != want_kind) or fingerprint(key) in ctl.get("revoked", []):
         return portkey_401("JWT verification failed: signature verification failed")
     if claims.get("exp", 0) <= time.time():
         return portkey_401("JWT verification failed: token expired")

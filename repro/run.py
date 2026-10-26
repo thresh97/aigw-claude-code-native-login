@@ -56,6 +56,8 @@ DESCRIBE = {
         'live_login: a stored `claude login` through the real gateway (via a local logging relay): a valid JWT works; a refused JWT costs the OAuth refresh loop (about 4 min); with LB_GUARD=on the sentinel and a missing header fail at once. Changes: rotates the stored login, swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 4 min.',
     'client_live':
         'client_live: the client end to end: JWT from your IdP (and broker), accepted by the gateway, installed into a stored-login Claude Code; the precheck hook replaces an expired JWT before the turn. Needs a prior `aigw_claude_auth.py login`. Changes: swaps LOGIN_CONFIG_DIR/settings.json for the run (--yes). About 1 min.',
+    'keycloak':
+        "keycloak: the client against a local Keycloak 26 in Docker (127.0.0.1 only, realm aigw-test, dummy user with a password made up for the run): device code and PKCE sign-in with the user's side done over HTTP, Mode A claims straight from the IdP (protocol mappers, nested defaults, no broker), refresh and Revoke Refresh Token behavior, offline_access vs SSO session end, Claude Code sending the IdP's JWT to the mock gateway, and Mode B (the plain IdP token). Needs Docker (or KEYCLOAK_URL and KEYCLOAK_ADMIN_PASSWORD for a Keycloak already running); SKIP (docker) without. Changes: starts and removes one container. About 4 min.",
     'managed':
         "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper; spike S4 (an unknown top-level key, AIGW_* in managed env, managed-settings.d/ drop-ins); doctor findings (what `doctor --json` reports per case, and that the precheck blocks on an Error). Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Drop-in cases also write files in managed-settings.d/ (and remove them, and the directory if it created it). Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 12 min.",
 }
@@ -416,9 +418,87 @@ dropinhooks_turn1 ok
 dropinhooks_turn1_jwt renewed
 '''
 
+EXPECT_KEYCLOAK_0 = r'''
+# the pinned Keycloak image (repro/keycloak/kc.py IMAGE)
+keycloak_version 26.4.7
+# Mode A from the IdP (no broker): device code sign-in, the user's side done over HTTP; token claims from the protocol mappers
+device_prompt yes
+device_login_exit 0
+device_page_confirms yes
+login_stores_refresh_token yes
+state_file_mode 0o600
+token_is_jwt yes
+claim_iss_is_issuer yes
+claim_aud_has_gateway yes
+claim_defaults_keys config_id,config_slug
+claim_defaults_nested_object yes
+claim_config_slug yes
+claim_config_id yes
+claim_portkey_workspace yes
+claim_portkey_oid_is_user_id yes
+claim_kind gateway
+token_lifetime_s 900
+token_second_call_cached yes
+refresh_token_typ Offline
+settings_holds_token yes
+# `inspect` decodes the stored JWT, redacted, and finds no problem
+inspect_exit 0
+inspect_problem_lines 0
+inspect_shows_workspace yes
+inspect_leaks_token no
+# refresh: Keycloak's default keeps old refresh tokens valid; with Revoke Refresh Token on, a reused one is refused and revokes the chain
+refresh_gives_new_jwt yes
+refresh_token_replaced_by_client yes
+old_refresh_token_still_valid_default yes
+realm_revoke_set 204
+revoke_on_client_refresh_ok yes
+revoke_on_client_stores_new_token yes
+revoke_on_old_token_rejected 400
+revoke_on_reuse_kills_current_token yes
+relogin_after_reuse_exit 0
+# Claude Code sends the IdP's JWT to the mock gateway (Mode A, broker_url empty)
+modea_broker_url_empty yes
+modea_login_exit 0
+modea_install_exit 0
+modea_settings_has_jwt yes
+modea_turn ok
+modea_gateway_got_idp_jwt yes
+modea_authorization_oauth yes
+modeb_login_exit 0
+modeb_install_exit 0
+# Mode B: a client without the custom mappers; the plain IdP token (no portkey claims) reaches a gateway that accepts it
+modeb_jwt_differs_from_modea yes
+modeb_claim_iss_is_issuer yes
+modeb_no_portkey_claims yes
+modeb_has_sub_and_azp yes
+modeb_turn ok
+modeb_gateway_got_idp_jwt yes
+# browser flow: PKCE S256 with a loopback redirect on any port; a client with PKCE enforced refuses the device flow (the client sends no code_challenge there)
+pkce_login_exit 0
+pkce_loopback_port_accepted yes
+pkce_stores_refresh_token yes
+pkce_enforced_device_login_exit 1
+pkce_enforced_device_error code_challenge_method
+pkce_enforced_pkce_login_exit 0
+# offline_access: ending the SSO session kills a normal refresh token, not the offline one; the admin 'logout user' call also revokes offline tokens
+normal_login_exit 0
+normal_refresh_token_typ Refresh
+normal_refresh_before_logout yes
+sessions_before_logout sso+,offline+
+sso_sessions_deleted 1
+sessions_after_sso_end sso0,offline+
+normal_refresh_after_sso_end_exit 1
+normal_refresh_after_sso_end_message sign-in-expired
+offline_refresh_after_sso_end_exit 0
+offline_jwt_after_sso_end yes
+admin_logout_status 204
+offline_refresh_after_admin_logout_exit 1
+offline_refresh_after_admin_logout_message sign-in-expired
+'''
+
 
 SCENARIOS = ["unit", "headers", "errors", "precheck", "stopfailure", "proxy", "stored_login", "stored_login_proxy",
-             "gateway", "live_login", "client_live", "managed"]
+             "gateway", "live_login", "client_live", "managed", "keycloak"]
 EXPORTED = ("CLAUDE_BIN", "MODEL", "LOGIN_CONFIG_DIR", "GATEWAY_URL", "TOKEN_COMMAND", "LB_GUARD", "SENTINEL")
 
 
@@ -474,6 +554,14 @@ def fp(path):
 def default_token_command():
     argv = [sys.executable, str(CLIENT), "token"]
     return subprocess.list2cmdline(argv) if IS_WIN else " ".join(shlex.quote(a) for a in argv)
+
+
+def docker_missing():
+    """None if `docker info` works, else why not."""
+    if not shutil.which("docker"):
+        return "not found"
+    p = run_text(["docker", "info"], timeout=30)
+    return None if p and p.returncode == 0 else "daemon not running"
 
 
 def run_text(argv, **kw):
@@ -622,6 +710,8 @@ class Runner:
                 print(f"gateway JWT: TOKEN_COMMAND failed (sign in first: {sys.executable} {CLIENT} login)")
         else:
             print("gateway: GATEWAY_URL not set (gateway, live_login, client_live will refuse to run)")
+        why = docker_missing()
+        print("docker: ok (the keycloak scenario can run)" if not why else f"docker: {why} (the keycloak scenario will SKIP unless KEYCLOAK_URL is set)")
         print("check: ok")
 
     def harness(self, scenario):
@@ -755,6 +845,19 @@ class Runner:
             imm = dict(immutable_exit="missing", immutable_wrote="missing", immutable_turn="missing", immutable_doctor="missing")
             self.expect("immutable_skipped", "macos-only", self.seen.get("immutable_skipped") or "missing")
         self.expect_seen(EXPECT_MANAGED_0, subst=imm)
+        self.finish()
+
+    def scenario_keycloak(self):
+        # Needs Docker, or an already running Keycloak (KEYCLOAK_URL, KEYCLOAK_ADMIN_PASSWORD); otherwise SKIP, as on Windows for managed.
+        self.start("keycloak")
+        why = None if os.environ.get("KEYCLOAK_URL") else docker_missing()
+        if why:
+            print(f"SKIP keycloak: docker is {why} (install/start Docker, or set KEYCLOAK_URL and KEYCLOAK_ADMIN_PASSWORD)")
+            self.append("summary.txt", f"keycloak: docker {why}")
+            self.finish("SKIP (docker)")
+            return
+        self.harness("keycloak")
+        self.expect_seen(EXPECT_KEYCLOAK_0)
         self.finish()
 
 
