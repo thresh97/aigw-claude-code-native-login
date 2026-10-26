@@ -1179,24 +1179,28 @@ def finding(check_id, severity, message, fix):
 
 
 def our_hooks(data, event, sub):
-    """(command text, timeout) of our hook entries for `event` in a settings dict."""
+    """(argv words, timeout) of our hook entries for `event` in a settings dict. Exec form (args) keeps its words;
+    a command string is split the way the platform's shell would (roughly)."""
     out = []
     for entry in (data.get("hooks") or {}).get(event) or []:
         for h in (entry.get("hooks") or []) if isinstance(entry, dict) else []:
             if not isinstance(h, dict):
                 continue
-            text = " ".join([str(h.get("command", ""))] + [str(x) for x in h.get("args") or []])
+            if h.get("args"):
+                words = [str(h.get("command", ""))] + [str(x) for x in h["args"]]
+            else:
+                try:
+                    words = split_command(str(h.get("command", "")), windows=is_windows())
+                except ValueError:
+                    words = str(h.get("command", "")).split()
+            text = " ".join(words)
             if MARKER.search(text) and re.search(rf"\bhook\s+{sub}\b", text):
-                out.append((text, h.get("timeout")))
+                out.append((words, h.get("timeout")))
     return out
 
 
-def hook_target(text):
-    """The aigw-claude-auth program a hook command line runs: (token, exists) or ("", False)."""
-    try:
-        words = shlex.split(text)
-    except ValueError:
-        words = text.split()
+def hook_target(words):
+    """The aigw-claude-auth program a hook runs: (path or name, exists) or ("", False)."""
     for w in words:
         if MARKER.search(Path(w).name):
             return w, bool(os.path.exists(w) or shutil.which(w))
@@ -1268,11 +1272,11 @@ def chk_hooks(ctx):
                 out.append(finding("hook-missing", "Warning", f"no {ev} hook runs `hook {sub}`",
                                    "aigw-claude-auth install (or ship the entry in managed settings)"))
             continue
-        for text, timeout in mine:
+        for words, timeout in mine:
             if timeout is None:
                 out.append(finding("hook-no-timeout", "Warning", f"the {ev} hook has no timeout; Claude Code's 30 s default may cut a slow precheck and send the prompt",
                                    f"add \"timeout\": {HOOK_TIMEOUT} (finding 8)"))
-            target, exists = hook_target(text)
+            target, exists = hook_target(words)
             if not target:
                 continue
             if not exists:
