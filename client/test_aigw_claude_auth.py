@@ -1423,6 +1423,34 @@ class StoreDriverTests(unittest.TestCase):
         s.delete()
         self.assertEqual(s.get(), "")
 
+    def test_windows_credential_splits_long_values(self):
+        class Api:                                   # enforces Credential Manager's per-credential blob limit
+            def __init__(self):
+                self.d = {}
+
+            def write(self, target, user, blob):
+                if len(blob) > 2560:
+                    raise A.SecretStoreError("CredWriteW error 1783")
+                self.d[target] = blob
+
+            def read(self, target):
+                return self.d.get(target)
+
+            def delete(self, target):
+                self.d.pop(target, None)
+        api = Api()
+        s = A.WinCredential("acct", service="svc", api=api)
+        long = "rt-" + "x" * 6000 + "é"
+        s.set(long)
+        self.assertEqual(s.get(), long)
+        self.assertEqual(sorted(api.d), ["svc/acct", "svc/acct#1", "svc/acct#2"])
+        s.set("short")                              # stale parts go away
+        self.assertEqual(s.get(), "short")
+        self.assertEqual(list(api.d), ["svc/acct"])
+        s.set(long)
+        s.delete()
+        self.assertEqual(api.d, {})
+
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS only")
 class MacKeychainRealTests(unittest.TestCase):

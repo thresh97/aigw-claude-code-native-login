@@ -617,17 +617,55 @@ class WinCredential:
     def __init__(self, account, service=STORE_SERVICE, api=None):
         self.target, self.user, self.api = f"{service}/{account}", account, api or WinCredApi()
 
+    # One credential holds at most CRED_MAX_CREDENTIAL_BLOB_SIZE (2560) bytes; CredWriteW fails with 1783 beyond that.
+    # A longer value is split: the main target holds a "aigw-chunks:<n>\n" header and the first part, and
+    # "<target>#1" ... "#<n-1>" the rest. Values that fit stay a single plain credential.
+    MAX_BLOB = 2560
+    HEADER = b"aigw-chunks:"
+
+    def _parts(self, blob):
+        """(n, list of part blobs) for the value stored at the main target, reading the extra parts."""
+        if not blob.startswith(self.HEADER):
+            return 1, [blob]
+        head, _, first = blob.partition(b"\n")
+        n, parts = int(head[len(self.HEADER):]), [first]
+        for i in range(1, n):
+            part = self.api.read(f"{self.target}#{i}")
+            if part is None:
+                raise SecretStoreError("incomplete entry")
+            parts.append(part)
+        return n, parts
+
     def get(self):
         blob = self.api.read(self.target)
+        if not blob:
+            return ""
         try:
-            return blob.decode("utf-8") if blob else ""
+            return b"".join(self._parts(blob)[1]).decode("utf-8")
         except ValueError:
             raise SecretStoreError("unreadable entry")
 
     def set(self, value):
-        self.api.write(self.target, self.user, value.encode("utf-8"))
+        blob = value.encode("utf-8")
+        old = self.api.read(self.target)
+        old_n = self._parts(old)[0] if old else 1
+        if len(blob) <= self.MAX_BLOB and not blob.startswith(self.HEADER):
+            parts = [blob]
+        else:
+            size = self.MAX_BLOB - len(self.HEADER) - 4      # room for "<n>\n" in the first part
+            parts = [blob[i:i + size] for i in range(0, len(blob), size)]
+        for i in range(len(parts) - 1, 0, -1):               # extra parts first, the header last
+            self.api.write(f"{self.target}#{i}", self.user, parts[i])
+        first = parts[0] if len(parts) == 1 else self.HEADER + str(len(parts)).encode() + b"\n" + parts[0]
+        self.api.write(self.target, self.user, first)
+        for i in range(len(parts), old_n):                    # a shorter value leaves no stale parts behind
+            self.api.delete(f"{self.target}#{i}")
 
     def delete(self):
+        blob = self.api.read(self.target)
+        n = self._parts(blob)[0] if blob else 1
+        for i in range(1, n):
+            self.api.delete(f"{self.target}#{i}")
         self.api.delete(self.target)
 
 
