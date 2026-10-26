@@ -74,7 +74,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -2680,11 +2680,15 @@ def cmd_install(a, cfg, state, settings):
         # one write: the proxy's address, the local secret, no JWT (a JWT left over from file mode is removed)
         settings.apply(base_url=base_url, hook_command=hook_cmd, put_lines={LOCAL_HEADER: proxy_secret(state, create=True)}, drop_lines=[cfg["header"]])
         log(f"updated {settings.path} (ANTHROPIC_BASE_URL {base_url}, local secret, no JWT)")
+        if a.linger and not sys.platform.startswith("linux"):
+            log("--linger is for Linux (systemd); ignored")
         if a.no_service or a.no_hooks or cfg.get("fleet"):
+            if a.linger:
+                log("--linger ignored: no service is installed, and lingering is what keeps the service running after logout")
             log("mode proxy: no daemon service installed (" + ("fleet: the fleet's own entry runs the daemon" if cfg.get("fleet") else "--no-service" if a.no_service else "--no-hooks: the caller runs the daemon") + ")")
             service_ok = False
         else:
-            service_ok, msg = service_install(cfg)
+            service_ok, msg = service_install(cfg, linger=a.linger)
             log(("mode proxy: daemon service: " if service_ok else "warning: mode proxy: the daemon is NOT installed as a service: ") + msg)
         kind, info = probe_proxy(cfg, state)
         if kind != "running":
@@ -2762,8 +2766,23 @@ def service_python():
     return best[2] if best else None
 
 
-def service_install(cfg, platform=None, run=None):
-    """Make the daemon a persistent per-user service. Returns (ok, message)."""
+def linger_note(run, linger):
+    """The lingering part of the Linux service message; with linger, turn it on first."""
+    if not linger:
+        return ("the proxy stops when your last login session ends. On an SSH-only or headless machine, or when Claude Code runs "
+                "in tmux or screen past your login, run `aigw-claude-auth install --linger` (or `loginctl enable-linger`)")
+    ok, out = run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"])
+    if ok and out.strip() == "yes":
+        return "lingering was already on, so the proxy keeps running after logout"
+    ok, out = run(["loginctl", "enable-linger"])
+    if ok:
+        return "lingering is on: the proxy keeps running after logout and starts at boot (undo: `loginctl disable-linger`)"
+    return f"warning: could not enable lingering ({out}); run `sudo loginctl enable-linger $USER` to keep the proxy running after logout"
+
+
+def service_install(cfg, platform=None, run=None, linger=False):
+    """Make the daemon a persistent per-user service. Returns (ok, message). linger (Linux): also `loginctl enable-linger`, so
+    the proxy outlives the login session; a failure there is a warning in the message, not a failure of the service."""
     platform, run = platform or sys.platform, run or service_run
     python = str(Path(sys.executable).resolve()) if platform == "win32" else service_python()
     if not python:
@@ -2805,7 +2824,7 @@ def service_install(cfg, platform=None, run=None):
             ok, out = run(["systemctl", "--user", "enable", "--now", f"{TASK_NAME}.service"])
             if not ok:
                 return False, f"wrote {path}, but systemd did not start it ({out})"
-            return True, f"systemd user unit {path} is enabled; after logout it keeps running only with lingering (`loginctl enable-linger $USER`)"
+            return True, f"systemd user unit {path} is enabled; " + linger_note(run, linger)
         if platform == "win32":
             tmp = Path(tempfile.mkdtemp(prefix="aigw-task-")) / "task.xml"
             try:
@@ -3637,6 +3656,9 @@ def main(argv=None):
     p.add_argument("--hook-command", help="how hooks call this tool (default: this interpreter and file; must contain 'aigw-claude-auth')")
     p.add_argument("--print", action="store_true", help="print the snippet for managed settings instead of writing")
     p.add_argument("--no-service", action="store_true", help="proxy mode: do not install the daemon as a launchd agent, systemd unit or Task Scheduler task")
+    p.add_argument("--linger", action="store_true", help="proxy mode on Linux: also run `loginctl enable-linger`, so the proxy keeps running after your last login "
+                   "session ends and starts at boot. Use it on an SSH-only or headless machine, or when Claude Code runs in tmux or screen past your login. "
+                   "A desktop does not need it. Off by default because it lets your processes run without a login; undo with `loginctl disable-linger`")
     p = sub.add_parser("doctor", help="read every config source, predict what Claude Code sends, report conflicts (exit 1 on an Error)")
     p.add_argument("--json", action="store_true", help="machine-readable report")
     p = sub.add_parser("task", help="Windows: install or remove the Task Scheduler task that runs the daemon at log on")

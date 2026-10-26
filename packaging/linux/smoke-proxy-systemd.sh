@@ -5,7 +5,8 @@
 #   packaging/linux/smoke-proxy-systemd.sh --client client/aigw_claude_auth.py [--keep]
 # Checks: install in proxy mode writes and starts the systemd user unit; status shows the email claim and the JWKS rows;
 # a request through the proxy reaches the gateway with the JWT injected and the local secret stripped; `requests` lists it
-# with credentials partly masked; systemd restarts the proxy after a kill; a second install is harmless; teardown.
+# with credentials partly masked; systemd restarts the proxy after a kill; a plain install leaves lingering off, and
+# `install --linger` either turns it on or, when polkit refuses the unprivileged user, warns and prints the sudo fallback; teardown.
 set -u
 CLIENT= KEEP=0 INSIDE=0
 while [ $# -gt 0 ]; do
@@ -115,8 +116,18 @@ EOF
     for _ in $(seq 1 15); do cli status --offline 2>/dev/null | grep -q "running on" && break; sleep 1; done
     cli status --offline 2>&1 | grep -q "running on" && ok "proxy answers again" || bad "proxy answers again"
 
-    step "5. reinstall is idempotent and teardown removes the service"
-    cli install >/dev/null 2>&1 && ok "second install exits 0" || bad "second install exits 0"
+    step "5. install --linger enables lingering (off after a plain install); teardown removes the service"
+    [ "$(loginctl show-user $U -p Linger --value)" = no ] && ok "lingering is off after a plain install" || bad "lingering is off after a plain install"
+    cli install --linger > /tmp/linger.out 2>&1 && ok "install --linger exits 0" || bad "install --linger exits 0"
+    grep -i "linger" /tmp/linger.out | cut -c1-230 | sed 's/^/   /'
+    if [ "$(loginctl show-user $U -p Linger --value)" = yes ]; then
+        ok "lingering is on after install --linger (this system let an unprivileged user enable it)"
+    else
+        # polkit decides whether a user may do this without sudo; with no terminal to ask on it is refused. Then install must say so and print the fallback.
+        echo "   unprivileged enable was refused here (polkit needs interactive authentication; no terminal in this container)"
+        grep -q "warning: could not enable lingering" /tmp/linger.out && grep -q "sudo loginctl enable-linger" /tmp/linger.out && ok "a refusal is a warning that prints the sudo fallback" || bad "a refusal is a warning that prints the sudo fallback"
+        loginctl enable-linger $U && [ "$(loginctl show-user $U -p Linger --value)" = yes ] && ok "the printed fallback (as root) turns lingering on" || bad "the printed fallback turns lingering on"
+    fi
     [ "$(uctl is-active aigw-claude-auth 2>/dev/null)" = active ] && ok "still active after reinstall" || bad "still active after reinstall"
     uctl disable --now aigw-claude-auth >/dev/null 2>&1; rm -f $UNIT; uctl daemon-reload
     sleep 1
@@ -134,7 +145,7 @@ trap cleanup EXIT
 docker build -q -t "$IMG" - >/dev/null <<'DF' || exit 1
 FROM ubuntu:latest
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update -qq && apt-get install -y -qq systemd systemd-sysv systemd-container dbus dbus-user-session python3 iproute2 procps curl >/dev/null
+RUN apt-get update -qq && apt-get install -y -qq systemd systemd-sysv systemd-container dbus dbus-user-session polkitd python3 iproute2 procps curl >/dev/null
 CMD ["/sbin/init"]
 DF
 docker run -d --name "$CTR" --privileged --cgroupns=host --tmpfs /run --tmpfs /run/lock --tmpfs /tmp "$IMG" >/dev/null || exit 1

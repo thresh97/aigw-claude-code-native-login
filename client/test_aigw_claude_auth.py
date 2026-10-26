@@ -2946,7 +2946,83 @@ class ServiceInstallTests(Base):
         self.assertIn(" daemon\n", unit)
         self.assertIn("Restart=on-failure", unit)
         self.assertIn(["systemctl", "--user", "enable", "--now", "aigw-claude-auth.service"], calls)
-        self.assertIn("lingering", msg)
+        self.assertIn("--linger", msg)
+
+    def linux(self, linger=False, show="no", enable=(True, ""), reload=(True, "")):
+        calls = []
+
+        def run(argv):
+            calls.append(argv)
+            if argv[:2] == ["systemctl", "--user"] and argv[2] == "daemon-reload":
+                return reload
+            if argv[:2] == ["loginctl", "show-user"]:
+                return True, show
+            if argv[:2] == ["loginctl", "enable-linger"]:
+                return enable
+            return True, ""
+        ok, msg = A.service_install({}, platform="linux", run=run, linger=linger)
+        return ok, msg, calls
+
+    def test_linux_does_not_enable_lingering_by_default_and_says_when_to_use_it(self):
+        ok, msg, calls = self.linux()
+        self.assertTrue(ok, msg)
+        self.assertFalse([c for c in calls if c[0] == "loginctl"], calls)
+        for hint in ("--linger", "SSH-only or headless", "tmux"):
+            self.assertIn(hint, msg)
+
+    def test_linger_enables_lingering(self):
+        ok, msg, calls = self.linux(linger=True)
+        self.assertTrue(ok, msg)
+        self.assertIn(["loginctl", "enable-linger"], calls)
+        self.assertIn("lingering is on", msg)
+        self.assertIn("disable-linger", msg)
+
+    def test_linger_leaves_lingering_that_is_already_on_alone(self):
+        ok, msg, calls = self.linux(linger=True, show="yes\n")
+        self.assertTrue(ok, msg)
+        self.assertNotIn(["loginctl", "enable-linger"], calls)
+        self.assertIn("already on", msg)
+
+    def test_a_refused_linger_is_a_warning_and_the_service_still_counts(self):
+        ok, msg, _ = self.linux(linger=True, enable=(False, "Access denied"))
+        self.assertTrue(ok, msg)
+        self.assertIn("warning: could not enable lingering (Access denied)", msg)
+        self.assertIn("sudo loginctl enable-linger", msg)
+
+    def test_linger_is_not_attempted_when_the_service_did_not_start(self):
+        ok, msg, calls = self.linux(linger=True, reload=(False, "no bus"))
+        self.assertFalse(ok)
+        self.assertFalse([c for c in calls if c[0] == "loginctl"], calls)
+
+    def test_install_passes_linger_on_and_ignores_it_without_a_service(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{free_port()}")
+        with mock.patch.object(A, "service_install", return_value=(True, "x")) as si:
+            code, _, err = self.run_cli("install", "--linger")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(si.call_args.kwargs, {"linger": True})
+        with mock.patch.object(A, "service_install") as si:
+            code, _, err = self.run_cli("install", "--linger", "--no-service")
+        self.assertEqual(code, 0, err)
+        si.assert_not_called()
+        self.assertIn("--linger ignored", err)
+
+    def test_linger_is_for_linux_only(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{free_port()}")
+        with mock.patch.object(A, "service_install", return_value=(True, "x")), mock.patch.object(A.sys, "platform", "darwin"):
+            code, _, err = self.run_cli("install", "--linger")
+        self.assertEqual(code, 0, err)
+        self.assertIn("--linger is for Linux", err)
+
+    def test_the_help_says_when_to_use_linger(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            A.main(["install", "--help"])
+        self.assertEqual(cm.exception.code, 0)
+        text = " ".join(out.getvalue().split())
+        for hint in ("--linger", "SSH-only or headless", "tmux or screen", "A desktop does not need it", "Off by default"):
+            self.assertIn(hint, text)
 
     def test_linux_without_a_user_session_says_why(self):
         run = lambda argv: (False, "Failed to connect to bus") if "daemon-reload" in argv else (True, "")
