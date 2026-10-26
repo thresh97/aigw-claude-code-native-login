@@ -27,11 +27,11 @@ When no JWT can be had and the one in the settings is unusable, `sync` writes th
 of an empty header. A load balancer rule can answer that sentinel with a non-401 status, which Claude Code shows at
 once; a 401 would send a native-login Claude Code into its OAuth refresh-and-retry loop for about four minutes.
 
-Python 3.8+, standard library only. macOS and Linux (uses fcntl for locking).
+Python 3.8+, standard library only. macOS, Linux and native Windows (fcntl or msvcrt for locking, ctypes for the
+Windows process check, a PowerShell toast and a Task Scheduler task on Windows).
 """
 import argparse
 import base64
-import fcntl
 import hashlib
 import http.server
 import json
@@ -50,10 +50,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from xml.sax.saxutils import escape as xml_escape
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = "1.1.1"
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+VERSION = "1.2.0"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -90,8 +96,21 @@ class AuthError(Exception):
 
 # --------------------------------------------------------------------------------------------- paths and config
 
+def is_windows():
+    return sys.platform == "win32"      # read at call time so tests can mock it
+
+
 def config_dir():
-    return Path(os.environ.get("AIGW_CLAUDE_AUTH_DIR") or Path.home() / ".config" / "aigw-claude-auth")
+    if os.environ.get("AIGW_CLAUDE_AUTH_DIR"):
+        return Path(os.environ["AIGW_CLAUDE_AUTH_DIR"])
+    if is_windows():
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "aigw-claude-auth"
+    return Path.home() / ".config" / "aigw-claude-auth"
+
+
+def log_dir():
+    """Where the Task Scheduler daemon (which has no console) writes its log. Only used on Windows."""
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "aigw-claude-auth" / "logs"
 
 
 def default_settings_path():
@@ -152,26 +171,64 @@ def log(msg, quiet=False):
 
 def write_private(path, text):
     """Atomic write (temp file, fsync, rename) with mode 600. Keeps an existing file's mode if it is stricter."""
+    # On Windows mode 700/600 do nothing; the profile directories (%APPDATA%) are user-only by default. No icacls for now.
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     mode = 0o600
     if path.exists():
         mode = path.stat().st_mode & 0o777 & 0o600 or 0o600
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
 
 
+def replace_file(src, dst, tries=40, pause=0.05):
+    """os.replace; on Windows retry for about 2 s while another process holds the target open (PermissionError)."""
+    for i in range(tries):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if not is_windows() or i == tries - 1:
+                raise
+            time.sleep(pause)
+
+
+def _kernel32():
+    import ctypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k
+
+
+def _pid_alive_windows(pid):
+    """os.kill(pid, 0) would terminate the process on Windows; ask for its exit code instead (STILL_ACTIVE = 259)."""
+    import ctypes
+    k = _kernel32()
+    h = k.OpenProcess(0x1000, 0, pid)                       # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ctypes.get_last_error() == 5                 # ERROR_ACCESS_DENIED: it exists, but is not ours
+    try:
+        code = ctypes.c_uint32()
+        return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259
+    finally:
+        k.CloseHandle(h)
+
+
 def pid_alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if is_windows():
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -217,7 +274,7 @@ class Settings:
     def load(self):
         if not self.path.exists():
             return {}
-        text = self.path.read_text()
+        text = self.path.read_text(encoding="utf-8-sig")
         return json.loads(text) if text.strip() else {}
 
     def _lines(self, data):
@@ -270,13 +327,13 @@ class State:
     def pending(self):
         """The pending hook sign-in, or {} if there is none or it is over (expired, or its process is gone)."""
         try:
-            p = json.loads(self.pending_file.read_text())
+            p = json.loads(self.pending_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
         return p if p.get("expires_at", 0) > time.time() + 10 and pid_alive(p.get("pid")) else {}
 
     def load(self):
-        return json.loads(self.file.read_text()) if self.file.exists() else {}
+        return json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists() else {}
 
     def save(self, data):
         write_private(self.file, json.dumps(data, indent=2) + "\n")
@@ -285,6 +342,21 @@ class State:
     def lock(self):
         """One writer at a time across the daemon, hooks and manual runs."""
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if is_windows():
+            with open(self.dir / "lock", "ab") as f:
+                while True:                                 # LK_LOCK gives up after ~10 s; keep waiting like flock does
+                    f.seek(0)
+                    try:
+                        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:
+                        continue
+                try:
+                    yield
+                finally:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            return
         with open(self.dir / "lock", "w") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
@@ -585,8 +657,12 @@ def cmd_status(a, cfg, state, settings):
 
 def cmd_daemon(a, cfg, state, settings):
     stop = threading.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stop.set())
+    if is_windows() and sys.stderr is None:                 # started by Task Scheduler through pythonw: no console
+        log_dir().mkdir(parents=True, exist_ok=True)
+        sys.stderr = open(log_dir() / "daemon.log", "a", encoding="utf-8", buffering=1)
+    for name in ("SIGTERM", "SIGINT", "SIGBREAK"):          # SIGBREAK exists on Windows only
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), lambda *_: stop.set())
     backoff = 30
     log(f"daemon started (settings {settings.path})")
     while not stop.is_set():
@@ -604,8 +680,20 @@ def cmd_daemon(a, cfg, state, settings):
     return 0
 
 
+def default_hook_command():
+    """macOS/Linux: a shell command string. Windows: an argv list for exec form (no shell, so no quoting; finding 17)."""
+    script = str(Path(__file__).resolve())
+    if is_windows():
+        return [str(Path(sys.executable).resolve()), script]
+    return f"{shlex.quote(sys.executable)} {shlex.quote(script)}"
+
+
 def hook_entry(hook_command, sub):
-    return {"hooks": [{"type": "command", "command": f"{hook_command} hook {sub}", "timeout": HOOK_TIMEOUT}]}
+    if isinstance(hook_command, (list, tuple)):
+        h = {"type": "command", "command": hook_command[0], "args": [*hook_command[1:], "hook", sub], "timeout": HOOK_TIMEOUT}
+    else:
+        h = {"type": "command", "command": f"{hook_command} hook {sub}", "timeout": HOOK_TIMEOUT}
+    return {"hooks": [h]}
 
 
 def cmd_hook(a, cfg, state, settings):
@@ -669,8 +757,8 @@ def hook_login_reason(cfg, state, settings):
             d = TokenSource(cfg, state).device_start()
             cmd = [sys.executable, str(Path(__file__).resolve()), "--config", cfg["_config_path"], "--state-dir", str(state.dir),
                    "--settings", str(settings.path), "hook-login-wait"]
-            with open(state.dir / "hook-login.log", "a") as logf:
-                child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            with open(state.dir / "hook-login.log", "a", encoding="utf-8") as logf:
+                child = spawn_detached(cmd, logf)
             child.stdin.write(json.dumps(d).encode())
             child.stdin.close()
             p = {"prompt": TokenSource.device_prompt(d), "uri": d.get("verification_uri_complete") or d.get("verification_uri") or d.get("verification_url"),
@@ -679,6 +767,25 @@ def hook_login_reason(cfg, state, settings):
     minutes = max(1, int(p["expires_at"] - time.time()) // 60)
     return (f"AI gateway sign-in needed: {p['prompt']} (within {minutes} min), then send your prompt again. "
             f"Or run `aigw-claude-auth login` in a terminal.")
+
+
+def spawn_detached(cmd, logf):
+    """Start `cmd` detached from the hook: stdin a pipe, stdout and stderr to logf (never the hook's stdout)."""
+    kw = dict(stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT)
+    if not is_windows():
+        return subprocess.Popen(cmd, start_new_session=True, **kw)
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP. CREATE_NO_WINDOW would be ignored together with DETACHED_PROCESS.
+    # CREATE_BREAKAWAY_FROM_JOB first, so a job that kills its children on close doesn't take the worker along;
+    # a job that doesn't allow breakaway refuses it, and then we go without.
+    flags = 0x00000008 | 0x00000200
+    cmd = list(cmd)
+    pyw = Path(cmd[0]).with_name("pythonw.exe")
+    if pyw.exists():
+        cmd[0] = str(pyw)
+    try:
+        return subprocess.Popen(cmd, creationflags=flags | 0x01000000, **kw)
+    except OSError:
+        return subprocess.Popen(cmd, creationflags=flags, **kw)
 
 
 def cmd_hook_login_wait(a, cfg, state, settings):
@@ -694,7 +801,7 @@ def cmd_hook_login_wait(a, cfg, state, settings):
     finally:
         with state.lock():                                  # remove the pending file only if it is still ours
             try:
-                if json.loads(state.pending_file.read_text()).get("pid") == os.getpid():
+                if json.loads(state.pending_file.read_text(encoding="utf-8")).get("pid") == os.getpid():
                     state.pending_file.unlink()
             except (OSError, ValueError):
                 pass
@@ -720,13 +827,40 @@ def hook_stop_failure(cfg, state, settings, payload):
     return 0
 
 
+TOAST_PS = r"""$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>Claude Code</text><text>@@TEXT@@</text></binding></visual></toast>')
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
+"""
+
+
+def toast_argv(msg):
+    """Windows PowerShell 5.1 WinRT toast (S7: about 1 s). The text is XML- and PowerShell-quote-escaped; no tokens."""
+    text = xml_escape(msg).replace("'", "''")
+    enc = base64.b64encode(TOAST_PS.replace("@@TEXT@@", text).encode("utf-16-le")).decode()
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", enc]
+
+
+def split_command(text, windows=False):
+    """shlex.split; on Windows keep backslashes (non-POSIX mode) and drop the double quotes around a word."""
+    if not windows:
+        return shlex.split(text)
+    return [w[1:-1] if len(w) > 1 and w[0] == w[-1] == '"' else w for w in shlex.split(text, posix=False)]
+
+
 def notify(cfg, msg):
     how = cfg["notify"]
     if how == "off":
         return
     try:
         if how != "auto":
-            subprocess.run(shlex.split(how) + [msg], timeout=10, capture_output=True)
+            subprocess.run(split_command(how, windows=is_windows()) + [msg], timeout=10, capture_output=True)
+        elif is_windows():
+            subprocess.run(toast_argv(msg), timeout=10, capture_output=True, stdin=subprocess.DEVNULL, creationflags=0x08000000)
         elif sys.platform == "darwin":
             subprocess.run(["osascript", "-e", f"display notification {json.dumps(msg)} with title \"Claude Code\""], timeout=10, capture_output=True)
         elif shutil.which("notify-send"):
@@ -736,8 +870,8 @@ def notify(cfg, msg):
 
 
 def cmd_install(a, cfg, state, settings):
-    hook = a.hook_command or f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))}"
-    if not MARKER.search(hook):
+    hook = a.hook_command or default_hook_command()
+    if not MARKER.search(hook if isinstance(hook, str) else json.dumps(hook)):
         raise AuthError("--hook-command must contain 'aigw-claude-auth' or 'aigw_claude_auth' so later installs can find and replace it")
     if a.print:
         snippet = {"hooks": {"UserPromptSubmit": [hook_entry(hook, "precheck")], "StopFailure": [hook_entry(hook, "stop-failure")]}}
@@ -752,10 +886,70 @@ def cmd_install(a, cfg, state, settings):
     return 0 if r.ok else 1
 
 
+TASK_NAME = "aigw-claude-auth"
+
+
+def task_xml(user, python, script):
+    """Task Scheduler definition: at log on of `user`, one instance, restart on failure, no time limit."""
+    pyw = Path(python).with_name("pythonw.exe")
+    exe = str(pyw if pyw.exists() else python)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Keeps the gateway JWT in Claude Code's settings fresh (aigw-claude-auth daemon)</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{xml_escape(user)}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{xml_escape(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{xml_escape(exe)}</Command><Arguments>{xml_escape(subprocess.list2cmdline([script, "daemon"]))}</Arguments></Exec></Actions>
+</Task>
+"""
+
+
+def current_user():
+    """DOMAIN\\user as Windows knows it (`whoami` is right where %USERDOMAIN% says WORKGROUP over ssh)."""
+    if is_windows():
+        try:
+            who = subprocess.run(["whoami.exe"], capture_output=True, text=True, timeout=10).stdout.strip()
+            if who:
+                return who
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return (os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")).lstrip("\\")
+
+
+def cmd_task(a, cfg, state, settings):
+    """Windows background start: a Task Scheduler task that runs the daemon at log on (the launchd/systemd counterpart)."""
+    user = current_user()
+    xml = task_xml(user, str(Path(sys.executable).resolve()), str(Path(__file__).resolve()))
+    if a.action == "print":
+        print(xml)
+        return 0
+    if not is_windows():
+        raise AuthError("the task command is for Windows; use the launchd agent or systemd unit elsewhere")
+    if a.action == "remove":
+        r = subprocess.run(["schtasks.exe", "/Delete", "/TN", a.name, "/F"], capture_output=True, text=True)
+        log((r.stdout or r.stderr).strip())
+        return r.returncode
+    path = Path(tempfile.mkdtemp(prefix="aigw-task-")) / "task.xml"
+    try:
+        path.write_text(xml, encoding="utf-16")
+        r = subprocess.run(["schtasks.exe", "/Create", "/TN", a.name, "/XML", str(path), "/F"], capture_output=True, text=True)
+    finally:
+        shutil.rmtree(path.parent, ignore_errors=True)
+    log((r.stdout or r.stderr).strip())
+    return r.returncode
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="aigw-claude-auth", description=__doc__.split("\n\n")[0])
     ap.add_argument("--config", type=Path, help="config file (default: <config dir>/config.json)")
-    ap.add_argument("--state-dir", type=Path, help="where the refresh token lives (default: ~/.config/aigw-claude-auth, or $AIGW_CLAUDE_AUTH_DIR)")
+    ap.add_argument("--state-dir", type=Path, help="where the refresh token lives (default: ~/.config/aigw-claude-auth, on Windows %%APPDATA%%\\aigw-claude-auth, or $AIGW_CLAUDE_AUTH_DIR)")
     ap.add_argument("--settings", type=Path, help="Claude Code settings file (default: $CLAUDE_CONFIG_DIR/settings.json or ~/.claude/settings.json)")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -781,16 +975,21 @@ def main(argv=None):
     p.add_argument("--no-hooks", action="store_true", help="only the base URL (for example when IT ships the hooks)")
     p.add_argument("--hook-command", help="how hooks call this tool (default: this interpreter and file; must contain 'aigw-claude-auth')")
     p.add_argument("--print", action="store_true", help="print the snippet for managed settings instead of writing")
+    p = sub.add_parser("task", help="Windows: install or remove the Task Scheduler task that runs the daemon at log on")
+    p.add_argument("action", choices=["install", "remove", "print"], help="print shows the task definition (XML) and registers nothing")
+    p.add_argument("--name", default=TASK_NAME, help="task name (default: %(default)s)")
     a = ap.parse_args(argv)
 
     cdir = a.state_dir or config_dir()
     try:
+        if a.cmd == "task":                                     # needs no config
+            return cmd_task(a, None, None, None)
         cfg = load_config(a.config or cdir / "config.json")
         cfg["_config_path"] = str((a.config or cdir / "config.json").resolve())   # for the hook's background sign-in
         state = State(cdir)
         settings = Settings(a.settings or default_settings_path(), cfg["header"])
         handler = {"login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "token": cmd_token, "status": cmd_status,
-                   "daemon": cmd_daemon, "hook": cmd_hook, "hook-login-wait": cmd_hook_login_wait, "install": cmd_install}[a.cmd]
+                   "daemon": cmd_daemon, "hook": cmd_hook, "hook-login-wait": cmd_hook_login_wait, "install": cmd_install, "task": cmd_task}[a.cmd]
         return handler(a, cfg, state, settings)
     except AuthError as e:
         if a.cmd == "hook":                                  # hooks must never fail Claude Code's turn
