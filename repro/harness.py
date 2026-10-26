@@ -903,7 +903,8 @@ def scenario_client_live(out):
     backup = borrow_settings(settings_file)
     env = dict(os.environ, AIGW_CLAUDE_SETTINGS=str(settings_file))
     # Claude Code runs with a throwaway HOME, so tell the hooks where the client's config and sign-in live.
-    env.setdefault("AIGW_CLAUDE_AUTH_DIR", str(Path.home() / ".config" / "aigw-claude-auth"))
+    default_dir = Path(os.environ["APPDATA"]) if IS_WIN else Path.home() / ".config"   # the client's config_dir()
+    env.setdefault("AIGW_CLAUDE_AUTH_DIR", str(default_dir / "aigw-claude-auth"))
     run = lambda *a: subprocess.run([sys.executable, str(CLIENT), *a], env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
     gw = Gateway(out, upstream=os.environ["GATEWAY_URL"])
     claude = Claude(out, gw.url, config_dir=cfg, env={"AIGW_CLAUDE_AUTH_DIR": env["AIGW_CLAUDE_AUTH_DIR"]})
