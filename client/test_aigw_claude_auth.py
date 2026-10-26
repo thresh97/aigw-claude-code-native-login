@@ -138,6 +138,11 @@ class FakeIdP:
         self.srv.shutdown()
 
 
+def hook_words(h):
+    """A hook's command and args as one string, for both the shell form and the Windows exec form."""
+    return " ".join([h["command"], *h.get("args", [])])
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.idp = FakeIdP()
@@ -208,14 +213,14 @@ class SettingsTests(Base):
         ups = [h["hooks"][0]["command"] for h in d["hooks"]["UserPromptSubmit"]]
         self.assertEqual(len(ups), 2)
         self.assertEqual(ups[0], "other")
-        self.assertTrue(ups[1].endswith("hook precheck"))
-        self.assertTrue(d["hooks"]["StopFailure"][0]["hooks"][0]["command"].endswith("hook stop-failure"))
+        self.assertTrue(hook_words(d["hooks"]["UserPromptSubmit"][1]["hooks"][0]).endswith("hook precheck"))
+        self.assertTrue(hook_words(d["hooks"]["StopFailure"][0]["hooks"][0]).endswith("hook stop-failure"))
         self.assertEqual(A.jwt_claims(self.header()).get("kind"), "gateway")
 
     def test_install_print_writes_nothing(self):
         code, out, _ = self.run_cli("install", "--print", "--base-url", "https://gw.example.com")
         self.assertEqual(code, 0)
-        self.assertIn("hook precheck", out)
+        self.assertIn("precheck", out)
         self.assertFalse(self.settings_path.exists())
 
 
@@ -250,7 +255,7 @@ class SyncTests(Base):
         tok = jwt(time.time() + 3600, kind="cmd")
         f = self.tmp / "tok"
         f.write_text(tok)
-        self.write_config(client_id="", issuer="", broker_url="", token_command=f"cat {f}")
+        self.write_config(client_id="", issuer="", broker_url="", token_command=f"type {f}" if sys.platform == "win32" else f"cat {f}")
         code, out, _ = self.run_cli("token")
         self.assertEqual((code, out.strip()), (0, tok))
         self.assertEqual(self.header(), tok)
@@ -399,7 +404,10 @@ class HookTests(Base):
         self.run_cli("hook", "precheck", stdin="{}")
         pending = json.loads(self.state_dir.joinpath("hook-login.json").read_text())
         os.kill(pending["pid"], 15)                         # the waiting process dies
-        os.waitpid(pending["pid"], 0)                       # reap it (the hook ran in this process, so it's our child)
+        if sys.platform == "win32":
+            self.wait_for(lambda: not A.pid_alive(pending["pid"]))
+        else:
+            os.waitpid(pending["pid"], 0)                   # reap it (the hook ran in this process, so it's our child)
         self.assertEqual(A.State(self.state_dir).pending(), {})
         self.idp.calls.clear()
         _, out, _ = self.run_cli("hook", "precheck", stdin="{}")        # a fresh sign-in is started
@@ -452,9 +460,14 @@ class HookTests(Base):
 
     def test_stop_failure_gateway_401_forces_refresh_and_notifies(self):
         note, script = self.tmp / "note", self.tmp / "notify.sh"
-        script.write_text(f'#!/bin/sh\nprintf %s "$1" > "{note}"\n')
-        script.chmod(0o755)
-        self.write_config(notify=str(script))
+        if sys.platform == "win32":
+            script = self.tmp / "notify.py"
+            script.write_text(f'import sys\nopen(r"{note}", "w").write(sys.argv[1])\n')
+            self.write_config(notify=f'"{sys.executable}" "{script}"')
+        else:
+            script.write_text(f'#!/bin/sh\nprintf %s "$1" > "{note}"\n')
+            script.chmod(0o755)
+            self.write_config(notify=str(script))
         self.sign_in()
         good = jwt(time.time() + 3600)                     # looks valid, but the gateway said no (revoked, wrong key)
         self.put_header(good)
@@ -638,6 +651,11 @@ class WindowsMockTests(Base):
         self.assertNotRegex(ps.lower(), r"invoke-expression|iex|gzip|downloadstring")
         self.assertLess(len(argv[6]), 5000)
 
+    def test_custom_notify_command_on_windows_keeps_backslashes_and_drops_quotes(self):
+        self.assertEqual(A.split_command(r'"C:\Program Files\Python\python.exe" C:\x\n.py -v', windows=True),
+                         [r"C:\Program Files\Python\python.exe", r"C:\x\n.py", "-v"])
+        self.assertEqual(A.split_command("'a b' c", windows=False), ["a b", "c"])
+
     def test_notify_on_windows_runs_toast(self):
         with self.win(), mock.patch("subprocess.run") as run:
             A.notify({"notify": "auto"}, "hello")
@@ -665,8 +683,13 @@ class WindowsMockTests(Base):
                 self.assertEqual(self.run_cli("task", "install")[0], 1)
         run.assert_not_called()
 
+    def test_task_needs_no_config(self):
+        self.config_path.unlink()
+        self.assertEqual(self.run_cli("task", "print")[0], 0)
+
     def test_task_install_argv_on_windows(self):
-        with self.win(), mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout="SUCCESS", stderr="")) as run:
+        with self.win(), mock.patch.object(A, "current_user", return_value="HOST\\me"), \
+                mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout="SUCCESS", stderr="")) as run:
             self.assertEqual(self.run_cli("task", "install", "--name", "aigw-test-x")[0], 0)
             self.assertEqual(self.run_cli("task", "remove", "--name", "aigw-test-x")[0], 0)
         self.assertEqual(run.call_args_list[0].args[0][:4], ["schtasks.exe", "/Create", "/TN", "aigw-test-x"])

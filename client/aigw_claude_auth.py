@@ -845,13 +845,20 @@ def toast_argv(msg):
     return ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", enc]
 
 
+def split_command(text, windows=False):
+    """shlex.split; on Windows keep backslashes (non-POSIX mode) and drop the double quotes around a word."""
+    if not windows:
+        return shlex.split(text)
+    return [w[1:-1] if len(w) > 1 and w[0] == w[-1] == '"' else w for w in shlex.split(text, posix=False)]
+
+
 def notify(cfg, msg):
     how = cfg["notify"]
     if how == "off":
         return
     try:
         if how != "auto":
-            subprocess.run(shlex.split(how, posix=not is_windows()) + [msg], timeout=10, capture_output=True)
+            subprocess.run(split_command(how, windows=is_windows()) + [msg], timeout=10, capture_output=True)
         elif is_windows():
             subprocess.run(toast_argv(msg), timeout=10, capture_output=True, stdin=subprocess.DEVNULL, creationflags=0x08000000)
         elif sys.platform == "darwin":
@@ -904,9 +911,21 @@ def task_xml(user, python, script):
 """
 
 
+def current_user():
+    """DOMAIN\\user as Windows knows it (`whoami` is right where %USERDOMAIN% says WORKGROUP over ssh)."""
+    if is_windows():
+        try:
+            who = subprocess.run(["whoami.exe"], capture_output=True, text=True, timeout=10).stdout.strip()
+            if who:
+                return who
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return (os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")).lstrip("\\")
+
+
 def cmd_task(a, cfg, state, settings):
     """Windows background start: a Task Scheduler task that runs the daemon at log on (the launchd/systemd counterpart)."""
-    user = (os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")).lstrip("\\")
+    user = current_user()
     xml = task_xml(user, str(Path(sys.executable).resolve()), str(Path(__file__).resolve()))
     if a.action == "print":
         print(xml)
@@ -963,6 +982,8 @@ def main(argv=None):
 
     cdir = a.state_dir or config_dir()
     try:
+        if a.cmd == "task":                                     # needs no config
+            return cmd_task(a, None, None, None)
         cfg = load_config(a.config or cdir / "config.json")
         cfg["_config_path"] = str((a.config or cdir / "config.json").resolve())   # for the hook's background sign-in
         state = State(cdir)
