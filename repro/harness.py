@@ -155,8 +155,8 @@ class Client:
     def sign_out(self):
         (self.dir / "state.json").write_text("{}", encoding="utf-8")
 
-    def run(self, *args, settings):
-        env = dict(os.environ, AIGW_CLAUDE_AUTH_DIR=str(self.dir), AIGW_CLAUDE_SETTINGS=str(settings))
+    def run(self, *args, settings, env=None):
+        env = dict(os.environ, AIGW_CLAUDE_AUTH_DIR=str(self.dir), AIGW_CLAUDE_SETTINGS=str(settings), **(env or {}))
         return subprocess.run([sys.executable, str(CLIENT), *args], env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=60)
 
 
@@ -988,18 +988,33 @@ class Managed:
         return f'[ -n "${cls.MARK}" ] || exit 0; {command}'
 
     @classmethod
-    def client_hooks(cls):
+    def client_hooks(cls, timeout=30, events=("UserPromptSubmit", "StopFailure")):
         client = f"{shlex.quote(sys.executable)} {shlex.quote(str(CLIENT))}"
-        return {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": cls.guarded(f"{client} hook precheck"), "timeout": 30}]}],
-                "StopFailure": [{"hooks": [{"type": "command", "command": cls.guarded(f"{client} hook stop-failure"), "timeout": 30}]}]}
+        sub = {"UserPromptSubmit": "precheck", "StopFailure": "stop-failure"}
+        return {ev: [{"hooks": [dict({"type": "command", "command": cls.guarded(f"{client} hook {sub[ev]}")}, **({"timeout": timeout} if timeout else {}))]}]
+                for ev in events}
 
 
-def managed_session(out, managed, managed_settings, user_hooks=True, capture=False, lock=None, initial="expired"):
+def doctor_observation(client, claude):
+    """`doctor --json` as Claude Code's hook would run it (CLAUDE_CONFIG_DIR set), reading the real managed locations.
+    -> (exit code, "id:Severity,..." sorted, without the always-present server-managed Info; "none" if empty)."""
+    r = client.run("doctor", "--json", settings=claude.settings_file, env={"CLAUDE_CONFIG_DIR": str(claude.config_dir)})
+    try:
+        rows = {f"{f['id']}:{f['severity']}" for f in json.loads(r.stdout)["findings"] if f["id"] != "server-managed"}
+    except (ValueError, KeyError):
+        rows = {"unreadable-report"}
+    return r.returncode, ",".join(sorted(rows)) or "none"
+
+
+def managed_session(out, managed, managed_settings, user_hooks=True, capture=False, lock=None, initial="expired", dropins=None,
+                    preflight=True):
     """One persistent session, two turns, with `managed_settings` in the OS managed-settings file (None: no file).
     The user's settings get the JWT (and the client hooks if user_hooks); capture adds a user-level capture hook.
-    lock: "readonly" (chmod 444) or "immutable" (macOS chflags uchg) on the user's settings.json before the session."""
+    lock: "readonly" (chmod 444) or "immutable" (macOS chflags uchg) on the user's settings.json before the session.
+    dropins: {name: content} for managed-settings.d/. preflight=False sets AIGW_CLAUDE_PREFLIGHT=off for the hooks, so the
+    case shows what Claude Code itself does with a config the preflight would block. Records what `doctor --json` finds."""
     gw, idp = Gateway(out), FakeIdP()
-    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH, Managed.MARK: "1"})
+    claude = Claude(out, gw.url, env={"CLAUDE_CODE_OAUTH_TOKEN": OAUTH, Managed.MARK: "1", **({} if preflight else {"AIGW_CLAUDE_PREFLIGHT": "off"})})
     client = Client(claude.tmp, idp)
     claude.env["AIGW_CLAUDE_AUTH_DIR"] = str(client.dir)
     obs = {}
@@ -1012,14 +1027,15 @@ def managed_session(out, managed, managed_settings, user_hooks=True, capture=Fal
         if capture:
             s.setdefault("hooks", {})["UserPromptSubmit"] = s.get("hooks", {}).get("UserPromptSubmit", []) + [capture_hook(out, "user")]
         claude.write_settings(s)
-        if managed_settings is not None:
-            managed.write(managed_settings)
+        if managed_settings is not None or dropins:
+            managed.write(managed_settings, dropins)
         if lock == "readonly":
             os.chmod(claude.settings_file, 0o444)
         elif lock == "immutable":
             if sys.platform != "darwin":
                 return {"skipped": "macos-only"}
             subprocess.run(["chflags", "uchg", str(claude.settings_file)], check=True)
+        obs["doctor_exit"], obs["doctor"] = doctor_observation(client, claude)
         if lock:
             r = client.run("sync", "--force", settings=claude.settings_file)
             obs["sync_exit"] = r.returncode
@@ -1047,7 +1063,7 @@ def managed_session(out, managed, managed_settings, user_hooks=True, capture=Fal
             subprocess.run(["chflags", "nouchg", str(claude.settings_file)])
         if lock:
             os.chmod(claude.settings_file, 0o600)
-        if managed_settings is not None:
+        if managed_settings is not None or dropins:
             managed.clear()
         claude.cleanup(), gw.close(), idp.close()
     return obs
@@ -1172,14 +1188,24 @@ def scenario_managed(out):
     pk = {"ANTHROPIC_CUSTOM_HEADERS": "x-managed-test: managed"}
     cases = {
         "none": dict(managed_settings=None),
-        "headers": dict(managed_settings={"env": pk}, initial="valid"),
+        "headers": dict(managed_settings={"env": pk}, initial="valid", preflight=False),
         "fleet": dict(managed_settings={"hooks": Managed.client_hooks()}, user_hooks=False),
         "fleetreload": dict(managed_settings={"hooks": Managed.client_hooks()}, user_hooks=False, initial="valid"),
         "hooksonly": dict(managed_settings={"allowManagedHooksOnly": True}, capture=True),
         "hooksonlymanaged": dict(managed_settings={"allowManagedHooksOnly": True, "hooks": Managed.client_hooks()}, user_hooks=False, capture=True),
         "readonly": dict(managed_settings=None, lock="readonly"),
-        "immutable": dict(managed_settings=None, lock="immutable"),
+        "immutable": dict(managed_settings=None, lock="immutable", preflight=False),
         "proxyauth": dict(managed_settings={"proxyAuthHelper": "echo 'Basic cmVwcm86cmVwcm8='"}, initial="valid"),
+        # doctor findings: each case checks what doctor --json reports and, with the preflight on (the default), that the
+        # precheck blocks the prompt with the finding instead of sending it
+        "gateheaders": dict(managed_settings={"env": pk}, initial="valid"),
+        "baseurl": dict(managed_settings={"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:9"}}),
+        "hooknotimeout": dict(managed_settings={"hooks": Managed.client_hooks(timeout=None)}, user_hooks=False),
+        "envconf": dict(managed_settings={"env": {"AIGW_ISSUER": "managed-issuer"}}),
+        "apikeyhelper": dict(managed_settings={"apiKeyHelper": "echo repro-dummy-key"}, initial="valid"),
+        "dropinhooks": dict(managed_settings={"allowManagedHooksOnly": True}, user_hooks=False,
+                            dropins={"10-up.json": {"hooks": Managed.client_hooks(events=("UserPromptSubmit",))},
+                                     "20-sf.json": {"hooks": Managed.client_hooks(events=("StopFailure",))}}),
     }
     s4 = {k: dict(s4=True, **v) for k, v in s4_specs(out, "http://127.0.0.1:0").items()}     # spike S4: see s4_session
     cases = {k: v for k, v in {**cases, **s4}.items() if not only or k in only}

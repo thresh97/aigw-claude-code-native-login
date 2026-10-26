@@ -152,6 +152,12 @@ class Base(unittest.TestCase):
         self.settings_path = self.tmp / "claude" / "settings.json"
         self.config_path = self.tmp / "config.json"
         self.write_config()
+        # never read the real managed locations (/Library, /etc/claude-code, Program Files, the registry, the plist)
+        self.managed = self.tmp / "managed"
+        mock.patch.object(A, "managed_dir", return_value=self.managed).start()
+        mock.patch.object(A, "plist_paths", return_value=[]).start()
+        mock.patch.object(A, "read_registry_policy", return_value=(None, "", "")).start()
+        self.addCleanup(mock.patch.stopall)
 
     def tearDown(self):
         self.idp.close()
@@ -505,6 +511,294 @@ class DaemonTests(Base):
         self.assertEqual(code, 0)
         self.assertIn("wrote a new JWT", err)
         self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+
+
+REAL_REGISTRY_READER = A.read_registry_policy         # Base.setUp patches the module's; one test wants the real one
+
+
+class DoctorTests(Base):
+    """`doctor` and the preflight, against fake managed dirs (see Base.setUp: the real locations are never read)."""
+
+    def managed_file(self, data, name="managed-settings.json", sub=None):
+        d = self.managed / sub if sub else self.managed
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(data if isinstance(data, str) else json.dumps(data))
+
+    def user_settings(self, data):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(json.dumps(data))
+
+    def ours(self, timeout=A.HOOK_TIMEOUT, cmd=None):
+        cmd = cmd or f"{sys.executable} {SCRIPT}"
+        h = lambda sub: [{"hooks": [dict({"type": "command", "command": f"{cmd} hook {sub}"}, **({"timeout": timeout} if timeout else {}))]}]
+        return {"UserPromptSubmit": h("precheck"), "StopFailure": h("stop-failure")}
+
+    def doctor(self, *args, env=None):
+        with mock.patch.dict(os.environ, env or {}):
+            code, out, _ = self.run_cli("doctor", "--json", *args)
+        report = json.loads(out)
+        return code, report, {f["id"]: f["severity"] for f in report["findings"]}
+
+    def clean_user(self):
+        self.user_settings({"env": {"ANTHROPIC_BASE_URL": "http://gw.example"}, "hooks": self.ours()})
+
+    def test_clean_setup_has_no_error_or_warning(self):
+        self.clean_user()
+        code, report, ids = self.doctor(env={"CLAUDE_CONFIG_DIR": str(self.settings_path.parent)})
+        self.assertEqual((code, {k: v for k, v in ids.items() if v != "Info"}), (0, {}))
+        self.assertEqual(ids["server-managed"], "Info")
+        self.assertIn("proxy-listen", [n["id"] for n in report["not_applicable"]])
+
+    def test_managed_custom_headers_is_an_error(self):
+        self.clean_user()
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}})
+        code, _, ids = self.doctor()
+        self.assertEqual((code, ids["managed-custom-headers"]), (1, "Error"))
+
+    def test_hooks_only_without_managed_hooks(self):
+        self.clean_user()
+        self.managed_file({"allowManagedHooksOnly": True})
+        self.assertEqual(self.doctor()[2]["hooks-only-missing"], "Error")
+        self.managed_file({"allowManagedHooksOnly": True, "hooks": self.ours()})
+        ids = self.doctor()[2]
+        self.assertNotIn("hooks-only-missing", ids)
+        self.assertNotIn("hook-missing", ids)
+
+    def test_dropins_count_and_merge_in_name_order(self):
+        self.user_settings({})
+        self.managed_file({"env": {"AIGW_ISSUER": "a"}, "allowManagedHooksOnly": True}, "managed-settings.json")
+        self.managed_file({"hooks": {"UserPromptSubmit": self.ours()["UserPromptSubmit"]}}, "10-a.json", sub="managed-settings.d")
+        self.managed_file({"hooks": {"StopFailure": self.ours()["StopFailure"]}}, "20-b.json", sub="managed-settings.d")
+        self.managed_file({"hooks": {"StopFailure": []}}, ".hidden.json", sub="managed-settings.d")
+        self.managed_file({"env": {"X": "1"}}, "30-c.txt", sub="managed-settings.d")
+        self.assertNotIn("hooks-only-missing", self.doctor()[2])
+        merged, files, errs = A.read_managed_files()
+        self.assertEqual([Path(f).name for f in files], ["managed-settings.json", "10-a.json", "20-b.json"])
+        self.assertEqual(merged["env"], {"AIGW_ISSUER": "a"})
+
+    def test_hook_missing_no_timeout_and_missing_binary(self):
+        self.user_settings({"hooks": {}})
+        self.assertEqual(self.doctor()[2]["hook-missing"], "Warning")
+        self.user_settings({"hooks": self.ours(timeout=None)})
+        self.assertEqual(self.doctor()[2]["hook-no-timeout"], "Warning")
+        self.user_settings({"hooks": self.ours(cmd="/nonexistent/aigw-claude-auth")})
+        self.assertEqual(self.doctor()[2]["hook-binary-missing"], "Error")
+        other = self.tmp / "aigw-claude-auth"
+        other.write_text("#!/bin/sh\n")
+        self.user_settings({"hooks": self.ours(cmd=str(other))})
+        self.assertEqual(self.doctor()[2]["hook-other-binary"], "Warning")
+
+    def test_guarded_managed_hooks_are_recognized(self):
+        # the repro harness ships its managed hooks as `[ -n "$X" ] || exit 0; <python> <client> hook precheck`
+        self.user_settings({})
+        guarded = f'[ -n "$AIGW_REPRO_MANAGED" ] || exit 0; {sys.executable} {SCRIPT}'
+        self.managed_file({"allowManagedHooksOnly": True, "hooks": self.ours(cmd=guarded)})
+        self.assertEqual({k: v for k, v in self.doctor()[2].items() if v != "Info" and k != "settings-file-mismatch"}, {})
+
+    def test_settings_not_replaceable(self):
+        self.clean_user()
+        with mock.patch.object(A, "settings_blocker", return_value="x has the immutable flag"):
+            self.assertEqual(self.doctor()[2]["settings-not-writable"], "Error")
+        self.assertNotIn("settings-not-writable", self.doctor()[2])
+        if sys.platform != "win32" and os.geteuid() != 0:
+            os.chmod(self.settings_path.parent, 0o500)
+            try:
+                self.assertEqual(self.doctor()[2]["settings-not-writable"], "Error")
+            finally:
+                os.chmod(self.settings_path.parent, 0o700)
+            os.chmod(self.settings_path, 0o444)             # a read-only file is fine: the client renames over it
+            self.assertNotIn("settings-not-writable", self.doctor()[2])
+
+    @unittest.skipUnless(sys.platform == "darwin", "chflags")
+    def test_real_immutable_flag_detected(self):
+        self.clean_user()
+        os.chflags(self.settings_path, stat.UF_IMMUTABLE)
+        try:
+            self.assertIn("immutable", A.settings_blocker(self.settings_path))
+        finally:
+            os.chflags(self.settings_path, 0)
+
+    def test_base_url_mismatch(self):
+        self.clean_user()
+        self.managed_file({"env": {"ANTHROPIC_BASE_URL": "http://other.example"}})
+        self.assertEqual(self.doctor()[2]["base-url-mismatch"], "Error")
+        self.managed_file({"env": {"ANTHROPIC_BASE_URL": "http://gw.example/"}})
+        self.assertNotIn("base-url-mismatch", self.doctor()[2])
+
+    def test_proxy_listen_mismatch_when_mode_is_proxy(self):
+        # `mode` and `proxy_listen` are read from the helper config when mode 2 exists; the check is ready for them
+        self.user_settings({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:9999"}})
+        with mock.patch.dict(A.DEFAULTS, {"mode": "file", "proxy_listen": "127.0.0.1:0"}):
+            self.write_config(mode="proxy", proxy_listen="127.0.0.1:8123")
+            self.assertEqual(self.doctor()[2]["proxy-listen"], "Error")
+            self.write_config(mode="proxy", proxy_listen="127.0.0.1:9999")
+            self.assertNotIn("proxy-listen", self.doctor()[2])
+
+    def test_settings_file_mismatch(self):
+        self.clean_user()
+        code, report, ids = self.doctor(env={"CLAUDE_CONFIG_DIR": str(self.tmp / "elsewhere")})
+        self.assertEqual((code, ids["settings-file-mismatch"]), (1, "Error"))
+        self.assertNotIn("settings-file-mismatch", self.doctor(env={"CLAUDE_CONFIG_DIR": str(self.settings_path.parent)})[2])
+
+    def test_block_on_failure_false_against_saas(self):
+        self.write_config(block_on_failure=False)
+        self.user_settings({"env": {"ANTHROPIC_BASE_URL": "https://api.portkey.ai"}})
+        self.assertEqual(self.doctor()[2]["block-on-failure"], "Error")
+        self.user_settings({"env": {"ANTHROPIC_BASE_URL": "https://gw.internal.example"}})
+        self.assertNotIn("block-on-failure", self.doctor()[2])
+
+    def test_sentinel_empty_and_custom(self):
+        self.write_config(sentinel="")
+        code, _, ids = self.doctor()
+        self.assertEqual((code, ids["sentinel-empty"]), (1, "Error"))
+        self.write_config(sentinel="my-sentinel")
+        self.assertEqual(self.doctor()[2]["sentinel-custom"], "Info")
+
+    def test_invalid_config_and_unparseable_documents(self):
+        self.config_path.write_text('{"bogus": 1, "client_id": "x"}')
+        self.assertEqual(self.doctor()[2]["config-invalid"], "Error")
+        self.write_config()
+        self.settings_path.parent.mkdir(parents=True)
+        self.settings_path.write_text("{nope")
+        self.assertEqual(self.doctor()[2]["user-settings-invalid"], "Error")
+        self.managed_file("{nope")
+        self.assertEqual(self.doctor()[2]["managed-unparseable"], "Error")
+
+    def test_credential_override_and_allowed_providers(self):
+        self.clean_user()
+        self.managed_file({"apiKeyHelper": "echo k", "env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "http://gw.example"}})
+        ids = self.doctor()[2]
+        self.assertEqual((ids["credential-override"], ids["allowed-providers"]), ("Warning", "Info"))
+        self.managed_file({"allowedProviders": ["customEndpoint"], "env": {"ANTHROPIC_BASE_URL": "http://gw.example"}})
+        self.assertNotIn("allowed-providers", self.doctor()[2])
+
+    def test_managed_aigw_env_conflicts_with_helper_config(self):
+        self.write_config(issuer="https://idp.example/a", hook_wait=0)
+        self.clean_user()
+        self.managed_file({"env": {"AIGW_ISSUER": "https://idp.example/b", "AIGW_HOOK_WAIT": "9", "AIGW_TYPO": "1", "AIGW_HEADER": "x-portkey-api-key"}})
+        report = self.doctor()[1]
+        got = sorted((f["id"], f["severity"]) for f in report["findings"] if f["id"].startswith("managed-") and f["id"] != "managed-custom-headers")
+        self.assertEqual(got, [("managed-config-conflict", "Error"), ("managed-config-conflict", "Warning"), ("managed-unknown-key", "Warning")])
+
+    def test_jwt_issuer_mismatch_only_without_broker(self):
+        self.write_config(broker_url="", issuer="https://idp.example/a")
+        self.put_header(jwt(time.time() + 3600, iss="https://idp.example/other"))
+        self.assertEqual(self.doctor()[2]["jwt-claims"], "Error")
+        self.put_header(jwt(time.time() + 3600, iss="https://idp.example/a/"))
+        self.assertNotIn("jwt-claims", self.doctor()[2])
+        self.write_config(issuer="https://idp.example/a")                        # a broker is configured: its iss is the broker's
+        self.put_header(jwt(time.time() + 3600, iss="https://broker"))
+        self.assertNotIn("jwt-claims", self.doctor()[2])
+
+    def test_secret_store_finding_when_a_store_exists(self):
+        self.sign_in()
+        self.assertIn("secret-store", [n["id"] for n in self.doctor()[1]["not_applicable"]])
+        with mock.patch.object(A, "secret_store_available", create=True, return_value=True):
+            self.assertEqual(self.doctor()[2]["secret-store"], "Warning")
+
+    def test_managed_sources_rank_plist_over_file_and_hkcu_last(self):
+        self.managed_file({"env": {"FROM": "file"}})
+        with mock.patch.object(A, "read_plist_policy", return_value=({"env": {"FROM": "plist"}}, "", "/p.plist")):
+            info = A.managed_effective()
+            self.assertEqual((info["source"], info["settings"]["env"]["FROM"]), ("plist", "plist"))
+        merge = {"managedSourcesBehavior": "merge", "env": {"FROM": "plist", "A": "1"}}
+        with mock.patch.object(A, "read_plist_policy", return_value=(merge, "", "/p.plist")):
+            self.assertEqual(A.managed_effective()["settings"]["env"], {"FROM": "plist", "A": "1"})
+        (self.managed / "managed-settings.json").unlink()
+        with mock.patch.object(A, "read_registry_policy", side_effect=lambda h: ({"env": {"FROM": h}}, "", h)):
+            self.assertEqual(A.managed_effective()["settings"]["env"]["FROM"], "HKLM")      # HKLM (admin) ranks above HKCU
+        with mock.patch.object(A, "read_registry_policy", side_effect=lambda h: ({"env": {"FROM": h}}, "", h) if h == "HKCU" else (None, "", "")):
+            self.assertEqual(A.managed_effective()["source"], "HKCU")
+
+    def test_policy_control_keys_alone_are_not_a_policy(self):
+        self.managed_file({"managedSourcesBehavior": "merge"})
+        self.assertEqual(A.managed_effective()["source"], "")
+
+    @unittest.skipUnless(sys.platform == "win32", "winreg")
+    def test_registry_read_is_read_only_and_does_not_raise(self):
+        for hive in ("HKLM", "HKCU"):
+            data, err, where = REAL_REGISTRY_READER(hive)
+            self.assertTrue(data is None or isinstance(data, dict))
+
+    def test_report_never_contains_the_token(self):
+        tok = jwt(time.time() + 3600, iss="https://idp.example/x", secretclaim="SECRETVALUE")
+        self.put_header(tok)
+        for args in (("--json",), ()):
+            out = self.run_cli("doctor", *args)[1]
+            self.assertNotIn(tok, out)
+            self.assertNotIn(tok.split(".")[2], out)
+            self.assertNotIn("SECRETVALUE", out)
+        self.assertIn("sha256", self.run_cli("doctor")[1])
+
+    def test_text_report_and_exit_code(self):
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}})
+        code, out, _ = self.run_cli("doctor")
+        self.assertEqual(code, 1)
+        self.assertIn("[Error] managed-custom-headers", out)
+        self.assertIn("fix:", out)
+
+    def test_precheck_blocks_on_a_preflight_error_and_writes_nothing(self):
+        self.sign_in()
+        old = jwt(time.time() - 10)
+        self.put_header(old)
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}})
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        d = json.loads(out)
+        self.assertEqual((code, d["decision"]), (0, "block"))
+        self.assertIn("ANTHROPIC_CUSTOM_HEADERS", d["reason"])
+        self.assertIn("managed-custom-headers", d["reason"])
+        self.assertEqual(self.header(), old, "the precheck wrote despite an Error")
+        self.assertFalse([c for c in self.idp.calls if c[0] == "POST"], "the precheck went to the IdP despite an Error")
+        with mock.patch.dict(os.environ, {"AIGW_CLAUDE_PREFLIGHT": "off"}):         # the bypass the repro harness uses
+            self.run_cli("hook", "precheck", stdin="{}")
+        self.assertNotEqual(self.header(), old)
+
+    def test_precheck_recovers_when_the_error_clears(self):
+        self.sign_in()
+        self.put_header(jwt(time.time() - 10))
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}})
+        self.assertEqual(json.loads(self.run_cli("hook", "precheck", stdin="{}")[1])["decision"], "block")
+        (self.managed / "managed-settings.json").unlink()
+        self.assertEqual(self.run_cli("hook", "precheck", stdin="{}")[:2], (0, ""))
+        self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+
+    def test_notify_only_when_the_findings_hash_changes(self):
+        note = self.tmp / "notes"
+        script = self.tmp / ("notify.py" if sys.platform == "win32" else "notify.sh")
+        if sys.platform == "win32":
+            script.write_text(f'import sys\nopen(r"{note}", "a").write(sys.argv[1] + "\\n")\n')
+            self.write_config(notify=f'"{sys.executable}" "{script}"')
+        else:
+            script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> "{note}"\n')
+            script.chmod(0o755)
+            self.write_config(notify=str(script))
+        self.sign_in()
+        self.put_header(jwt(time.time() + 3600))
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}})
+        for _ in range(3):
+            self.run_cli("hook", "precheck", stdin="{}")
+        self.assertEqual(len(note.read_text().splitlines()), 1)
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}, "apiKeyHelper": "echo k"})    # a new warning: a new hash
+        self.run_cli("hook", "precheck", stdin="{}")
+        self.assertEqual(len(note.read_text().splitlines()), 2)
+        (self.managed / "managed-settings.json").unlink()                           # cleared: one "fixed" note
+        self.run_cli("hook", "precheck", stdin="{}")
+        self.run_cli("hook", "precheck", stdin="{}")
+        lines = note.read_text().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("fixed", lines[-1])
+
+    def test_daemon_skips_the_write_on_an_error(self):
+        self.sign_in()
+        old = jwt(time.time() - 1)
+        self.put_header(old)
+        self.managed_file({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x: y"}})
+        threading.Timer(1.0, lambda: __import__("signal").raise_signal(__import__("signal").SIGTERM)).start()
+        code, _, err = self.run_cli("daemon", "--max-sleep", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("not renewing", err)
+        self.assertEqual(self.header(), old)
+        self.assertFalse([c for c in self.idp.calls if c[0] == "POST"])
 
 
 SCRIPT = str(Path(A.__file__).resolve())

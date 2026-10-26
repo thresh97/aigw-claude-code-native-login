@@ -384,15 +384,15 @@ turn_after_expiry_fast yes
 EOF
   finish; }
 
-describe_managed() { echo "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper; spike S4 (an unknown top-level key, AIGW_* in managed env, managed-settings.d/ drop-ins). Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Drop-in cases also write files in managed-settings.d/ (and remove them, and the directory if it created it). Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 8 min."; }
+describe_managed() { echo "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper; spike S4 (an unknown top-level key, AIGW_* in managed env, managed-settings.d/ drop-ins); doctor findings (what `doctor --json` reports per case, and that the precheck blocks on an Error). Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Drop-in cases also write files in managed-settings.d/ (and remove them, and the directory if it created it). Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 12 min."; }
 scenario_managed() {
   guard managed "writes the machine-wide managed-settings file while it runs"
   sudo -v || { echo "ERROR: managed needs sudo"; exit 2; }
   start managed
   ( while sleep 50; do sudo -n true || exit; done ) & on_exit "kill $! 2>/dev/null"   # keep sudo's timestamp fresh
   harness managed
-  local immutable_exit=1 immutable_wrote=no immutable_turn=blocked
-  [[ $(uname -s) == Darwin ]] || { immutable_exit=missing immutable_wrote=missing immutable_turn=missing; expect "immutable_skipped" "macos-only" "${SEEN[immutable_skipped]:-missing}"; }
+  local immutable_exit=1 immutable_wrote=no immutable_turn=blocked immutable_doctor=settings-not-writable:Error
+  [[ $(uname -s) == Darwin ]] || { immutable_exit=missing immutable_wrote=missing immutable_turn=missing immutable_doctor=missing; expect "immutable_skipped" "macos-only" "${SEEN[immutable_skipped]:-missing}"; }
   expect_seen <<EOF
 # no managed file: the client hooks renew the expired JWT (control)
 none_turn1 ok
@@ -458,6 +458,42 @@ dropinonly_base_url_from_managed yes
 dropinonly_hook_userprompt_ran yes
 dropinonly_hook_stopfailure_ran yes
 dropinonly_env_userprompt AIGW_ONLY_DROPIN=yes
+# doctor (the preflight): what `doctor --json` reports for each case, in "id:Severity,..." form (server-managed Info left out)
+none_doctor none
+none_doctor_exit 0
+headers_doctor managed-custom-headers:Error
+headers_doctor_exit 1
+fleet_doctor none
+fleetreload_doctor none
+hooksonly_doctor hooks-only-missing:Error
+hooksonlymanaged_doctor none
+readonly_doctor none
+immutable_doctor $immutable_doctor
+proxyauth_doctor none
+# the preflight is on: the precheck blocks the prompt with the finding, nothing reaches the gateway
+gateheaders_doctor managed-custom-headers:Error
+gateheaders_turn1 blocked
+gateheaders_block_message yes
+gateheaders_turn1_jwt none
+# a managed ANTHROPIC_BASE_URL that differs from the user's (and no allowedProviders)
+baseurl_doctor allowed-providers:Info,base-url-mismatch:Error
+baseurl_turn1 blocked
+baseurl_block_message yes
+# managed hooks without a timeout: a warning only; the hooks run and renew the expired JWT
+hooknotimeout_doctor hook-no-timeout:Warning
+hooknotimeout_turn1 ok
+hooknotimeout_turn1_jwt renewed
+# AIGW_ISSUER in managed env that differs from the helper config's issuer
+envconf_doctor managed-config-conflict:Error
+envconf_turn1 blocked
+envconf_block_message yes
+# a managed apiKeyHelper: a warning (what Claude Code sends then is not asserted)
+apikeyhelper_doctor credential-override:Warning
+# allowManagedHooksOnly with the hooks split over two managed-settings.d files: doctor merges them; user hooks don't run, the managed ones do
+dropinhooks_doctor none
+dropinhooks_user_hook_ran no
+dropinhooks_turn1 ok
+dropinhooks_turn1_jwt renewed
 EOF
   finish; }
 
