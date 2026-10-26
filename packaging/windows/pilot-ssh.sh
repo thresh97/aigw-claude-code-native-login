@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Mac-side wrapper for packaging/windows/pilot-vm.ps1 (emulated pilot on a disposable Windows VM reached by ssh).
+# Drives packaging/windows/pilot-vm.ps1 over ssh from any machine with bash (emulated pilot on a disposable Windows VM).
 # No tenant data here: the fleet file is passed in, the host is an ssh alias.
 #
-#   pilot-mac.sh push    <file|proxy> <fleet.json>     build the Windows package and copy it and the driver to the VM
-#   pilot-mac.sh phase   <file|proxy> <phase> [user]   run one phase (install, check, concurrent, uninstall, cleanup)
-#   pilot-mac.sh logon   <file|proxy> <user>           logon-prep, wait for the reboot, wait for ssh, then check
+#   pilot-ssh.sh push    <file|proxy> <fleet.json>     build the Windows package and copy it and the driver to the VM
+#   pilot-ssh.sh phase   <file|proxy> <phase> [user]   run one phase (install, check, concurrent, uninstall, cleanup)
+#   pilot-ssh.sh logon   <file|proxy> <user>           logon-prep, wait for the reboot, wait for ssh, then check
 #
 # Env: PILOT_HOST (required: an ssh host or alias for the disposable VM), PILOT_WORK (default C:\aigw-pilot), PILOT_OUT (default a temp dir for the build).
 set -euo pipefail

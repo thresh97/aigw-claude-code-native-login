@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Emulated pilot of the Windows fleet package on a disposable test VM (run elevated, Windows PowerShell 5.1).
-  Driven phase by phase from packaging/windows/pilot-mac.sh; each phase is one call and prints CHECK lines.
+  Driven phase by phase from packaging/windows/pilot-ssh.sh; each phase is one call and prints CHECK lines.
 .DESCRIPTION
   DISPOSABLE VM ONLY. It installs into the real C:\Program Files, creates two local users (pilot1, pilot2) with random
   passwords that exist only in memory and, briefly, in the Winlogon autologon values, and reboots the machine to get a

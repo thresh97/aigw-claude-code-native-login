@@ -3,10 +3,10 @@
 # second local user (logged in by hand with fast user switching), then uninstall. A person runs this, from a
 # terminal that is not a Claude Code session: the managed drop-in reroutes every Claude Code on the machine.
 #
-#   pilot-mac.sh install <fleet.json> [--with-user]   build + `sudo installer`; --with-user also creates the standard
+#   pilot.sh install <fleet.json> [--with-user]   build + `sudo installer`; --with-user also creates the standard
 #                                                     user `aigwpilot`
-#   pilot-mac.sh check                                checks for the console user and aigwpilot (if logged in)
-#   pilot-mac.sh uninstall                            purge the users the pilot touched, uninstall, delete aigwpilot
+#   pilot.sh check                                checks for the console user and aigwpilot (if logged in)
+#   pilot.sh uninstall                            purge the users the pilot touched, uninstall, delete aigwpilot
 #
 # A personal install of a user is taken over by the fleet at that user's login (packaging/README.md, "A personal install
 # on the same machine"): the pilot exercises that, it doesn't set one aside or restore it.
@@ -37,7 +37,7 @@ json_field() { /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.ar
 # ---------------------------------------------------------------------------------------------------------- install
 cmd_install() {
     local fleet="${1:-}" with_user=0
-    [ -n "$fleet" ] && [ -f "$fleet" ] || die "usage: pilot-mac.sh install <fleet.json> [--with-user]"
+    [ -n "$fleet" ] && [ -f "$fleet" ] || die "usage: pilot.sh install <fleet.json> [--with-user]"
     [ "${2:-}" = "--with-user" ] && with_user=1
     [ -n "${CLAUDECODE:-}" ] && die "this is a Claude Code session; quit it and run from a plain terminal"
     [ -f "$STATE" ] && die "a pilot is already installed ($STATE); run uninstall first"
