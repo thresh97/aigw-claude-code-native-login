@@ -5,16 +5,20 @@ Guidance for coding agents running or changing this repo. Read README.md first.
 ## What running this touches
 
 - **Client install** (README 1.3, on a user's machine): `~/.local/bin/aigw-claude-auth`, `~/.config/aigw-claude-auth/`
-  (`config.json`, `state.json` with the IdP refresh token, mode 600; while a hook-started sign-in is pending,
+  (`config.json`, `state.json`, mode 600; Windows `%APPDATA%\aigw-claude-auth\`), the IdP refresh token in the OS credential store
+  (macOS Keychain, Secret Service, Windows Credential Manager; `state.json` when `secret_store` is `file` or no store works; while a hook-started sign-in is pending,
   `hook-login.json` and its `hook-login.log`), and edits to Claude Code's `settings.json`
   (`ANTHROPIC_BASE_URL`, the JWT in `env.ANTHROPIC_CUSTOM_HEADERS`, two hook entries). Optionally a systemd user unit or
-  launchd agent.
+  launchd agent, or (Windows) a Task Scheduler task from `task install`.
 - **Gateway** (README 1.1, 1.2, manual): a passthrough config in a workspace, and optionally ALB listener rules in front
   of the gateway. Both are shared infrastructure: get the operator's go-ahead first.
 - **Offline scenarios** (`unit headers errors precheck stopfailure proxy`; `run.sh` or `run.py`): local only. Throwaway HOME, config dir and fake
   IdP under the run's results dir; a mock gateway on 127.0.0.1. Dummy credentials only. `proxy` also starts
   `repro/proxy_prototype.py` on 127.0.0.1 (its token file is a fake JWT in a throwaway dir) and a mock gateway listening
   on a Unix socket in a throwaway dir.
+- **`keycloak`**: local only, needs Docker. Starts `quay.io/keycloak/keycloak:26.4.7` on 127.0.0.1 (container `aigw-kc*`,
+  removed with its volumes afterwards), creates a test user with a random password kept in memory, and drives the
+  client's sign-ins against it with `secret_store: file` (never the real Keychain). Mock gateway on 127.0.0.1.
 - **`winprobe`** (`repro/winprobe.py`, spike S7): local only, no sudo or `--yes`. Throwaway HOME, USERPROFILE, APPDATA and
   Claude config dir under its `--out` dir, mock gateway on 127.0.0.1, dummy credentials. On Windows it also launches
   `powershell.exe` toasts (no registry or settings changes). Setup: `repro/WINDOWS.md`.
@@ -56,10 +60,11 @@ Guidance for coding agents running or changing this repo. Read README.md first.
 
 ## Changing the code
 
-- `client/aigw_claude_auth.py` is one file, Python 3.8+, **standard library only**, macOS and Linux. Users copy it as
+- `client/aigw_claude_auth.py` is one file, Python 3.8+, **standard library only**, macOS, Linux and native Windows. Users copy it as
   is; don't split it or add dependencies. Bump `VERSION` when behavior changes.
-- Run `python3 -m unittest -v client/test_aigw_claude_auth.py` (about 20 s, the `unit` scenario). New behavior needs a
-  test against the `FakeIdP` there.
+- Run `python3 -m unittest -v client/test_aigw_claude_auth.py` (about a minute, the `unit` scenario). New behavior needs a
+  test against the `FakeIdP` there. Tests set `secret_store: file`; real credential-store tests use only a throwaway
+  keychain file (macOS) or `aigw-claude-auth-test-*` credentials (Windows), removed afterwards.
 - Keep these in step:
   - config keys: `DEFAULTS` in the client, `client/config.example.json`, the README's config table;
   - commands and flags: the client's argparse, the README's client reference;
