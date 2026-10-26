@@ -96,8 +96,15 @@ disable the entry; macOS `uninstall.sh` boots the agent out).
 - Linux: `packaging/linux/container-test-deb.sh` (debian:12) and `container-test-rpm.sh` (rockylinux:9) inside `docker run --rm`: files land, the unit is enabled globally, `--version` and `doctor --json` run, a fresh user's first run writes only the JWT line, removal leaves nothing.
 - Windows: `-WhatIf` writes nothing; an install into an alternate `-Root` (task registration skipped), `task.xml` parses, the client, `doctor` and the launcher run from it, and the uninstall into the same root removes everything.
 
-Not covered: real privileged installs, LaunchAgent/systemd/Task Scheduler actually starting at login, the group-principal task
-registering and firing, a real MDM push, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
+- Emulated pilot (Windows, 2026-10-26; Windows 11 Pro VM, Python 3.13 for all users, driver `windows/pilot-vm.ps1` + `windows/pilot-mac.sh`; disposable VM only, no IdP sign-in, no request to the gateway), file mode and proxy mode, each a full cycle:
+  - Elevated install into the real `C:\Program Files`: files land, the drop-in is valid JSON without `ANTHROPIC_CUSTOM_HEADERS`, no `HKLM\SOFTWARE\Policies\ClaudeCode` key, the task registers with principal `GroupId=Users`, `LogonType=Group`, `RunLevel=Limited`; the install folder and the drop-in are not writable by Users.
+  - Two standard local users each got a real interactive logon (Winlogon autologon for one logon, then reboot; the autologon values were removed right after, `DefaultPassword` verified absent). Each time the task fired at logon (`LastRunTime` after boot, `LastTaskResult` 0x41301 = running) and the daemon ran as that user. The launcher's first run wrote only the sentinel `x-portkey-api-key` line (file mode) or the loopback `ANTHROPIC_BASE_URL` plus the user's own `x-aigw-local` secret and no JWT (proxy mode). `doctor --json` run in the user's own session: 0 errors, 0 warnings, one Info (`server-managed`), managed source `file`.
+  - Proxy mode: the two users' secrets differ (43 characters each, different hashes); user 1's is unchanged after a third logon; the fixed port 127.0.0.1:18787 was free after each reboot and bound by the logged-on user's proxy. With one user's proxy running, a second launcher (started as the admin with redirected state, see below) failed with `cannot listen on 127.0.0.1:18787 ... an aigw-claude-auth proxy is running there but does not accept this user's secret`; the first proxy kept the port. Starting the task by hand while an instance runs is refused (`0x800710E0`), the effect of `MultipleInstancesPolicy IgnoreNew`.
+  - Uninstall: task, drop-in, install folder (and the empty `ClaudeCode` folders) gone, no daemon left. Per user, as documented: the user who ran `purge-user` has no header line and no state folder (the log folder stays while the running daemon holds `daemon.log`); the other user keeps the state folder, the log folder and the inert header line.
+  - Bugs found and fixed: the installer's `PayloadDir` default used `$PSScriptRoot`, which is empty under `powershell -File` (so the installer did not run that way); `purge-user` now also removes the Windows log folder.
+
+Not covered: a real MDM/Intune push, LaunchAgent/systemd actually starting at login, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
+Not covered on Windows: two users logged on at the same time (the VM had one autologon, `Start-Process -Credential` from ssh fails with 0xC0000142 and a standard user may not run password tasks), so whether the second user's At-logon trigger is dropped by `IgnoreNew` while the first user's daemon runs is inferred from the manual start above, not observed; in proxy mode that user would have no proxy (the fixed port is taken anyway). A user signing in to the IdP, renewal, and Claude Code itself against the gateway were not run.
 
 ## What the emulated pilot needs
 
@@ -105,7 +112,6 @@ registering and firing, a real MDM push, signing, a logged-in-user `launchctl bo
 - macOS: sudo on a disposable user account or machine; `sudo installer -pkg ... -target /`, then log in as a second user to see the
   agent start; `uninstall.sh --purge-users` afterwards. Note the managed file applies to every Claude Code on the machine.
 - Linux: a VM or container with systemd (`systemd --user` sessions) for `systemctl --user status` after login.
-- Windows: elevated run of the installer on the VM, then logon as a second local user to confirm the group-principal task fires
-  (`Get-ScheduledTask`, `Get-ScheduledTaskInfo`); registration of that XML has not been tried yet.
+- Windows: done for one VM (see "What was tested"); `windows/pilot-mac.sh` repeats it. Still open: two simultaneous sessions (fast user switching or a terminal server) and a real sign-in.
 - Pilot checks: `doctor` clean (hooks resolve, no `managed-config-conflict`), first prompt shows the sign-in, a renewal, proxy mode
   with two users getting different secrets, uninstall leaves no managed file.

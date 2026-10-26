@@ -273,7 +273,11 @@ function Phase-Check {
         Say ("  user settings env keys: " + ($f.env -join ','))
         Say ("  user settings header lines: " + (Header-Summary $f.header))
         Check "user-settings-no-hooks:$User" (-not $f.hooks) 'hooks come from managed settings'
-        Check "user-settings-no-base-url:$User" ($f.env -notcontains 'ANTHROPIC_BASE_URL')
+        if ($Mode -eq 'file') { Check "user-settings-no-base-url:$User" ($f.env -notcontains 'ANTHROPIC_BASE_URL') 'the base URL comes from managed settings' }
+        else {
+            $bu = (Get-Content -LiteralPath $f.settings -Raw | ConvertFrom-Json).env.ANTHROPIC_BASE_URL
+            Check "user-settings-base-url-is-the-proxy:$User" ($bu -eq "http://127.0.0.1:$ProxyPort") 'proxy mode also writes the loopback address'
+        }
         $names = @($f.header | ForEach-Object { ($_ -split ':', 2)[0].Trim().ToLower() })
         if ($Mode -eq 'file') {
             Check "file-mode-only-portkey-sentinel:$User" ($names.Count -eq 1 -and $names[0] -eq 'x-portkey-api-key' -and -not ($f.header[0] -like '*eyJ*'))
