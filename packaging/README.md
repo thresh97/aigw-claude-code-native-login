@@ -163,9 +163,11 @@ Machines where several users are logged in at the same time (terminal servers, f
   then: sentinel, `doctor` 0 errors, no `personal-install`. (A `check` run within a second of the install still saw the personal JWT and the
   `personal-install` Warning: it ran before the agent's first run.) The first `claude` prompt was blocked with a PKCE sign-in, the browser
   sign-in to Okta succeeded ("Signed in to the AI gateway; send your prompt again"), and Claude Code then worked through the gateway with the
-  fleet's Okta JWT and the user's claude.ai login.
+  fleet's Okta JWT and the user's claude.ai login. A Claude Code `/logout` + `/login` (a new claude.ai login) kept working. Then proxy
+  mode (uninstall, install with the proxy fleet file, sign in again): the user's settings hold only the loopback base URL and the
+  `x-aigw-local` secret, the proxy listens on 127.0.0.1:18787 as the user with the Okta JWT in memory, and Claude Code works through it.
 
-Not covered: a real MDM/Intune push, the macOS LaunchAgent starting at a real login and proxy mode on macOS, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
+Not covered: a real MDM/Intune push, the macOS LaunchAgent starting at a real macOS login, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
 Not covered on Windows: two users logged on at the same time (the VM had one autologon, `Start-Process -Credential` from ssh fails with 0xC0000142 and a standard user may not run password tasks), so whether the second user's At-logon trigger is dropped by `IgnoreNew` while the first user's daemon runs is inferred from the manual start above, not observed; in proxy mode that user would have no proxy (the fixed port is taken anyway). A user signing in to the IdP, renewal, and Claude Code itself against the gateway were not run.
 
 ## What the emulated pilot needs
