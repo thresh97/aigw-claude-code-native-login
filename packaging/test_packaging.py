@@ -155,6 +155,7 @@ class Generator(unittest.TestCase):
         self.assertIn(f"ExecStart=/usr/bin/python3 {paths['launcher']} daemon", unit)
         self.assertIn("WantedBy=default.target", unit)
         self.assertTrue(paths["bgstart"].startswith("/usr/lib/systemd/user/"))
+        self.assertTrue(paths["bgstart"].endswith("/aigw-claude-auth-fleet.service"))   # a personal aigw-claude-auth.service can't shadow it
 
     def test_windows_task_is_the_clients_xml_for_the_users_group(self):
         files, paths = build.render(fleet(), "windows")
@@ -206,10 +207,12 @@ class Launcher(unittest.TestCase):
         (self.fleet_dir / "config.json").write_text(json.dumps(cfg))
 
     def run_launcher(self):
+        with mock.patch.object(aigw_launch, "HERE", str(self.fleet_dir)):
+            return self.run_launcher_with(aigw_launch.load_client())
+
+    def run_launcher_with(self, real):
         """The launcher's main, with the daemon replaced by a recorder (the real one never returns)."""
         calls = []
-        with mock.patch.object(aigw_launch, "HERE", str(self.fleet_dir)):
-            real = aigw_launch.load_client()
 
         class Wrapped:
             def __getattr__(self, n):
@@ -248,6 +251,21 @@ class Launcher(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AIGW_CLAUDE_AUTH_DIR": str(other / "cfg"), "AIGW_CLAUDE_SETTINGS": str(other / "s.json")}):
             self.run_launcher()
             self.assertNotEqual(json.loads((other / "s.json").read_text())["env"]["ANTHROPIC_CUSTOM_HEADERS"], lines)
+
+    def test_first_run_moves_a_personal_install_aside(self):
+        self.config(fleet=True)
+        cfg = self.home / "cfg"
+        cfg.mkdir(parents=True)
+        (cfg / "config.json").write_text(json.dumps({"issuer": "https://other.example", "client_id": "p", "secret_store": "file"}))
+        (cfg / "state.json").write_text(json.dumps({"refresh_token": "personal"}))
+        with mock.patch.object(aigw_launch, "HERE", str(self.fleet_dir)):
+            real = aigw_launch.load_client()
+        with mock.patch.object(real, "personal_entry", return_value=None):
+            rc, calls = self.run_launcher_with(real)
+        self.assertEqual(calls, [["install", "--no-hooks"], ["daemon"]])
+        backup, = self.home.glob("cfg.personal-*")
+        self.assertEqual(sorted(p.name for p in backup.iterdir()), ["config.json", "state.json"])
+        self.assertFalse((cfg / "config.json").exists())
 
     def test_broken_first_run_still_starts_the_daemon(self):
         self.config(mode="nonsense")

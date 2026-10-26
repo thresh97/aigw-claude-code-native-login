@@ -7,7 +7,7 @@ step() { echo "== $*"; }
 fail() { echo "FAIL: $*"; exit 1; }
 DIR=/usr/lib/aigw-claude-auth
 MANAGED=/etc/claude-code/managed-settings.d/50-aigw-claude-auth.json
-UNIT=aigw-claude-auth.service
+UNIT=aigw-claude-auth-fleet.service
 
 step "install"
 apt-get update -qq >/dev/null

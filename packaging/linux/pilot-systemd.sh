@@ -20,7 +20,7 @@ if [ "$INSIDE" = 1 ]; then
     NAME=aigw-claude-auth
     DIR=/usr/lib/$NAME
     MANAGED=/etc/claude-code/managed-settings.d/50-$NAME.json
-    UNIT=$NAME.service
+    UNIT=$NAME-fleet.service
     FAILS=0
     step() { echo; echo "== $*"; }
     ok() { echo "ok   $*"; }

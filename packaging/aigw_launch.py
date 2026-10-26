@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Per-user launcher for the fleet packages (standard library only; sits next to aigw_claude_auth.py and config.json).
 
-  aigw_launch.py [daemon]   what the LaunchAgent, systemd user unit and Windows logon task run. Runs
-                            `install --no-hooks` for the signed-in user (their JWT line, or in proxy mode the proxy
+  aigw_launch.py [daemon]   what the LaunchAgent, systemd user unit and Windows logon task run. Moves a personal
+                            install of the user aside (the fleet replaces it), runs `install --no-hooks` for the signed-in user (their JWT line, or in proxy mode the proxy
                             address and their own secret: idempotent), then the daemon, both with the fleet's
                             config.json. The managed settings already carry the hooks and the base URL.
   aigw_launch.py purge-user undo the per-user part for the user running it: forget the refresh token, remove our
@@ -66,6 +66,12 @@ def main(argv):
     base = ["--config", os.path.join(HERE, "config.json")]
     if cmd == "purge-user":
         return purge_user(client, base)
+    try:
+        cfg = client.load_config(client.Path(base[1]))
+        for line in client.take_over_personal(cfg, client.State(client.config_dir()), client.Settings(client.default_settings_path(), cfg["header"])):
+            log(line)
+    except Exception as e:      # the fleet must still start; doctor reports a personal install that is left
+        log(f"moving a personal install aside failed: {e}")
     try:
         rc = client.main(base + ["install", "--no-hooks"])
         log(f"first-run install --no-hooks exit {rc}")

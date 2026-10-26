@@ -4,7 +4,7 @@ set -eu
 fail() { echo "FAIL: $*"; exit 1; }
 DIR=/usr/lib/aigw-claude-auth
 MANAGED=/etc/claude-code/managed-settings.d/50-aigw-claude-auth.json
-UNIT=aigw-claude-auth.service
+UNIT=aigw-claude-auth-fleet.service
 dnf -q -y install python3 /pkg/*.rpm >/dev/null 2>&1 || dnf -y install python3 /pkg/*.rpm
 for f in $DIR/aigw_claude_auth.py $DIR/aigw_launch.py $DIR/config.json $MANAGED /usr/lib/systemd/user/$UNIT; do
     [ -f "$f" ] || fail "missing $f"; echo "ok $f"

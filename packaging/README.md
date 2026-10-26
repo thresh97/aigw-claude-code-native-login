@@ -36,7 +36,7 @@ checked by `load_config()` and the Windows task is the client's `task_xml()` cha
 | --- | --- | --- | --- |
 | Client, launcher, `config.json` | `/usr/local/libexec/aigw-claude-auth/` | `/usr/lib/aigw-claude-auth/` | `C:\Program Files\aigw-claude-auth\` |
 | Managed settings (drop-in) | `/Library/Application Support/ClaudeCode/managed-settings.d/50-<name>.json` | `/etc/claude-code/managed-settings.d/50-<name>.json` | `C:\Program Files\ClaudeCode\managed-settings.d\50-<name>.json` |
-| Background start for all users | `/Library/LaunchAgents/<name>.fleet.plist` (loads at each login; the postinstall also starts it for the console user) | `/usr/lib/systemd/user/<name>.service`, `systemctl --global enable` | Scheduled task `aigw-claude-auth-fleet`: at log on of any member of the local Users group, runs as that user (`task.xml`) |
+| Background start for all users | `/Library/LaunchAgents/<name>.fleet.plist` (loads at each login; the postinstall also starts it for the console user) | `/usr/lib/systemd/user/<name>-fleet.service`, `systemctl --global enable` | Scheduled task `aigw-claude-auth-fleet`: at log on of any member of the local Users group, runs as that user (`task.xml`) |
 | Uninstall | `/usr/local/libexec/aigw-claude-auth/uninstall.sh [--purge-users]` | `apt remove` / `dnf remove` | `Uninstall-AigwClaudeAuth.ps1 [-PurgeCurrentUser]` |
 
 Managed settings: base URL, the two hooks (command = the packaged client with `--config <install dir>/config.json`),
@@ -70,9 +70,11 @@ code (nothing to run); otherwise `aigw-claude-auth login` in a terminal. After t
 
 macOS needs the Command Line Tools for `/usr/bin/python3`; Linux packages depend on `python3 >= 3.8`; Windows has no Python,
 so the installer refuses to run when the `python.windows` path is missing. A fleet should ship a bundled interpreter (or
-one compiled binary) and point `python` at it. This is the main open item before a real rollout.
+one compiled binary) and point `python` at it. Out of scope for now: the pilot uses the system Python (Windows: Python installed for all users).
 
 ## Signing
+
+Out of scope for now (the pilot installs unsigned packages). When needed:
 
 - macOS: `--sign "<Developer ID Installer identity>"` is passed to `productbuild --sign`; notarize with
   `xcrun notarytool submit ... --wait` and `xcrun stapler staple`. Unsigned pkgs need a right-click open or an MDM push.
@@ -80,12 +82,29 @@ one compiled binary) and point `python` at it. This is the main open item before
 - Windows: `Set-AuthenticodeSignature` on the two scripts and the Python files you ship; WiX (MSI) is a follow-up so
   Intune/SCCM can use native install detection.
 
+## A personal install on the same machine
+
+The fleet replaces a personal install (README 1.3); the two are not meant to run side by side. Both would use the same state
+folder (the fleet would pick up the personal refresh token, maybe from another IdP) and both daemons would write the JWT. The
+fleet's config carries `"fleet": true`, and at each login the launcher, before its first run, moves a personal install of that
+user aside (client 1.4.1, `take_over_personal`):
+
+- stops and removes the personal background entry: `~/Library/LaunchAgents/aigw-claude-auth.plist`, `~/.config/systemd/user/aigw-claude-auth.service`
+  (moved into the backup folder), or the Task Scheduler task `aigw-claude-auth`;
+- forgets the personal refresh token in the OS credential store and moves the personal `config.json`, `state.json` etc. to
+  `~/.config/aigw-claude-auth.personal-<time>` (Windows `%APPDATA%\aigw-claude-auth.personal-<time>`): renamed, not deleted;
+- removes our hook entries from the user's `settings.json` (the managed settings carry the fleet's).
+
+The user then signs in once through the fleet. The personal client file (`~/.local/bin/aigw-claude-auth`) stays; it does nothing
+without its entry and config. `doctor` reports a personal install that is still there as Warning `personal-install`. The
+Linux fleet unit is `<name>-fleet.service` so that a personal `aigw-claude-auth.service` in `~/.config/systemd/user` can't shadow it.
+
 ## Uninstall and what it leaves
 
 All three remove their files, the background entry and the drop-in. Per-user data (refresh token, `~/.config/aigw-claude-auth`,
 header lines in `~/.claude/settings.json`) is not touched by default because the installer cannot act as every user:
 `python3 <install dir>/aigw_launch.py purge-user` run as a user (macOS `uninstall.sh --purge-users` does it for every local
-user via `sudo -u`; Windows `-PurgeCurrentUser` for the caller) logs out, removes our header lines and deletes the state folder.
+user with UID 500 or above via `sudo -u`, including admin accounts; Windows `-PurgeCurrentUser` for the caller) logs out, removes our header lines and deletes the state folder.
 Without the managed base URL and hooks, the leftovers are inert. Running daemons stop at the next logout (Linux/Windows
 disable the entry; macOS `uninstall.sh` boots the agent out).
 
