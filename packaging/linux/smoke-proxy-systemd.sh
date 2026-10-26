@@ -118,6 +118,7 @@ EOF
 
     step "5. install --linger enables lingering (off after a plain install); teardown removes the service"
     [ "$(loginctl show-user $U -p Linger --value)" = no ] && ok "lingering is off after a plain install" || bad "lingering is off after a plain install"
+    cli doctor 2>&1 | grep -q "\[Warning\] proxy-linger" && ok "doctor warns that lingering is off in a headless session" || bad "doctor warns that lingering is off in a headless session"
     cli install --linger > /tmp/linger.out 2>&1 && ok "install --linger exits 0" || bad "install --linger exits 0"
     grep -i "linger" /tmp/linger.out | cut -c1-230 | sed 's/^/   /'
     if [ "$(loginctl show-user $U -p Linger --value)" = yes ]; then
@@ -128,6 +129,7 @@ EOF
         grep -q "warning: could not enable lingering" /tmp/linger.out && grep -q "sudo loginctl enable-linger" /tmp/linger.out && ok "a refusal is a warning that prints the sudo fallback" || bad "a refusal is a warning that prints the sudo fallback"
         loginctl enable-linger $U && [ "$(loginctl show-user $U -p Linger --value)" = yes ] && ok "the printed fallback (as root) turns lingering on" || bad "the printed fallback turns lingering on"
     fi
+    cli doctor 2>&1 | grep -q "proxy-linger" && bad "doctor stops warning once lingering is on" || ok "doctor stops warning once lingering is on"
     [ "$(uctl is-active aigw-claude-auth 2>/dev/null)" = active ] && ok "still active after reinstall" || bad "still active after reinstall"
     uctl disable --now aigw-claude-auth >/dev/null 2>&1; rm -f $UNIT; uctl daemon-reload
     sleep 1

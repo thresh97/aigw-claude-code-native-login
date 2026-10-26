@@ -74,7 +74,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -2766,6 +2766,16 @@ def service_python():
     return best[2] if best else None
 
 
+def systemd_unit_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or home_dir() / ".config") / "systemd" / "user" / f"{TASK_NAME}.service"
+
+
+def linger_state():
+    """'yes' or 'no' from loginctl for this user; None when it can't be read (no logind, no systemd)."""
+    ok, out = service_run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"])
+    return out.strip() if ok and out.strip() in ("yes", "no") else None
+
+
 def linger_note(run, linger):
     """The lingering part of the Linux service message; with linger, turn it on first."""
     if not linger:
@@ -2812,8 +2822,7 @@ def service_install(cfg, platform=None, run=None, linger=False):
                 return False, f"wrote {path}, but launchctl could not start it ({out}); it starts at your next desktop login"
             return True, f"launch agent {path} runs {python} (starts at login, restarted after a crash)"
         if platform.startswith("linux"):
-            base = Path(os.environ.get("XDG_CONFIG_HOME") or home_dir() / ".config")
-            path = base / "systemd" / "user" / f"{TASK_NAME}.service"
+            path = systemd_unit_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("[Unit]\nDescription=aigw-claude-auth daemon (local proxy in proxy mode)\nAfter=network-online.target\n\n"
                             f"[Service]\nExecStart={shlex.quote(python)} {shlex.quote(script)} daemon\n"
@@ -3454,6 +3463,26 @@ def chk_secret_store(ctx):
     if ctx["state"].load().get("refresh_token") and make_store(ctx["cfg"], ctx["state"].dir) is not None:
         return [finding("secret-store", "Warning", "the refresh token is in state.json although an OS credential store is available (secret_store: auto)",
                         "run `aigw-claude-auth login` once to migrate it")]
+
+
+@check("proxy-linger")
+def chk_proxy_linger(ctx):
+    """Proxy mode on Linux under a systemd user unit: without lingering the proxy stops when the last login session ends. That
+    only hurts when Claude Code can outlive the login (SSH, tmux, a headless machine), so only those sessions are told."""
+    if ctx["cfg"]["mode"] != "proxy" or not sys.platform.startswith("linux"):
+        ctx["na"]["proxy-linger"] = "mode is file" if ctx["cfg"]["mode"] != "proxy" else "not Linux"
+        return
+    if not systemd_unit_path().exists():
+        ctx["na"]["proxy-linger"] = "no systemd user unit from install"
+        return
+    if linger_state() != "no":
+        return                                              # on, or unreadable: nothing to say
+    sig = environment_signals()
+    if sig["ssh"] or not sig["desktop"]:
+        return [finding("proxy-linger", "Warning", "the proxy runs as a systemd user unit but lingering is off, and this looks like an SSH or headless session: "
+                        "the proxy stops when your last login session ends, and Claude Code's requests then fail with connection errors",
+                        "aigw-claude-auth install --linger (or `sudo loginctl enable-linger $USER`); a desktop does not need it")]
+    ctx["na"]["proxy-linger"] = "lingering is off, which is fine in a desktop session"
 
 
 @check("personal-install")

@@ -2897,6 +2897,46 @@ class ServicePythonTests(unittest.TestCase):
         self.assertIsNone(self.pick(v, venv=True, usable=[FAKE_EXE]))
 
 
+class ProxyLingerDoctorTests(unittest.TestCase):
+    """The proxy-linger finding: proxy mode, Linux, a systemd user unit, lingering off, and a session that can outlive the login."""
+
+    def check(self, mode="proxy", platform="linux", unit=True, linger="no", ssh=False, desktop=False):
+        tmp = Path(tempfile.mkdtemp(prefix="aigw-linger-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / "aigw-claude-auth.service"
+        if unit:
+            path.write_text("[Service]\n")
+        sig = dict(HEADLESS, ssh=ssh, desktop=desktop)
+        ctx = {"cfg": {"mode": mode}, "na": {}}
+        with mock.patch.object(A.sys, "platform", platform), mock.patch.object(A, "systemd_unit_path", return_value=path), \
+             mock.patch.object(A, "linger_state", return_value=linger), mock.patch.object(A, "environment_signals", return_value=sig):
+            return A.chk_proxy_linger(ctx), ctx["na"].get("proxy-linger", "")
+
+    def test_ssh_or_headless_with_lingering_off_gets_a_warning_with_the_fix(self):
+        for kw in ({"ssh": True, "desktop": True}, {"ssh": False, "desktop": False}):
+            with self.subTest(**kw):
+                found, _ = self.check(**kw)
+                self.assertEqual([f["severity"] for f in found], ["Warning"])
+                self.assertEqual(found[0]["id"], "proxy-linger")
+                self.assertIn("install --linger", found[0]["fix"])
+                self.assertIn("enable-linger", found[0]["fix"])
+
+    def test_a_desktop_session_is_told_it_is_fine(self):
+        found, na = self.check(desktop=True)
+        self.assertFalse(found)
+        self.assertIn("fine in a desktop session", na)
+
+    def test_lingering_on_or_unreadable_says_nothing(self):
+        for linger in ("yes", None):
+            with self.subTest(linger=linger):
+                self.assertEqual(self.check(linger=linger, ssh=True), (None, ""))
+
+    def test_not_applicable_says_why(self):
+        self.assertEqual(self.check(mode="file", ssh=True), (None, "mode is file"))
+        self.assertEqual(self.check(platform="darwin", ssh=True), (None, "not Linux"))
+        self.assertEqual(self.check(unit=False, ssh=True), (None, "no systemd user unit from install"))
+
+
 class ServiceInstallTests(Base):
     def setUp(self):
         super().setUp()
