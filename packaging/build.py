@@ -111,7 +111,9 @@ def find_placeholders(fleet):
 def client_config(fleet, client):
     """The config.json every user gets (read from the install dir by the launcher and the hooks)."""
     cfg = dict(fleet["idp"])
-    cfg.update(mode=fleet["mode"], proxy_listen=fleet["proxy_listen"], gateway_url=fleet["gateway_url"])
+    cfg.update(mode=fleet["mode"], proxy_listen=fleet["proxy_listen"])
+    if fleet["mode"] == "proxy":        # file mode keeps the gateway URL in the managed ANTHROPIC_BASE_URL only (one place, no mismatch)
+        cfg["gateway_url"] = fleet["gateway_url"]
     if "notify" in fleet["options"]:
         cfg["notify"] = fleet["options"]["notify"]
     with tempfile.TemporaryDirectory() as d:        # the client's own validation: unknown keys, bad enums, non-loopback proxy
@@ -358,7 +360,7 @@ def build_linux(fleet, out, rpm=False):
     if rpm:
         rstage = work / "rpm"
         write_stage(rstage, files, paths)
-        spec = RPM_SPEC.format(name=name, ver=ver, rev=rev, stage="/stage", files="\n".join(rel))
+        spec = RPM_SPEC.format(name=name, ver=ver, rev=rev, stage="/stage", files=f"%dir {paths['install_dir']}\n" + "\n".join(rel))
         spec = spec.replace("@POSTINST@", strip_shebang(scripts["postinst"])).replace("@PRERM@", strip_shebang(scripts["prerm"]))
         (work / "pkg.spec").write_text(spec)
         rpmfile = f"{name}-{ver}-{rev}.noarch.rpm"

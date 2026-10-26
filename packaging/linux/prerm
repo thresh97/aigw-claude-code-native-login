@@ -1,0 +1,9 @@
+#!/bin/sh
+# deb prerm / rpm %preun (generated from packaging/linux/prerm by build.py): disable the unit for all users.
+# Running user instances keep running until their session ends; a user can `systemctl --user stop @UNIT@`.
+UNIT="@UNIT@"
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --global disable "$UNIT" >/dev/null 2>&1 || true
+fi
+rm -f "/etc/systemd/user/default.target.wants/$UNIT"
+exit 0

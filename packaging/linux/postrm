@@ -1,0 +1,5 @@
+#!/bin/sh
+# deb postrm (generated from packaging/linux/postrm by build.py). Per-user data (~/.config/aigw-claude-auth, header lines
+# in ~/.claude/settings.json) is left alone; a user or admin removes it with
+#   python3 @INSTALL_DIR@/aigw_launch.py purge-user      (run BEFORE removing the package, as that user)
+exit 0

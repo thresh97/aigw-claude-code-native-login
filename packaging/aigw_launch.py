@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 
+sys.dont_write_bytecode = True      # the install dir belongs to root; no __pycache__ left behind for the uninstaller
 HERE = os.environ.get("AIGW_FLEET_DIR") or os.path.dirname(os.path.realpath(__file__))
 
 
