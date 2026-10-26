@@ -584,7 +584,7 @@ Phases are ordered, not dated; dates need an owner and staffing. The Windows por
 4. **More IdP profiles.** Keycloak in CI first (no tenant needed); Okta and Ping once dev tenants exist, including a fixed `redirect_port` and Mode A claims straight from the IdP; Mode B.
    - Gate: `client_live` passes per IdP. **Keycloak done 2026-10-26** with the new `keycloak` scenario (local Keycloak 26.4.7, mock gateway, Mode A from the IdP and Mode B; README finding 18). Okta by hand on 2026-10-26 (README finding 21); its scenario is next. Ping waits for a dev tenant.
 5. **Mode 2 local proxy.** JWT in memory; gateway 401 translated to 498; Anthropic 401 passed through; SSE pass-through; fail closed.
-   - Gate: a refused JWT through the proxy fails in one attempt with a stored login.
+   - Gate: a refused JWT through the proxy fails in one attempt with a stored login. **Built 2026-10-26 (client 1.4.0):** `mode: proxy` with `proxy_listen` `127.0.0.1:18787`, per-user secret header `x-aigw-local`, renew-and-retry once, 498 on gateway refusals, Anthropic 401 passed through, fail closed with an in-session sign-in, `inspect --live`, `doctor` proxy findings. Offline `proxy` scenario PASS on macOS (79) and Windows (72, 7 Unix-socket SKIP). The live gate (`stored_login_proxy`) is pending.
 6. **Packaging and fleet pilot.** Signed packages, managed policy and background entries per OS, pilot users on each platform.
    - Gate: security review complete before wider rollout.
 

@@ -208,9 +208,9 @@ If the curl shows `Portkey Error: ...` (for example `Invalid API Key. Error Code
 | `errors` | How Claude Code treats 401 (gateway and Anthropic), 403, 407 and 498 with an env-token login | Claude Code |
 | `precheck` | Renew before the request; no-op while valid; why `hook_wait` matters; block when no JWT can be had (signed out, IdP hanging); the device code sign-in offered in the block message and the resent prompt going through; the LB guard path with blocking off | Claude Code |
 | `stopfailure` | Renew and notify after a refused JWT; Anthropic-side failures left alone | Claude Code |
-| `proxy` | The prototype local proxy ([design-v2](docs/design-v2.md), Mode 2) in front of the mock: header injected, client value stripped, SSE streamed, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token fails closed; which Unix socket base URLs Claude Code accepts | Claude Code |
+| `proxy` | The client's local proxy (`mode: proxy`, 1.4.0; [design-v2](docs/design-v2.md), Mode 2) in front of the mock: per-user secret header required and stripped, renew and retry once on a gateway 401, header injected, client value stripped, SSE streamed, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token fails closed; which Unix socket base URLs Claude Code accepts | Claude Code |
 | `stored_login` | Stored login against the mock: 498 fails once; a gateway 401 runs the OAuth loop | a stored login |
-| `stored_login_proxy` | Stored login through the prototype proxy and the mock: a refused JWT fails in one attempt, no OAuth loop | a stored login |
+| `stored_login_proxy` | Stored login through the client's proxy and the mock: a refused JWT fails in one attempt, no OAuth loop | a stored login |
 | `gateway` | The real gateway, request by request: which failures are the gateway's, and passthrough works | gateway, JWT |
 | `live_login` | Real gateway and stored login: a refused JWT costs the OAuth loop; with the LB guard, sentinel and missing header fail at once | gateway, JWT, stored login |
 | `client_live` | The client for real: IdP (and broker) → JWT → gateway → Anthropic; the precheck replaces an expired JWT before the turn | everything, after `aigw-claude-auth login` |
@@ -245,7 +245,8 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `daemon [--max-sleep 60]` | Run `sync` ahead of every expiry. It naps at most `--max-sleep` seconds, so it catches up within a minute after a laptop wakes. On failures it backs off from 30 s to 5 min |
 | `token [--force]` | Print a valid JWT on stdout (for curl and scripts); also updates the settings |
 | `status` | Settings file, token source, sign-in state, where the refresh token lives (never its value), JWT fingerprint, expiry and the `iss`/`sub`/`portkey_workspace` claims |
-| `inspect [--fresh] [--show-claims] [--debug on\|off]` | Decode the JWT: header, times, Mode A claims, verdicts against the config, its source. Prints a `PROBLEM` line and exits 1 for `alg: none`, expired, not yet valid, no `exp`, issuer mismatch (Mode B), opaque token or the sentinel. Never prints the token or signature; redacts `sub`, email and groups unless `--show-claims`. `--fresh` mints a token without writing it. `--debug on` logs a summary at each renewal for 24 h |
+| `proxy` | Run the local proxy in the foreground (proxy mode; `daemon` runs it in the background under the single-instance lock). The launchd agent (`KeepAlive`), systemd unit (`Restart=on-failure`) and Task Scheduler task (restart on failure) restart it after a crash |
+| `inspect [--live] [--fresh] [--show-claims] [--debug on\|off]` | Decode the JWT: header, times, Mode A claims, verdicts against the config, its source. Prints a `PROBLEM` line and exits 1 for `alg: none`, expired, not yet valid, no `exp`, issuer mismatch (Mode B), opaque token or the sentinel. Never prints the token or signature; redacts `sub`, email and groups unless `--show-claims`. `--fresh` mints a token without writing it. `--debug on` logs a summary at each renewal for 24 h |
 | `doctor [--json]` | Read every config source (helper config, user settings, the managed file and `managed-settings.d/`, the macOS managed preferences, the Windows `HKLM`/`HKCU` policy, `AIGW_*` keys in managed `env`) and list findings as Error, Warning or Info, each with a fix. Exits 1 on any Error. Works with a broken config. Server-managed settings show as unknown |
 | `hook precheck`, `hook stop-failure` | The two Claude Code hooks. They read the hook payload on stdin and always exit 0 |
 | `hook-login-wait` | Internal: the precheck's background sign-in. It reads the device authorization response on stdin, waits for the user, writes the JWT, notifies and exits |
@@ -279,6 +280,9 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `login_method` | `auto` | `auto`, `device`, `pkce`, `pkce-print` or `pkce-paste`. Overridden by `login` flags and `AIGW_LOGIN_METHOD` |
 | `device_unavailable_ttl` | `86400` | Seconds to remember that the IdP refused the device grant or the loopback redirect |
 | `secret_store` | `auto` | `auto`: refresh token in the OS credential store, the file if none works; `file`: `state.json` only |
+| `mode` | `file` | `file`: the JWT is written into `settings.json`. `proxy`: a local proxy (run by `daemon`, or `proxy` in the foreground) keeps the JWT in memory, injects it, and turns a gateway refusal into 498 after one renew-and-retry; `install` then writes `ANTHROPIC_BASE_URL=http://<proxy_listen>` and the per-user secret header, no JWT |
+| `proxy_listen` | `127.0.0.1:18787` | The proxy's address. Loopback only; non-loopback addresses are refused. Every request must carry the per-user secret in `x-aigw-local` (written by `install` into `ANTHROPIC_CUSTOM_HEADERS`, kept in the state dir with mode 600, stripped before forwarding), so other local users and web pages can't use the proxy |
+| `gateway_url` | | Proxy mode: the gateway the proxy forwards to (required) |
 | `debug_until` | `0` | Set by `inspect --debug on`; while in the future, each renewal logs a summary (no `sub`, no token) |
 | `notify` | `auto` | Desktop notification after a StopFailure renewal and when the precheck's background sign-in succeeds or fails: `auto` (macOS Notification Center, `notify-send` on Linux, a Windows PowerShell toast on Windows), `off`, or a command that gets the message as `$1` |
 | `redirect_uri`, `redirect_port` | `http://127.0.0.1:{port}/`, `0` | PKCE loopback redirect; port `0` picks a free port. Set a fixed port where the IdP needs an exact match (Okta, Ping), or to forward it with `ssh -L` or publish it from a container |
@@ -408,8 +412,7 @@ Open questions and gaps, not tested here:
 - **Also untested:**
   - 403 and 407 with a stored login;
   - on macOS: the live scenarios other than `stored_login_proxy` (the harness reads the stored login from the login Keychain and passes the real `HOME` to Claude Code for them), `claude -p` while signed out, and device code expiry.
-- **Protecting the JWT and the refresh token at rest.** The JWT sits in the settings file; the refresh token is in the OS credential store since 1.3.0 (the file is the fallback). Options not built yet:
-  - a local injecting proxy, which keeps the JWT in memory (a prototype, `repro/proxy_prototype.py`, passes the `proxy` scenario with an env-token login; what's missing is a stored login through it (`stored_login_proxy`, not yet run), a real gateway, and a production implementation);
+- **Protecting the JWT and the refresh token at rest.** In file mode the JWT sits in the settings file; `mode: proxy` (1.4.0) keeps it in memory only. Not yet run for the proxy: a stored login through it against the real gateway, and `stored_login_proxy` with 1.4.0. The refresh token is in the OS credential store since 1.3.0 (the file is the fallback). Options not built yet:
   - Claude Code permission rules that deny reading the files;
   - sender-constrained tokens, if the gateway ever supports them.
 

@@ -72,7 +72,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
