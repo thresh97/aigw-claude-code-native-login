@@ -61,11 +61,17 @@ class BuildError(Exception):
     pass
 
 
+_CLIENT = []
+
+
 def load_client():
+    if _CLIENT:
+        return _CLIENT[0]
     spec = importlib.util.spec_from_file_location("aigw_claude_auth_client", CLIENT_PATH)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
+    _CLIENT.append(mod)
     return mod
 
 
@@ -152,7 +158,10 @@ def hook_command(osname, paths, fleet):
 
 def managed_settings(osname, fleet, client, cfg, paths):
     proxy = fleet["mode"] == "proxy"
-    base_url = client.proxy_base_url(cfg) if proxy else fleet["gateway_url"]
+    try:
+        base_url = client.proxy_base_url(cfg) if proxy else fleet["gateway_url"]
+    except client.AuthError as e:
+        raise BuildError(str(e))
     hook = hook_command(osname, paths, fleet)
     env = {"ANTHROPIC_BASE_URL": base_url}
     for key in AIGW_ENV_KEYS:
