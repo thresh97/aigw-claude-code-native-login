@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import io
 import json
+import plistlib
 import os
 import shutil
 import stat
@@ -166,7 +167,7 @@ class Base(unittest.TestCase):
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        for k in ("AIGW_LOGIN_METHOD", "AIGW_HOOK_LOGIN"):
+        for k in ("AIGW_LOGIN_METHOD", "AIGW_HOOK_LOGIN", "XDG_CONFIG_HOME"):
             os.environ.pop(k, None)
         sig = mock.patch.object(A, "environment_signals", side_effect=lambda env=None: dict(HEADLESS))
         sig.start()
@@ -183,6 +184,9 @@ class Base(unittest.TestCase):
         mock.patch.object(A, "plist_paths", return_value=[]).start()
         mock.patch.object(A, "read_registry_policy", return_value=(None, "", "")).start()
         mock.patch.object(A, "personal_entry", return_value=None).start()      # never this machine's own personal install
+        mock.patch.object(A, "home_dir", side_effect=lambda: self.tmp / "home").start()   # never the real LaunchAgents or systemd dir
+        mock.patch.object(A, "service_run", side_effect=lambda argv: (False, "") if argv[1:2] == ["print"] else (True, "")).start()   # never launchctl, systemctl or schtasks
+        mock.patch.object(A, "service_python", return_value="/usr/bin/python3").start()   # the same interpreter whatever the machine has
         self.addCleanup(mock.patch.stopall)
 
     def tearDown(self):
@@ -2069,6 +2073,7 @@ class FakeGateway:
         self.release = threading.Event()  # the SSE reply sends its second chunk when this is set
         self.barrier = None               # a threading.Barrier: the SSE reply waits for all parties (concurrency)
         self.gzip_401 = False
+        self.reply = None                 # (status, {headers}): answer every request that is not refused or streamed with this
         gw = self
 
         class H(BaseHTTPRequestHandler):
@@ -2117,6 +2122,8 @@ class FakeGateway:
                         self.wfile.flush()
                     self.wfile.write(b"0\r\n\r\n")
                     return
+                if gw.reply:
+                    return self.send(gw.reply[0], {"ok": gw.reply[0] < 400}, gw.reply[1])
                 self.send(200, {"ok": True, "echo": body.decode("utf-8", "replace")})
 
             def do_GET(self):
@@ -2546,6 +2553,227 @@ class ProxyControlTests(ProxyBase):
         self.assertNotIn("refresh_token", A.State(self.state_dir).load())
 
 
+class MaskingTests(unittest.TestCase):
+    def test_mask_secret_shows_at_most_eight_characters_and_the_length(self):
+        m = A.mask_secret("Bearer sk-ant-oat01-abcdefghijklmnop")
+        self.assertTrue(m.startswith("Bearer sk-a...mnop (len "), m)
+        self.assertNotIn("abcdefgh", m)
+        self.assertEqual(A.mask_secret("short-secret"), "... (len 12)")          # too short to show any of it
+        tok = jwt(time.time() + 60, sub="x")
+        self.assertEqual(A.mask_secret(tok), f"{tok[:4]}...{tok[-4:]} (len {len(tok)})")
+
+    def test_log_headers_keeps_the_listed_ones_and_never_the_proxy_secret(self):
+        h = {"Authorization": "Bearer sk-ant-oat01-abcdefghijklmnop", "x-portkey-api-key": "p" * 40, A.LOCAL_HEADER: "local-secret-value",
+             "anthropic-beta": "oauth-2025-04-20", "Cookie": "session=abc", "User-Agent": "claude-cli/2"}
+        out = A.log_headers(h, "x-portkey-api-key")
+        self.assertEqual(set(out), {"authorization", "x-portkey-api-key", "anthropic-beta", "user-agent"})
+        self.assertEqual(out["anthropic-beta"], "oauth-2025-04-20")
+        self.assertNotIn("local-secret-value", json.dumps(out))
+        self.assertNotIn("p" * 20, out["x-portkey-api-key"])
+
+    def test_status_claims_includes_the_email_and_flattens_defaults(self):
+        c = A.status_claims({"sub": "u1", "email_id": "dev@example.com", "portkey_oid": "o1", "portkey_workspace": "ws1",
+                             "defaults": {"config_slug": "pc-main", "config_id": "cid"}, "scope": "a b", "groups": ["g"]})
+        self.assertEqual(c, {"sub": "u1", "email": "dev@example.com", "portkey_oid": "o1", "portkey_workspace": "ws1",
+                             "config_slug": "pc-main", "scope": "a b"})
+        self.assertEqual(A.status_claims({"email": "other@example.com"}), {"email": "other@example.com"})
+        self.assertEqual(A.status_claims({}), {})
+
+    def test_proxy_log_requests_must_be_a_whole_number(self):
+        base = Base("run")
+        for bad in (-1, 10001, "5", True, 1.5):
+            with self.subTest(bad=bad):
+                p = Path(tempfile.mkdtemp(prefix="aigw-cfg-")) / "c.json"
+                self.addCleanup(shutil.rmtree, p.parent, ignore_errors=True)
+                p.write_text(json.dumps({"client_id": "c", "proxy_log_requests": bad}))
+                with self.assertRaises(A.AuthError):
+                    A.load_config(p)
+
+
+class JwksTests(unittest.TestCase):
+    CFG = dict(A.DEFAULTS, issuer="https://idp.example/v2.0", broker_url="https://broker.example/token/exchange", http_timeout=5)
+
+    def rows(self, cfg, kid, reply):
+        with mock.patch.object(A, "http_json", side_effect=reply if isinstance(reply, Exception) else None, return_value=None if isinstance(reply, Exception) else reply) as hj:
+            return dict(A.jwks_rows(cfg, kid)), hj
+
+    def test_a_broker_publishes_its_keys_at_its_own_origin(self):
+        rows, hj = self.rows(self.CFG, "k1", (200, {"keys": [{"kid": "k0"}, {"kid": "k1"}]}))
+        self.assertEqual(rows["jwks"], "https://broker.example/.well-known/jwks.json")
+        self.assertIn("kid k1 is published there", rows["jwks check"])
+        self.assertIn("does not verify the signature", rows["jwks check"])
+
+    def test_a_kid_missing_from_the_jwks_is_called_out(self):
+        rows, _ = self.rows(self.CFG, "k9", (200, {"keys": [{"kid": "k1"}]}))
+        self.assertIn("kid k9 is NOT in that JWKS", rows["jwks check"])
+
+    def test_an_unreachable_jwks_is_reported_not_raised(self):
+        rows, _ = self.rows(self.CFG, "k1", A.AuthError("cannot reach broker.example: timed out"))
+        self.assertIn("not reachable", rows["jwks check"])
+
+    def test_without_a_broker_the_idps_discovery_document_names_the_jwks(self):
+        cfg = dict(self.CFG, broker_url="")
+        answers = iter([(200, {"jwks_uri": "https://idp.example/keys"}), (200, {"keys": [{"kid": "k1"}]})])
+        with mock.patch.object(A, "http_json", side_effect=lambda url, **kw: next(answers)):
+            rows = dict(A.jwks_rows(cfg, "k1"))
+        self.assertEqual(rows["jwks"], "https://idp.example/keys")
+        self.assertIn("is published there", rows["jwks check"])
+
+    def test_a_token_command_has_no_known_jwks_and_makes_no_request(self):
+        with mock.patch.object(A, "http_json") as hj:
+            rows = dict(A.jwks_rows(dict(self.CFG, token_command="echo x"), "k1"))
+        hj.assert_not_called()
+        self.assertIn("unknown", rows["jwks"])
+
+
+class SettlesRecords:
+    """The proxy records a request after it has sent the reply, so a test that reads the request log right after call()
+    returns can find it empty (a fast machine wins that race, a slow one loses it). Wait until the record is there."""
+
+    def recorded(self):
+        with self.ps.stats_lock:
+            return sum(self.ps.stats.values())
+
+    def call(self, *a, **kw):
+        before = self.recorded()
+        out = super().call(*a, **kw)
+        if not (kw.get("path") or (a[1] if len(a) > 1 else "/v1/messages")).startswith("/_aigw/"):
+            deadline = time.time() + 3
+            while self.recorded() <= before and time.time() < deadline:
+                time.sleep(0.01)
+        return out
+
+
+class ProxyRequestLogTests(SettlesRecords, ProxyBase):
+    def entries(self, n=50):
+        return self.ps.recent_requests(n)
+
+    def test_each_request_is_kept_with_masked_credentials(self):
+        tok = self.renew()
+        self.assertEqual(self.call(headers={"Authorization": "Bearer sk-ant-oat01-abcdefghijklmnop"})[0], 200)
+        e = self.entries()[-1]
+        self.assertEqual((e["method"], e["path"], e["status"]), ("POST", "/v1/messages", 200))
+        self.assertTrue(e["in"]["authorization"].startswith("Bearer sk-a..."), e["in"])
+        self.assertEqual(e["in"]["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(e["out"], {"x-portkey-api-key": A.mask_secret(tok)})
+        dump = json.dumps(self.entries())
+        for secret in (tok, tok.split(".")[2] if len(tok.split(".")[2]) > 8 else tok, "sk-ant-oat01-abcdefghijklmnop", self.secret):
+            self.assertNotIn(secret, dump)
+        self.assertNotIn(A.LOCAL_HEADER, dump)
+
+    def test_a_refused_request_is_kept_without_the_wrong_secret(self):
+        self.renew()
+        self.assertEqual(self.call(secret="not-the-secret-value")[0], 498)
+        e = self.entries()[-1]
+        self.assertEqual(e["note"], "local-secret")
+        self.assertNotIn("not-the-secret-value", json.dumps(self.entries()))
+
+    def test_only_the_last_n_are_kept(self):
+        self.configure(proxy_log_requests=3)
+        self.restart_proxy()
+        self.renew()
+        for i in range(5):
+            self.call(path=f"/v1/messages?i={i}")
+        self.assertEqual(len(self.entries()), 3)
+        self.assertEqual(len(self.entries(2)), 2)
+        self.assertEqual(self.entries(0), [])
+
+    def test_the_upstream_request_id_and_retry_after_are_kept(self):
+        self.renew()
+        self.gw.reply = (429, {"retry-after": "7", "request-id": "req_test123", "set-cookie": "never=kept"})
+        self.assertEqual(self.call()[0], 429)
+        e = self.entries()[-1]
+        self.assertEqual((e["status"], e["up"]), (429, {"request-id": "req_test123", "retry-after": "7"}))
+        self.gw.reply = None
+        self.assertEqual(self.call()[0], 200)
+        self.assertEqual(self.entries()[-1]["up"], {})                  # nothing carried over from the previous request
+        self.assertNotIn("never=kept", json.dumps(self.entries()))
+
+    def test_a_passed_through_401_keeps_the_request_id(self):
+        self.renew()
+        self.gw.anthropic_401 = True
+        self.assertEqual(self.call()[0], 401)
+        self.assertEqual(self.entries()[-1]["up"], {"request-id": "req_x"})
+
+    def test_a_refusal_made_by_the_proxy_has_no_upstream_headers(self):
+        self.assertEqual(self.call(secret="nope")[0], 498)
+        self.assertEqual(self.entries()[-1]["up"], {})
+
+    def test_zero_keeps_nothing(self):
+        self.configure(proxy_log_requests=0)
+        self.restart_proxy()
+        self.renew()
+        self.call()
+        self.assertIsNone(self.ps.recent)
+        status, _, body = self.call("GET", "/_aigw/requests", body=b"")
+        self.assertEqual((status, json.loads(body)), (200, {"limit": 0, "requests": []}))
+
+    def test_the_control_endpoint_takes_a_count_and_needs_the_secret(self):
+        self.renew()
+        for _ in range(4):
+            self.call()
+        status, _, body = self.call("GET", "/_aigw/requests?n=2", body=b"")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(body)["requests"]), 2)
+        self.assertEqual(self.call("GET", "/_aigw/requests", body=b"", secret=False)[0], 498)
+
+
+class ProxyStatusCliTests(SettlesRecords, ProxyBase):
+    def setUp(self):
+        self.port_wanted = free_port()
+        super().setUp()
+
+    def configure(self, **over):
+        self.write_config(**dict(dict(mode="proxy", gateway_url=self.gw.url, proxy_listen=f"127.0.0.1:{self.port_wanted}"), **over))
+
+    def hold(self, **claims):
+        self.ps.holder.token = jwt(time.time() + 3600, **claims)
+
+    def test_status_shows_who_the_jwt_is_for_including_the_email(self):
+        self.hold(sub="user-1", email_id="dev@example.com", portkey_workspace="ws-1", defaults={"config_slug": "pc-main"})
+        code, out, err = self.run_cli("status", "--offline")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"jwt email\s+dev@example.com")
+        self.assertRegex(out, r"jwt config_slug\s+pc-main")
+        self.assertNotIn("jwks", out)                          # --offline: no network call
+
+    def test_status_names_the_jwks_and_whether_it_publishes_the_kid(self):
+        self.hold(sub="user-1")
+        with mock.patch.object(A, "http_json", return_value=(200, {"keys": [{"kid": "test"}]})):
+            code, out, _ = self.run_cli("status")
+        self.assertEqual(code, 0)
+        self.assertIn("/.well-known/jwks.json", out)
+        self.assertIn("kid test is published there", out)
+
+    def test_requests_prints_the_recent_requests_with_masked_headers(self):
+        self.renew()
+        self.call(headers={"Authorization": "Bearer sk-ant-oat01-abcdefghijklmnop"})
+        code, out, err = self.run_cli("requests", "-n", "5")
+        self.assertEqual(code, 0, err)
+        self.assertIn("POST /v1/messages -> 200", out)
+        self.assertIn("in  authorization: Bearer sk-a...mnop", out)
+        self.assertIn("out x-portkey-api-key:", out)
+        self.assertNotIn("sk-ant-oat01-abcdefghijklmnop", out)
+        code, out, _ = self.run_cli("requests", "--json")
+        self.assertEqual(json.loads(out)[-1]["status"], 200)
+
+    def test_requests_prints_the_upstream_headers(self):
+        self.renew()
+        self.gw.reply = (429, {"retry-after": "7", "request-id": "req_test123"})
+        self.call()
+        code, out, err = self.run_cli("requests", "-n", "1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("-> 429", out)
+        self.assertRegex(out, r"up  request-id: req_test123")
+        self.assertRegex(out, r"up  retry-after: 7")
+
+    def test_requests_in_file_mode_says_why_there_is_no_log(self):
+        self.write_config(mode="file")
+        code, _, err = self.run_cli("requests")
+        self.assertEqual(code, 1)
+        self.assertIn("mode is file", err)
+
+
 class ProxyConfigTests(Base):
     def test_only_loopback_addresses_are_accepted(self):
         for bad in ("0.0.0.0:8000", "192.168.1.5:8000", "[::]:8000", "example.com:8000", "8000", "127.0.0.1", "127.0.0.1:99999", "10.0.0.1:1", ":80"):
@@ -2614,6 +2842,131 @@ class ProxyUpstreamTests(unittest.TestCase):
     def test_http_upstream_through_a_proxy_uses_the_absolute_uri(self):
         c, target = self.conn("http://gw.example.com:8080/x", HTTP_PROXY="http://proxy.local:3128")
         self.assertEqual((c.host, c.port, target("/v1/messages")), ("proxy.local", 3128, "http://gw.example.com:8080/x/v1/messages"))
+
+
+class SignedOutInstallTests(Base):
+    def test_install_succeeds_signed_out_and_writes_the_settings(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        code, _, err = self.run_cli("install", "--base-url", "https://gw.example.com")
+        self.assertEqual(code, 0, err)
+        d = json.loads(self.settings_path.read_text())
+        self.assertEqual(d["env"]["ANTHROPIC_BASE_URL"], "https://gw.example.com")
+        self.assertIn("mode file:", err)
+        self.assertIn("not signed in yet", err)
+
+    def test_install_signed_out_in_proxy_mode_succeeds(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        port = free_port()
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{port}")
+        code, _, err = self.run_cli("install")
+        self.assertEqual(code, 0, err)
+        self.assertIn("mode proxy: the proxy is not running yet", err)
+
+
+REAL_SERVICE_PYTHON = A.service_python       # the base class stubs A.service_python; these tests need the real one
+
+
+FAKE_EXE = "/opt/not-a-real-machine/bin/python3"      # sys.executable is /usr/bin/python3 on Linux, which is in the search list
+
+
+class ServicePythonTests(unittest.TestCase):
+    def pick(self, versions, venv=False, usable=None):
+        """service_python() with python_version() answering from `versions` (a path -> version map)."""
+        with mock.patch.object(A, "python_version", side_effect=lambda p: versions.get(p)), \
+             mock.patch.object(A.os, "access", side_effect=lambda p, mode: usable is None or p in usable), \
+             mock.patch.object(A.sys, "executable", FAKE_EXE), \
+             mock.patch.object(A.sys, "prefix", "/venv" if venv else sys.base_prefix):
+            return REAL_SERVICE_PYTHON()
+
+    def test_the_newest_wins_over_the_system_python(self):
+        self.assertEqual(self.pick({"/opt/homebrew/bin/python3": (3, 13), "/usr/bin/python3": (3, 9)}), "/opt/homebrew/bin/python3")
+        self.assertEqual(self.pick({"/opt/homebrew/bin/python3": (3, 9), "/usr/bin/python3": (3, 14)}), "/usr/bin/python3")
+
+    def test_homebrew_wins_a_tie(self):
+        v = {"/opt/homebrew/bin/python3": (3, 13), "/Library/Frameworks/Python.framework/Versions/Current/bin/python3": (3, 13)}
+        self.assertEqual(self.pick(v), "/opt/homebrew/bin/python3")
+
+    def test_too_old_and_missing_interpreters_are_skipped(self):
+        self.assertEqual(self.pick({"/opt/homebrew/bin/python3": (3, 7), "/usr/bin/python3": (3, 9)}), "/usr/bin/python3")
+        self.assertIsNone(self.pick({"/usr/bin/python3": (2, 7)}))
+        self.assertIsNone(self.pick({}))
+
+    def test_sys_executable_is_used_only_outside_a_virtualenv(self):
+        v = {FAKE_EXE: (3, 14)}
+        self.assertEqual(self.pick(v, venv=False, usable=[FAKE_EXE]), FAKE_EXE)
+        self.assertIsNone(self.pick(v, venv=True, usable=[FAKE_EXE]))
+
+
+class ServiceInstallTests(Base):
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(A.time, "sleep").start()          # the launchd wait and retry must not slow the tests
+        self.addCleanup(mock.patch.stopall)
+
+    def test_darwin_writes_a_launch_agent_and_bootstraps_it(self):
+        calls = []
+        ok, msg = A.service_install({}, platform="darwin", run=lambda argv: calls.append(argv) or (argv[1] != "print", ""))
+        self.assertTrue(ok, msg)
+        d = plistlib.loads((self.tmp / "home" / "Library" / "LaunchAgents" / "aigw-claude-auth.plist").read_bytes())
+        self.assertEqual(d["ProgramArguments"][-1], "daemon")
+        self.assertTrue(d["RunAtLoad"])
+        self.assertEqual(calls[-1][:2], ["launchctl", "bootstrap"])
+
+    def test_darwin_bootstrap_failure_is_reported_and_the_agent_file_stays(self):
+        run = lambda argv: (False, "Bootstrap failed: 5") if argv[1] == "bootstrap" else (False, "")
+        ok, msg = A.service_install({}, platform="darwin", run=run)
+        self.assertFalse(ok)
+        self.assertIn("Bootstrap failed", msg)
+        self.assertIn("next desktop login", msg)
+        self.assertTrue((self.tmp / "home" / "Library" / "LaunchAgents" / "aigw-claude-auth.plist").exists())
+
+    def test_darwin_retries_a_bootstrap_that_races_the_old_agent(self):
+        calls, tries = [], []
+        def run(argv):
+            calls.append(argv[1])
+            if argv[1] == "bootstrap":
+                tries.append(argv)
+                return (len(tries) > 1, "Bootstrap failed: 5")     # first attempt races the old agent, the retry works
+            return (False, "")                                       # print: the label is gone
+        ok, msg = A.service_install({}, platform="darwin", run=run)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(tries), 2)
+
+    def test_darwin_waits_until_launchd_forgets_the_old_agent(self):
+        printed = iter([True, True, False])
+        run = lambda argv: (next(printed), "") if argv[1] == "print" else (argv[1] == "bootout" or argv[1] == "bootstrap", "")
+        ok, msg = A.service_install({}, platform="darwin", run=run)
+        self.assertTrue(ok, msg)
+
+    def test_linux_writes_a_user_unit_and_enables_it(self):
+        calls = []
+        ok, msg = A.service_install({}, platform="linux", run=lambda argv: calls.append(argv) or (True, ""))
+        self.assertTrue(ok, msg)
+        unit = (self.tmp / "home" / ".config" / "systemd" / "user" / "aigw-claude-auth.service").read_text()
+        self.assertIn(" daemon\n", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn(["systemctl", "--user", "enable", "--now", "aigw-claude-auth.service"], calls)
+        self.assertIn("lingering", msg)
+
+    def test_linux_without_a_user_session_says_why(self):
+        run = lambda argv: (False, "Failed to connect to bus") if "daemon-reload" in argv else (True, "")
+        ok, msg = A.service_install({}, platform="linux", run=run)
+        self.assertFalse(ok)
+        self.assertIn("no systemd user session answered", msg)
+
+    def test_unsupported_platform_says_so(self):
+        ok, msg = A.service_install({}, platform="freebsd", run=lambda argv: (True, ""))
+        self.assertFalse(ok)
+        self.assertIn("no service manager for freebsd", msg)
+
+    def test_install_no_service_skips_the_service(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_config(mode="proxy", gateway_url="https://gw.example.com", proxy_listen=f"127.0.0.1:{free_port()}")
+        with mock.patch.object(A, "service_install") as si:
+            code, _, err = self.run_cli("install", "--no-service")
+        self.assertEqual(code, 0, err)
+        si.assert_not_called()
+        self.assertIn("--no-service", err)
 
 
 class ProxyInstallTests(Base):

@@ -6,5 +6,6 @@
   "broker_url": "https://<broker>/token/exchange",
   "mode": "file",
   "proxy_listen": "127.0.0.1:18787",
-  "gateway_url": ""
+  "gateway_url": "",
+  "proxy_log_requests": 100
 }

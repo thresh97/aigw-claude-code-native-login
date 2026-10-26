@@ -113,10 +113,12 @@ cp client/aigw_claude_auth.py ~/.local/bin/aigw-claude-auth && chmod +x ~/.local
 #    Desktop notifications are on by default ("notify": "auto"); set "notify" to "off" or a command to change that.
 cp client/config.example.json ~/.config/aigw-claude-auth/config.json && ${EDITOR:-vi} ~/.config/aigw-claude-auth/config.json
 
-# 3. Sign in to the IdP once: browser flow on a desktop, device code over ssh or without a display (--device forces it)
+# 3. Sign in to the IdP: browser flow on a desktop, device code over ssh or without a display (--device forces it).
+#    Install works before this step; a signed-out install says to sign in next.
 aigw-claude-auth login
 
-# 4. Point Claude Code at the gateway and add the hooks (edits ~/.claude/settings.json, or $CLAUDE_CONFIG_DIR/settings.json)
+# 4. Point Claude Code at the gateway and add the hooks (edits ~/.claude/settings.json, or $CLAUDE_CONFIG_DIR/settings.json).
+#    File mode: `--base-url https://<gateway host>`. Proxy mode: no arguments (see "Choose a mode" below).
 aigw-claude-auth install --base-url https://<gateway host>
 
 # 5. Keep the JWT fresh in the background
@@ -130,6 +132,27 @@ systemctl --user daemon-reload && systemctl --user enable --now aigw-claude-auth
 # 6. Sign in to Anthropic in Claude Code as usual, if not done yet
 claude        # then /login
 ```
+
+**Choose a mode.** The `mode` setting in `config.json` decides how Claude Code gets the JWT. `install` reads it and does the right thing; the command is the same in both modes.
+
+*File mode (`"mode": "file"`, the default).* The JWT is written into `~/.claude/settings.json`. No background process is needed: the hooks renew the JWT before a prompt that needs it, which can add a pause of about 3 s. The daemon (step 5) is optional.
+
+```bash
+# config.json: "mode": "file", "gateway_url": "https://<gateway host>"
+aigw-claude-auth login
+aigw-claude-auth install --base-url https://<gateway host>
+```
+
+*Proxy mode (`"mode": "proxy"`).* A local proxy on loopback keeps the JWT in memory, injects it into each request, and turns a gateway refusal into a 498 after one renew-and-retry. Nothing sensitive is left in `settings.json` except a per-user secret for the proxy. The daemon has to be running, because the proxy is what renews the JWT.
+
+```bash
+# config.json: "mode": "proxy", "proxy_listen": "127.0.0.1:18787", "gateway_url": "https://<gateway host>"
+aigw-claude-auth login
+aigw-claude-auth install          # no --base-url: the address comes from proxy_listen
+aigw-claude-auth daemon           # or the launchd / systemd / Task Scheduler entry from step 5
+```
+
+`install` writes `ANTHROPIC_BASE_URL=http://127.0.0.1:18787` and the `x-aigw-local` secret, removes the JWT line, and installs the daemon as a per-user service: a launchd agent on macOS (`~/Library/LaunchAgents/aigw-claude-auth.plist`), a systemd user unit on Linux (`~/.config/systemd/user/aigw-claude-auth.service`), or a Task Scheduler task on Windows. If it can't, `install` prints a warning with the reason and still exits 0, and you start the daemon by hand (`aigw-claude-auth daemon`). Use `--no-service` to skip the service. Linux needs a systemd user session, and it keeps running after logout only with lingering (`loginctl enable-linger $USER`). A service installed by `install` is removed by the teardown in section 4. `doctor` lists anything still wrong. Switching modes: change `mode`, run `install` again, and it removes the other mode's entries. To check the Linux path in a throwaway container (systemd user unit, restart after a kill, the request log), run `packaging/linux/smoke-proxy-systemd.sh --client client/aigw_claude_auth.py`; it needs Docker and uses a fake JWT and a mock gateway.
 
 **Fleet packages.** For many machines, build packages from one fleet file with `packaging/build.py` (macOS `.pkg`, Linux `.deb`/`.rpm`, a Windows PowerShell installer; see [packaging/README.md](packaging/README.md)). They install the client, a managed-settings drop-in (`managed-settings.d/50-aigw-claude-auth.json`: base URL, hooks, `allowedProviders`, `AIGW_*` env, never `ANTHROPIC_CUSTOM_HEADERS`) and a login-time background entry for all users. At each login that entry runs `install --no-hooks` for the user (the JWT line in file mode, the user's own proxy secret in proxy mode) and then the daemon; the user only signs in once. Unsigned. Emulated pilot (real privileged installs, real logons, no MDM) passed on Linux (systemd container) and the Windows VM; macOS is person-run with `packaging/macos/pilot.sh`. The fleet replaces a personal install: at login it moves the user's personal install aside (packaging/README.md, "A personal install on the same machine"). Several users logged in at once is out of scope: proxy mode doesn't support it, Windows file mode is untested (packaging/README.md, "Several users at once").
 
@@ -159,7 +182,7 @@ with the script path). That form uses no shell, so the hooks work whether or not
 - It logs renewals and failures only: `journalctl --user -u aigw-claude-auth` on Linux, `~/Library/Logs/aigw-claude-auth.log` on macOS (never rotated; it grows slowly), `%LOCALAPPDATA%\aigw-claude-auth\logs\daemon.log` on Windows (not rotated either).
 - The service manager restarts it if it crashes, but not after a clean stop.
 
-It's optional. Without it, the precheck hook renews before the prompt that needs it, at the cost of a pause of about 3 s. To check it's working: `systemctl --user status aigw-claude-auth` or `launchctl print gui/$(id -u)/aigw-claude-auth | head`, and `aigw-claude-auth status` shows a new fingerprint and expiry after each renewal. On macOS the agent runs `/usr/bin/python3`, which works only with the Xcode Command Line Tools installed (`xcode-select --install`). With a different Python, change the path in the plist.
+It's optional. Without it, the precheck hook renews before the prompt that needs it, at the cost of a pause of about 3 s. To check it's working: `systemctl --user status aigw-claude-auth` or `launchctl print gui/$(id -u)/aigw-claude-auth | head`, and `aigw-claude-auth status` shows a new fingerprint and expiry after each renewal. On macOS and Linux, `install` (proxy mode) runs the daemon under the newest Python 3.8+ it finds in this order: Homebrew (`/opt/homebrew/bin/python3`, `/usr/local/bin/python3`), python.org, the Command Line Tools (`/usr/bin/python3`), then the Python that ran `install` (not from a virtualenv). Ties go to Homebrew. The chosen path is in the agent's `ProgramArguments`, and `install` prints it. To use another interpreter, edit the plist or the unit.
 
 **Trial install (your everyday Claude Code untouched).** Claude Code re-reads its settings about a second after they change. So `install` on `~/.claude/settings.json` reroutes every running Claude Code session, including an agent doing the install. To try it first, use a separate Claude Code config dir. That dir needs its own `/login`:
 
@@ -230,7 +253,7 @@ aigw-claude-auth logout          # forgets the refresh token, writes the sentine
 ```
 
 Then:
-1. In `~/.claude/settings.json`, remove `ANTHROPIC_BASE_URL`, the `x-portkey-api-key` line in `ANTHROPIC_CUSTOM_HEADERS`, and the two hook entries whose command contains `aigw-claude-auth`.
+1. In `~/.claude/settings.json`, remove `ANTHROPIC_BASE_URL`, the `x-portkey-api-key` line (file mode) and the `x-aigw-local` line (proxy mode) in `ANTHROPIC_CUSTOM_HEADERS`, and the two hook entries whose command contains `aigw-claude-auth`. Leave other lines in that header alone.
 2. Delete `~/.config/aigw-claude-auth` and `~/.local/bin/aigw-claude-auth` (Windows: `%APPDATA%\aigw-claude-auth` and `%USERPROFILE%\.local\bin\aigw-claude-auth.py`).
 
 On the gateway side, remove the passthrough config and the LB rules if nothing else uses them.
@@ -242,11 +265,12 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | Command | What it does |
 |---|---|
 | `login [--device \| --pkce \| --pkce-print \| --paste] [--no-browser]` | Sign in to the IdP, then write a JWT. `--pkce` opens a browser here; `--pkce-print` (or `--pkce --no-browser`) prints the URL, and that browser must reach `127.0.0.1:<redirect_port>` on this host (for example `ssh -L <port>:127.0.0.1:<port> <host>`); `--paste` prints the URL, you sign in in any browser and paste the `http://127.0.0.1:...` address you end up on (no listener, no device grant); `--device` uses a device code. With no flag, see [Sign-in method](#sign-in-method) |
-| `install [--base-url URL] [--no-hooks] [--hook-command CMD] [--print]` | Add `ANTHROPIC_BASE_URL` and the hooks to the settings file (or print the snippet), then `sync`. On Windows the hooks are in exec form; `--hook-command` is still a shell string |
+| `install [--base-url URL] [--no-hooks] [--no-service] [--hook-command CMD] [--print]` | Add `ANTHROPIC_BASE_URL` and the hooks to the settings file (or print the snippet), then `sync`. Proxy mode also installs the daemon as a per-user service (launchd agent, systemd user unit or Task Scheduler task) unless `--no-service`, `--no-hooks` or a fleet config says not to; a failure is a warning with the reason, and `install` still exits 0. On Windows the hooks are in exec form; `--hook-command` is still a shell string |
 | `sync [--force] [--quiet]` | Make sure the settings hold a JWT valid for more than `refresh_before` seconds |
 | `daemon [--max-sleep 60]` | Run `sync` ahead of every expiry. It naps at most `--max-sleep` seconds, so it catches up within a minute after a laptop wakes. On failures it backs off from 30 s to 5 min |
 | `token [--force]` | Print a valid JWT on stdout (for curl and scripts); also updates the settings |
-| `status` | Settings file, token source, sign-in state, where the refresh token lives (never its value), JWT fingerprint, expiry and the `iss`/`sub`/`portkey_workspace` claims |
+| `status [--offline]` | Settings file, token source, sign-in state, where the refresh token lives (never its value), JWT fingerprint, expiry, and who the JWT is for: `iss`, `sub`, `email` (the `email_id` or `email` claim), `portkey_oid`, `portkey_workspace`, `config_slug` (`defaults.config_slug`) and `scope`. It then names the JWKS that publishes the signing key (the broker's `<origin>/.well-known/jwks.json`, or the IdP's `jwks_uri` when there is no broker) and says whether it lists the JWT's `kid`. That is one short request; `--offline` skips it. The client does not verify the signature: the gateway does, against the JWKS URL in its org settings, which the client cannot read |
+| `requests [-n N] [--json]` | Proxy mode: the proxy's last N requests (default 20; it keeps `proxy_log_requests`, in memory, lost on restart). Each shows time, method, path, status, latency and the note (`local-secret`, `gateway-401->498`, ...), then the headers Claude Code sent (`authorization`, `anthropic-beta`, `user-agent`, ...), the `x-portkey-api-key` the proxy injected, and the reply's `request-id` and `retry-after` when it has them (they show whether the gateway or Anthropic answered a 429 or 401). Credentials are partly masked: the scheme, 4 characters at each end and the length. The proxy's own `x-aigw-local` secret is never kept. A healthy proxy writes nothing to its log file for a request that succeeds, so this is where to look |
 | `proxy` | Run the local proxy in the foreground (proxy mode; `daemon` runs it in the background under the single-instance lock). The launchd agent (`KeepAlive`), systemd unit (`Restart=on-failure`) and Task Scheduler task (restart on failure) restart it after a crash |
 | `inspect [--live] [--fresh] [--show-claims] [--debug on\|off]` | Decode the JWT: header, times, Mode A claims, verdicts against the config, its source. Prints a `PROBLEM` line and exits 1 for `alg: none`, expired, not yet valid, no `exp`, issuer mismatch (Mode B), opaque token or the sentinel. Never prints the token or signature; redacts `sub`, email and groups unless `--show-claims`. `--fresh` mints a token without writing it. `--debug on` logs a summary at each renewal for 24 h |
 | `doctor [--json]` | Read every config source (helper config, user settings, the managed file and `managed-settings.d/`, the macOS managed preferences, the Windows `HKLM`/`HKCU` policy, `AIGW_*` keys in managed `env`) and list findings as Error, Warning or Info, each with a fix. Exits 1 on any Error. Works with a broken config. Server-managed settings show as unknown |
@@ -285,6 +309,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `mode` | `file` | `file`: the JWT is written into `settings.json`. `proxy`: a local proxy (run by `daemon`, or `proxy` in the foreground) keeps the JWT in memory, injects it, and turns a gateway refusal into 498 after one renew-and-retry; `install` then writes `ANTHROPIC_BASE_URL=http://<proxy_listen>` and the per-user secret header, no JWT |
 | `proxy_listen` | `127.0.0.1:18787` | The proxy's address. Loopback only; non-loopback addresses are refused. Every request must carry the per-user secret in `x-aigw-local` (written by `install` into `ANTHROPIC_CUSTOM_HEADERS`, kept in the state dir with mode 600, stripped before forwarding), so other local users and web pages can't use the proxy |
 | `gateway_url` | | Proxy mode: the gateway the proxy forwards to (required) |
+| `proxy_log_requests` | `100` | Proxy mode: how many recent requests the proxy keeps in memory for `requests`, 0 to 10000 (0 keeps none) |
 | `fleet` | `false` | Set by the fleet packages: at login the fleet moves a personal install of the user aside, and `doctor` reports one that is left ([packaging/README.md](packaging/README.md)) |
 | `debug_until` | `0` | Set by `inspect --debug on`; while in the future, each renewal logs a summary (no `sub`, no token) |
 | `notify` | `auto` | Desktop notification after a StopFailure renewal and when the precheck's background sign-in succeeds or fails: `auto` (macOS Notification Center, `notify-send` on Linux, a Windows PowerShell toast on Windows), `off`, or a command that gets the message as `$1` |
