@@ -339,20 +339,25 @@ def return_settings(settings_file, backup):
     backup.unlink()
 
 
-def cred_state(config_dir):
-    """A stored `claude login`, reduced to hashes and the expiry (never the tokens)."""
+def stored_oauth(config_dir):
+    """A stored `claude login`'s claudeAiOauth object, or None."""
     f = Path(config_dir) / ".credentials.json"
     if f.exists():
-        o = json.loads(f.read_text(encoding="utf-8")).get("claudeAiOauth", {})
-    elif sys.platform == "darwin":
+        return json.loads(f.read_text(encoding="utf-8")).get("claudeAiOauth", {})
+    if sys.platform == "darwin":
         # macOS keeps it in the login Keychain; with CLAUDE_CONFIG_DIR the item's service name ends in the first 8 hex
         # of sha256(the config dir path)
         service = "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
         r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"], capture_output=True, encoding="utf-8", errors="replace", timeout=10)
-        if r.returncode != 0 or not r.stdout.strip():
-            return {"exists": False}
-        o = json.loads(r.stdout).get("claudeAiOauth", {})
-    else:
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout).get("claudeAiOauth", {})
+    return None
+
+
+def cred_state(config_dir):
+    """A stored `claude login`, reduced to hashes and the expiry (never the tokens)."""
+    o = stored_oauth(config_dir)
+    if o is None:
         return {"exists": False}
     return {"exists": True, "expiresAt": o.get("expiresAt"), "access": fp(o.get("accessToken", "")), "refresh": fp(o.get("refreshToken", ""))}
 
@@ -913,8 +918,7 @@ def gateway_request(token, oauth=None, extra=None):
 
 
 def stored_access_token():
-    o = json.loads((Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser() / ".credentials.json").read_text(encoding="utf-8")).get("claudeAiOauth", {})
-    return o.get("accessToken", "")
+    return (stored_oauth(Path(os.environ["LOGIN_CONFIG_DIR"]).expanduser()) or {}).get("accessToken", "")
 
 
 def scenario_gateway(out):
