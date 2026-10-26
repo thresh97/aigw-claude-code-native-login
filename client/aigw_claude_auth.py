@@ -72,7 +72,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -102,6 +102,7 @@ DEFAULTS = {
     "mode": "file",                    # file (the JWT goes into settings.json) | proxy (a local proxy injects it; see "Mode 2")
     "proxy_listen": "127.0.0.1:18787", # proxy mode: loopback address and a fixed port (install writes ANTHROPIC_BASE_URL from it)
     "gateway_url": "",                 # proxy mode: the gateway the proxy forwards to (file mode keeps it in ANTHROPIC_BASE_URL)
+    "fleet": False,                    # set by the fleet packages (packaging/): the fleet's login entry moves a personal install aside
     "http_timeout": 30,
     "hook_http_timeout": 5,            # per request inside a hook: Claude Code gives up on a hook after HOOK_TIMEOUT s and
                                        # then sends the prompt anyway, so discovery + refresh + broker + hook_wait must fit
@@ -327,9 +328,10 @@ class Settings:
         """Add ANTHROPIC_BASE_URL and our two hooks; replaces earlier entries of ours, keeps everything else."""
         return self.apply(base_url=base_url, hook_command=hook_command)
 
-    def apply(self, base_url=None, hook_command=None, put_lines=None, drop_lines=(), drop_base_url=None):
-        """One atomic write: ANTHROPIC_BASE_URL (or drop it, when drop_base_url(current) says so), our hooks, and header
-        lines in ANTHROPIC_CUSTOM_HEADERS (put_lines {name: value}; drop_lines [name]). Everything else stays as it is."""
+    def apply(self, base_url=None, hook_command=None, put_lines=None, drop_lines=(), drop_base_url=None, drop_hooks=False):
+        """One atomic write: ANTHROPIC_BASE_URL (or drop it, when drop_base_url(current) says so), our hooks (or drop
+        them), and header lines in ANTHROPIC_CUSTOM_HEADERS (put_lines {name: value}; drop_lines [name]). Everything else
+        stays as it is."""
         data = self.load()
         env = data.setdefault("env", {})
         if base_url:
@@ -342,6 +344,14 @@ class Settings:
                 entries = [e for e in hooks.get(event, []) if not MARKER.search(json.dumps(e))]
                 entries.append(hook_entry(hook_command, sub))
                 hooks[event] = entries
+        elif drop_hooks and data.get("hooks"):
+            hooks = data["hooks"]
+            for event in list(hooks):
+                hooks[event] = [e for e in hooks[event] if not MARKER.search(json.dumps(e))]
+                if not hooks[event]:
+                    del hooks[event]
+            if not hooks:
+                del data["hooks"]
         if put_lines or drop_lines:
             names = {n.lower() for n in list(put_lines or {}) + list(drop_lines)}
             lines = [l for l in self._lines(data) if l.partition(":")[0].strip().lower() not in names]
@@ -2609,6 +2619,96 @@ def cmd_task(a, cfg, state, settings):
     return r.returncode
 
 
+# --------------------------------------------------------------------------------------------- fleet replaces personal
+# A fleet install (packaging/: `fleet` in its config, which sits in the install dir; hooks and base URL in managed
+# settings) replaces a personal one (README 1.3: config.json in the config dir, hooks in the user's settings, a launchd
+# agent, systemd user unit or Task Scheduler task named TASK_NAME). Both use the same state dir, so the fleet would pick
+# up the personal refresh token (perhaps from another IdP) and both daemons would write the JWT. The fleet's login entry
+# calls take_over_personal() before its first run; doctor reports what is left (personal-install).
+
+def personal_entry(platform=None):
+    """The personal background entry as (kind, path or task name), or None."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        p = Path.home() / "Library" / "LaunchAgents" / f"{TASK_NAME}.plist"
+        return ("launchd", p) if p.exists() else None
+    if platform == "win32":
+        try:
+            r = subprocess.run(["schtasks.exe", "/Query", "/TN", TASK_NAME], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return ("task", TASK_NAME) if r.returncode == 0 else None
+    p = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user" / f"{TASK_NAME}.service"
+    return ("systemd", p) if p.exists() else None
+
+
+def personal_leftovers(cfg, state_dir, user_settings):
+    """What of a personal install is still there next to a fleet one (empty when cfg is not a fleet config)."""
+    if not cfg.get("fleet"):
+        return []
+    left = []
+    if (Path(state_dir) / "config.json").exists():
+        left.append(f"its config.json in {state_dir}")
+    entry = personal_entry()
+    if entry:
+        left.append(f"its {entry[0]} entry ({entry[1]})")
+    if MARKER.search(json.dumps((user_settings or {}).get("hooks") or {})):
+        left.append("its hooks in the user's Claude Code settings")
+    return left
+
+
+def take_over_personal(cfg, state, settings, run=None, platform=None):
+    """Fleet install: stop and remove this user's personal background entry, forget its refresh token in the OS store,
+    drop its hooks from the user's settings and move its files from the state dir to <state dir>.personal-<time>.
+    Returns what it did, one line per step."""
+    if not cfg.get("fleet"):
+        return []
+    run, platform, d, done = run or subprocess.run, platform or sys.platform, state.dir, []
+    entry, personal_cfg = personal_entry(platform), d / "config.json"
+    hooks = MARKER.search(json.dumps(settings.load().get("hooks") or {}))
+    if not (entry or personal_cfg.exists() or hooks):
+        return []
+    backup = d.with_name(f"{d.name}.personal-{time.strftime('%Y%m%d-%H%M%S')}")
+    backup.mkdir(mode=0o700, parents=True, exist_ok=True)
+    quiet = dict(capture_output=True, text=True, timeout=30)
+    if entry:
+        kind, where = entry
+        if kind == "launchd":
+            run(["launchctl", "bootout", f"gui/{os.getuid()}/{TASK_NAME}"], **quiet)
+        elif kind == "systemd":
+            run(["systemctl", "--user", "disable", "--now", f"{TASK_NAME}.service"], **quiet)
+        else:
+            run(["schtasks.exe", "/End", "/TN", TASK_NAME], **quiet)
+            run(["schtasks.exe", "/Delete", "/TN", TASK_NAME, "/F"], **quiet)
+        if kind != "task":
+            shutil.move(str(where), str(backup / where.name))
+            if kind == "systemd":
+                run(["systemctl", "--user", "daemon-reload"], **quiet)
+        done.append(f"stopped and removed the personal {kind} entry ({where})")
+    if personal_cfg.exists():
+        try:
+            raw = json.loads(personal_cfg.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            raw = {}
+        store = make_store({"secret_store": raw.get("secret_store", "auto")}, d, platform)
+        if store is not None:
+            try:
+                store.delete()
+                done.append("forgot the personal refresh token in the OS credential store")
+            except SecretStoreError as e:
+                done.append(f"could not forget the personal refresh token in the OS credential store: {e}")
+        for item in list(d.iterdir()):
+            try:
+                shutil.move(str(item), str(backup / item.name))
+            except OSError as e:
+                done.append(f"could not move {item.name}: {e}")
+        done.append(f"moved the personal config and state to {backup}")
+    if hooks:
+        settings.apply(drop_hooks=True)
+        done.append(f"removed the personal hooks from {settings.path} (the managed settings carry the fleet's)")
+    return done
+
+
 # --------------------------------------------------------------------------------------------- doctor
 # `doctor` and the preflight: read every config source, predict what Claude Code will send, name conflicts.
 # Self-contained: every source has its own small reader (tests mock these), every finding its own check.
@@ -3073,6 +3173,17 @@ def chk_secret_store(ctx):
     if ctx["state"].load().get("refresh_token") and make_store(ctx["cfg"], ctx["state"].dir) is not None:
         return [finding("secret-store", "Warning", "the refresh token is in state.json although an OS credential store is available (secret_store: auto)",
                         "run `aigw-claude-auth login` once to migrate it")]
+
+
+@check("personal-install")
+def chk_personal(ctx):
+    if not ctx["cfg"].get("fleet"):
+        ctx["na"]["personal-install"] = "not a fleet install"
+        return
+    left = personal_leftovers(ctx["cfg"], ctx["state"].dir, ctx["user"])
+    if left:
+        return [finding("personal-install", "Warning", "a personal install is still here next to the fleet install: " + "; ".join(left),
+                        "log out and back in (the fleet's login entry moves it aside), or remove it (README \"4. Teardown\")")]
 
 
 @check("server-managed")

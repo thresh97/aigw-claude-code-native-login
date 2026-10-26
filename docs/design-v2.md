@@ -300,8 +300,8 @@ Fleets need users in different IdP groups to land in different gateway workspace
 
 **Open questions for Portkey**
 
-1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both, and what applies when `defaults` is absent (workspace default config)?
-2. Is a scope such as `completions.write` required, and is it checked per route?
+1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both? (Without `defaults`, the workspace's default config for user API keys applies: README finding 22.)
+2. Is a scope such as `completions.write` required, and is it checked per route? (Not required on the hybrid gateway for `/v1/messages`: finding 22. SaaS and other routes not tested.)
 3. What shape does `rate_limits` take?
 
 ## Sign-in method selection and in-session re-login (new in v2)
@@ -484,7 +484,7 @@ The tested fleet recipe from v1.1.1 is: hooks and `ANTHROPIC_BASE_URL` in Claude
 **Gateway side (once)**
 
 1. Create the passthrough config: it forwards the caller's `authorization` and `anthropic-beta` to Anthropic; its `api_key` is a placeholder. Bind it to the credential (JWT `defaults.config_slug` on hybrid, `config_id` on SaaS) or make it the workspace default.
-2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker.
+2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker. The JWKS URL is per org (one org per tenant service group) and takes a comma-separated list, so a broker and an IdP can be trusted side by side (with both listed, Okta's JWT is accepted: README finding 22; the broker's JWT not re-sent).
 3. Optional, hybrid only: the LB guard. On an L7 load balancer, answer the sentinel with 498 "expired", forward any other header value, answer a missing header on OAuth requests (`anthropic-beta` contains `oauth-2025-04-20`) with 498 "missing", forward the rest.
 
 **Client side**
@@ -586,7 +586,7 @@ Phases are ordered, not dated; dates need an owner and staffing. The Windows por
 5. **Mode 2 local proxy.** JWT in memory; gateway 401 translated to 498; Anthropic 401 passed through; SSE pass-through; fail closed.
    - Gate: a refused JWT through the proxy fails in one attempt with a stored login. **Built 2026-10-26 (client 1.4.0):** `mode: proxy` with `proxy_listen` `127.0.0.1:18787`, per-user secret header `x-aigw-local`, renew-and-retry once, 498 on gateway refusals, Anthropic 401 passed through, fail closed with an in-session sign-in, `inspect --live`, `doctor` proxy findings. Offline `proxy` scenario PASS on macOS (79) and Windows (72, 7 Unix-socket SKIP). **Gate passed 2026-10-26:** `stored_login_proxy` PASS (15 observations) with a stored login on macOS: a refused JWT and a missing JWT each fail in one attempt, the login is neither rotated nor invalidated.
 6. **Packaging and fleet pilot.** Signed packages, managed policy and background entries per OS, pilot users on each platform.
-   - Gate: security review complete before wider rollout.
+   - Gate: security review complete before wider rollout. **Packaging built 2026-10-26, offline-tested** (`packaging/`: 22 unit tests; `.deb` and `.rpm` installed, first run tested and removed in throwaway containers; `.pkg` checked with `pkgutil` and a `DESTDIR` dry run; Windows installer run with `-WhatIf` and an alternate root on the VM). Managed policy goes in a `managed-settings.d` drop-in on every OS (on Windows an `HKLM` `Settings` value outranks it; a fleet that already uses one delivers the same JSON there). The per-user step runs automatically at login. **Emulated pilot 2026-10-26** (after the Okta test against the real gateway, finding 22): real privileged installs and real logons, no MDM, no sign-in: Linux (deb/rpm in a systemd container, two users) and Windows (VM, two autologon users) pass in file and proxy mode; macOS has a person-run driver (`packaging/macos/pilot.sh`). Several users logged in at once is out of scope for now: proxy mode doesn't support it (fixed port, observed on Linux), Windows file mode is untested (`IgnoreNew` on the group task). macOS ran person-run for the console user (file mode). A fleet replaces a personal install of the same user (client 1.4.1: moved aside at login, `doctor` check `personal-install`). Out of scope for now: signing and a bundled interpreter (the pilot uses the system Python).
 
 Phases 3 and 4 can run in parallel once phase 2 lands. If the first rollout target is a SaaS gateway, move phase 5 ahead of phase 4.
 

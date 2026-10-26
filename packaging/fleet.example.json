@@ -1,0 +1,25 @@
+{
+  "name": "aigw-claude-auth",
+  "gateway_url": "https://<gateway host>",
+  "mode": "file",
+  "proxy_listen": "127.0.0.1:18787",
+  "idp": {
+    "issuer": "https://login.microsoftonline.com/<tenant id>/v2.0",
+    "client_id": "<public client app id>",
+    "scope": "openid offline_access api://<broker api app>/access_as_user",
+    "broker_url": "https://<broker>/token/exchange",
+    "redirect_port": 0,
+    "login_method": "auto",
+    "hook_login": "auto"
+  },
+  "options": {
+    "pin_allowed_providers": true,
+    "allow_managed_hooks_only": false,
+    "notify": "auto"
+  },
+  "python": {
+    "macos": "/usr/bin/python3",
+    "linux": "/usr/bin/python3",
+    "windows": "C:\\Program Files\\Python312\\python.exe"
+  }
+}

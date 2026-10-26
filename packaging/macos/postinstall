@@ -1,0 +1,29 @@
+#!/bin/sh
+# pkg postinstall (generated from packaging/macos/postinstall by build.py). Needs no per-user interaction.
+# ROOT: the target volume ($3 from the installer), or DESTDIR for a dry run into a temp dir (nothing live is touched).
+set -u
+ROOT="${DESTDIR:-${3:-/}}"
+ROOT="${ROOT%/}"
+LIBEXEC="$ROOT@INSTALL_DIR@"
+PLIST="$ROOT@PLIST@"
+LABEL="@LABEL@"
+
+# root:wheel when we are root (a dry run as a normal user skips the chown)
+own() { [ "$(id -u)" = 0 ] && chown "$@" || true; }
+chmod 755 "$LIBEXEC" "$LIBEXEC/aigw_claude_auth.py" "$LIBEXEC/aigw_launch.py" "$LIBEXEC/uninstall.sh"
+chmod 644 "$LIBEXEC/config.json" "$PLIST" "$ROOT@MANAGED@"
+own -R root:wheel "$LIBEXEC"
+own root:wheel "$PLIST" "$ROOT@MANAGED@"
+
+# A bad plist would make launchd ignore the agent for every user: fail the install visibly instead.
+/usr/bin/plutil -lint "$PLIST" >/dev/null || exit 1
+
+# Start the agent for the user at the console now; everyone else gets it at their next login (it lives in /Library/LaunchAgents).
+if [ -z "${DESTDIR:-}" ] && [ "${3:-/}" = "/" ]; then
+    user="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+    if [ -n "$user" ] && [ "$user" != root ] && uid="$(/usr/bin/id -u "$user" 2>/dev/null)"; then
+        /bin/launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
+        /bin/launchctl bootstrap "gui/$uid" "$PLIST" >/dev/null 2>&1 || true
+    fi
+fi
+exit 0

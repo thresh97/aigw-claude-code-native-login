@@ -182,6 +182,7 @@ class Base(unittest.TestCase):
         mock.patch.object(A, "managed_dir", return_value=self.managed).start()
         mock.patch.object(A, "plist_paths", return_value=[]).start()
         mock.patch.object(A, "read_registry_policy", return_value=(None, "", "")).start()
+        mock.patch.object(A, "personal_entry", return_value=None).start()      # never this machine's own personal install
         self.addCleanup(mock.patch.stopall)
 
     def tearDown(self):
@@ -911,6 +912,65 @@ class DaemonTests(Base):
 
 
 REAL_REGISTRY_READER = A.read_registry_policy         # Base.setUp patches the module's; one test wants the real one
+
+
+class FleetTakeoverTests(Base):
+    """A fleet install (config key `fleet`) moves a personal install of the same user aside; doctor reports leftovers."""
+
+    def personal(self):
+        """A personal install: config and state in the state dir, our hooks plus someone else's in the user's settings,
+        a background entry."""
+        self.state_dir.mkdir(parents=True)
+        (self.state_dir / "config.json").write_text(json.dumps({"issuer": "https://other-idp.example", "client_id": "p", "secret_store": "file"}))
+        (self.state_dir / "state.json").write_text(json.dumps({"refresh_token": "personal-rt"}))
+        self.settings_path.parent.mkdir(parents=True)
+        theirs = {"hooks": [{"type": "command", "command": "other-tool"}]}
+        self.settings_path.write_text(json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": "x-portkey-api-key: a.b.c"},
+                                                  "hooks": {"UserPromptSubmit": [A.hook_entry("aigw-claude-auth", "precheck"), theirs],
+                                                            "StopFailure": [A.hook_entry("aigw-claude-auth", "stop-failure")]}}))
+        unit = self.tmp / "aigw-claude-auth.service"
+        unit.write_text("[Unit]\n")
+        A.personal_entry.return_value = ("systemd", unit)
+        return unit, theirs
+
+    def take_over(self):
+        calls = []
+        cfg = A.load_config(self.config_path)
+        done = A.take_over_personal(cfg, A.State(self.state_dir), A.Settings(self.settings_path, cfg["header"]),
+                                    run=lambda argv, **kw: calls.append(argv), platform="linux")
+        return done, calls
+
+    def test_fleet_moves_the_personal_install_aside(self):
+        self.write_config(fleet=True)
+        unit, theirs = self.personal()
+        done, calls = self.take_over()
+        self.assertEqual(calls, [["systemctl", "--user", "disable", "--now", "aigw-claude-auth.service"], ["systemctl", "--user", "daemon-reload"]])
+        backup, = self.tmp.glob("state.personal-*")
+        self.assertEqual(sorted(p.name for p in backup.iterdir()), ["aigw-claude-auth.service", "config.json", "state.json"])
+        self.assertEqual(list(self.state_dir.iterdir()), [])                  # the fleet starts with an empty state dir
+        s = json.loads(self.settings_path.read_text())
+        self.assertEqual(s["hooks"], {"UserPromptSubmit": [theirs]})          # only our hooks go
+        self.assertIn("x-portkey-api-key", s["env"]["ANTHROPIC_CUSTOM_HEADERS"])
+        self.assertEqual(len(done), 3)
+        A.personal_entry.return_value = None
+        self.assertEqual(self.take_over(), ([], []))                          # the next login finds nothing to do
+
+    def test_personal_config_alone_is_not_touched(self):
+        self.personal()
+        self.assertEqual(self.take_over(), ([], []))
+        self.assertTrue((self.state_dir / "config.json").exists())
+
+    def test_doctor_reports_a_personal_install_only_for_a_fleet(self):
+        self.personal()
+        code, report, ids = DoctorTests.doctor(self)
+        self.assertNotIn("personal-install", ids)
+        self.assertIn("personal-install", [n["id"] for n in report["not_applicable"]])
+        self.write_config(fleet=True)
+        code, report, ids = DoctorTests.doctor(self)
+        self.assertEqual(ids["personal-install"], "Warning")
+        msg = [f["message"] for f in report["findings"] if f["id"] == "personal-install"][0]
+        for part in ("config.json", "systemd entry", "hooks"):
+            self.assertIn(part, msg)
 
 
 class DoctorTests(Base):

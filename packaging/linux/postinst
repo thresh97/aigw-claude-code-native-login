@@ -1,0 +1,14 @@
+#!/bin/sh
+# deb postinst / rpm %post (generated from packaging/linux/postinst by build.py). No per-user interaction.
+# Enable the user unit for every user: it starts at their next login (or user-manager start).
+set -e
+UNIT="@UNIT@"
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable "$UNIT" >/dev/null 2>&1 || true
+fi
+# systemctl --global only writes this symlink; without systemctl (minimal containers) write it ourselves
+if [ ! -e "/etc/systemd/user/default.target.wants/$UNIT" ]; then
+    mkdir -p /etc/systemd/user/default.target.wants
+    ln -sf "/usr/lib/systemd/user/$UNIT" "/etc/systemd/user/default.target.wants/$UNIT"
+fi
+exit 0
