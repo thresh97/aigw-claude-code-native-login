@@ -46,6 +46,11 @@ class FakeIdP:
         self.issue_refresh = True
         self.broker_status = 200
         self.idp_lifetime = 3600
+        self.device_desc = "AADSTS50105: blocked by policy"
+        self.device_error = None         # e.g. "unauthorized_client": the device grant is refused (policy)
+        self.advertise_device = True     # device_authorization_endpoint in discovery
+        self.grants = None               # grant_types_supported in discovery
+        self.code_error = None           # e.g. "redirect_uri_mismatch" at the code exchange
         self.broker_lifetime = 3600
         idp = self
 
@@ -65,9 +70,12 @@ class FakeIdP:
                 u = urllib.parse.urlsplit(self.path)
                 idp.calls.append(("GET", u.path))
                 if u.path == "/.well-known/openid-configuration":
-                    return self._json(200, {"issuer": idp.url, "token_endpoint": idp.url + "/token",
-                                            "device_authorization_endpoint": idp.url + "/device",
-                                            "authorization_endpoint": idp.url + "/authorize"})
+                    doc = {"issuer": idp.url, "token_endpoint": idp.url + "/token", "authorization_endpoint": idp.url + "/authorize"}
+                    if idp.advertise_device:
+                        doc["device_authorization_endpoint"] = idp.url + "/device"
+                    if idp.grants:
+                        doc["grant_types_supported"] = idp.grants
+                    return self._json(200, doc)
                 if u.path == "/authorize":   # the "browser": sign in at once and redirect to the loopback
                     q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
                     assert q["code_challenge_method"] == "S256"
@@ -85,6 +93,8 @@ class FakeIdP:
                 n = int(self.headers.get("Content-Length") or 0)
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(n).decode()).items()}
                 idp.calls.append(("POST", self.path, form.get("grant_type")))
+                if self.path == "/device" and idp.device_error:
+                    return self._json(400, {"error": idp.device_error, "error_description": idp.device_desc})
                 if self.path == "/device":
                     return self._json(200, {"device_code": "dev-1", "user_code": "ABCD-EFGH", "verification_uri": idp.url + "/activate",
                                             "expires_in": 60, "interval": 0})
@@ -99,6 +109,8 @@ class FakeIdP:
                         if idp.device_polls <= idp.device_pending:
                             return self._json(400, {"error": "authorization_pending"})
                         return self._json(200, idp.tokens())
+                    if g == "authorization_code" and idp.code_error:
+                        return self._json(400, {"error": idp.code_error, "error_description": "AADSTS500113: no reply address"})
                     if g == "authorization_code":
                         challenge, redirect = idp.codes.pop(form.get("code"), (None, None))
                         ok = challenge and redirect == form.get("redirect_uri") and challenge == base64.urlsafe_b64encode(
@@ -144,8 +156,21 @@ def hook_words(h):
     return " ".join([h["command"], *h.get("args", [])])
 
 
+HEADLESS = {"platform": "linux", "ssh": False, "browser_env": False, "vscode": False, "container": False, "wsl": False,
+            "wsl_opener": False, "desktop": False}
+
+
 class Base(unittest.TestCase):
     def setUp(self):
+        # the machine running the tests must not decide the sign-in method (or open a browser): headless, no overrides
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for k in ("AIGW_LOGIN_METHOD", "AIGW_HOOK_LOGIN"):
+            os.environ.pop(k, None)
+        sig = mock.patch.object(A, "environment_signals", side_effect=lambda env=None: dict(HEADLESS))
+        sig.start()
+        self.addCleanup(sig.stop)
         self.idp = FakeIdP()
         self.tmp = Path(tempfile.mkdtemp(prefix="aigw-auth-test-"))
         self.state_dir = self.tmp / "state"
@@ -493,6 +518,377 @@ class HookTests(Base):
         payload = {"last_assistant_message": "Failed to authenticate. API Error: 401 anthropic error: OAuth access token is invalid."}
         self.run_cli("hook", "stop-failure", stdin=json.dumps(payload))
         self.assertEqual(self.header(), cur)
+
+
+SIG_KEYS = ("ssh", "browser_env", "vscode", "container", "wsl", "wsl_opener", "desktop")
+
+
+def sig(platform="linux", **on):
+    return dict(HEADLESS, platform=platform, **{k: True for k in on if on[k]})
+
+
+SUPPORT = {"device": True, "pkce": True}
+CFG = dict(A.DEFAULTS)
+
+
+def choose(flag=None, env=None, cfg=None, st=None, support=SUPPORT, signals=None, hook=False, now=None):
+    return A.choose_method(flag, env or {}, dict(CFG, **(cfg or {})), st or {}, support, signals or sig(), hook=hook, now=now)[0]
+
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class MethodSelectionTests(unittest.TestCase):
+    """Environment signals -> method, on every platform, with the probes mocked."""
+
+    def test_detection_matrix(self):
+        cases = [
+            ("macOS with a GUI session", sig("darwin", desktop=True), "pkce"),
+            ("macOS without a GUI session", sig("darwin"), "device"),
+            ("macOS GUI, over ssh", sig("darwin", desktop=True, ssh=True), "device"),
+            ("ssh with a forwarded BROWSER", sig(ssh=True, browser_env=True), "pkce"),
+            ("ssh, Linux with DISPLAY", sig(ssh=True, desktop=True), "device"),
+            ("Linux DISPLAY or WAYLAND_DISPLAY", sig(desktop=True), "pkce"),
+            ("Linux, nothing", sig(), "device"),
+            ("container", sig(container=True, desktop=True), "device"),
+            ("container with BROWSER", sig(container=True, browser_env=True), "pkce"),
+            ("VS Code dev container", sig(container=True, vscode=True), "pkce"),
+            ("VS Code remote over ssh", sig(ssh=True, vscode=True, browser_env=True), "pkce"),
+            ("WSL with a Windows opener", sig(wsl=True, wsl_opener=True), "pkce"),
+            ("WSL without one", sig(wsl=True), "device"),
+            ("Windows desktop session", sig("windows", desktop=True), "pkce"),
+            ("Windows service or ssh session", sig("windows"), "device"),
+        ]
+        for name, s, want in cases:
+            with self.subTest(name):
+                self.assertEqual(choose(signals=s), want)
+
+    def test_signals_from_environment_and_probes(self):
+        with mock.patch.object(A, "platform_name", return_value="darwin"), mock.patch.object(A, "probe_macos_gui", return_value=True), \
+                mock.patch.object(A, "probe_container", return_value=False):
+            self.assertTrue(A.environment_signals({})["desktop"])
+            s = A.environment_signals({"SSH_TTY": "/dev/ttys001"})
+            self.assertTrue(s["ssh"])
+            self.assertEqual(A.classify_environment(s), "headless")
+        with mock.patch.object(A, "platform_name", return_value="linux"), mock.patch.object(A, "probe_container", return_value=False):
+            self.assertTrue(A.environment_signals({"WAYLAND_DISPLAY": "wayland-0"})["desktop"])
+            self.assertFalse(A.environment_signals({})["desktop"])
+            self.assertTrue(A.environment_signals({"VSCODE_IPC_HOOK_CLI": "/x"})["vscode"])
+            self.assertTrue(A.environment_signals({"BROWSER": "/home/u/.vscode-server/bin/helper/bin/helpers/browser.sh"})["vscode"])
+            with mock.patch.object(A, "probe_wsl_opener", return_value=True):
+                s = A.environment_signals({"WSL_DISTRO_NAME": "Ubuntu"})
+                self.assertEqual((s["wsl"], s["wsl_opener"]), (True, True))
+        with mock.patch.object(A, "platform_name", return_value="windows"), mock.patch.object(A, "probe_container", return_value=False):
+            self.assertTrue(A.environment_signals({"SESSIONNAME": "Console"})["desktop"])
+            self.assertTrue(A.environment_signals({"SESSIONNAME": "RDP-Tcp#1"})["desktop"])
+            self.assertFalse(A.environment_signals({"SESSIONNAME": "Console", "SSH_CONNECTION": "a b c d"})["desktop"])
+            self.assertFalse(A.environment_signals({"SESSIONNAME": "Services"})["desktop"])
+            self.assertFalse(A.environment_signals({})["desktop"])
+
+    def test_macos_probe_runs_launchctl_for_this_user(self):
+        if sys.platform == "win32":
+            self.skipTest("POSIX uid")
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertTrue(A.probe_macos_gui())
+            self.assertEqual(run.call_args[0][0], ["launchctl", "print", f"gui/{os.getuid()}"])
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=113)):
+            self.assertFalse(A.probe_macos_gui())
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertFalse(A.probe_macos_gui())
+
+    def test_precedence(self):
+        gui = sig("darwin", desktop=True)
+        st = {"last_login_method": "device"}
+        self.assertEqual(choose(signals=gui), "pkce")
+        self.assertEqual(choose(signals=gui, st=st), "device")                                           # remembered beats detection
+        self.assertEqual(choose(signals=gui, st=st, cfg={"login_method": "pkce-print"}), "pkce-print")   # config beats remembered
+        self.assertEqual(choose(signals=gui, st=st, cfg={"login_method": "pkce-print"}, env={"AIGW_LOGIN_METHOD": "pkce"}), "pkce")
+        self.assertEqual(choose(flag="pkce-paste", signals=gui, st=st, cfg={"login_method": "pkce-print"}, env={"AIGW_LOGIN_METHOD": "pkce"}), "pkce-paste")
+        self.assertEqual(choose(signals=gui, st=st, env={"AIGW_LOGIN_METHOD": "auto"}), "device")       # auto defers to the next rule
+        self.assertEqual(choose(env={"AIGW_LOGIN_METHOD": "paste"}), "pkce-paste")
+        with self.assertRaises(A.AuthError):
+            choose(env={"AIGW_LOGIN_METHOD": "carrier-pigeon"})
+
+    def test_remembered_method_must_be_viable_here(self):
+        st = {"last_login_method": "pkce"}                      # signed in on the desktop; now over ssh
+        self.assertEqual(choose(signals=sig(ssh=True), st=st), "device")
+        self.assertEqual(choose(signals=sig(), st={"last_login_method": "pkce-print"}), "device")          # no fixed port to forward
+        self.assertEqual(choose(signals=sig(), st={"last_login_method": "pkce-print"}, cfg={"redirect_port": 8765}), "pkce-print")
+        self.assertEqual(choose(signals=sig(), st={"last_login_method": "pkce-paste"}), "pkce-paste")
+        self.assertEqual(choose(signals=sig(), st={"last_login_method": "pkce-paste"}, hook=True), "device")   # a hook has no terminal
+
+    def test_fallback_order_when_device_is_unavailable(self):
+        no_dev = {"device": False, "pkce": True}
+        self.assertEqual(choose(support=no_dev), "pkce-paste")                                  # headless, no port
+        self.assertEqual(choose(support=no_dev, cfg={"redirect_port": 8765}), "pkce-print")     # headless, forwardable port
+        self.assertIsNone(choose(support=no_dev, hook=True))                                    # hook: block with next steps
+        self.assertEqual(choose(support=no_dev, hook=True, cfg={"redirect_port": 8765}), "pkce-print")
+        self.assertEqual(choose(support=no_dev, signals=sig(desktop=True)), "pkce")
+        self.assertIsNone(choose(support={"device": False, "pkce": False}))
+
+    def test_flag_ignored_in_hook_but_env_and_config_apply(self):
+        self.assertEqual(choose(flag="pkce", hook=True), "device")
+        self.assertEqual(choose(hook=True, env={"AIGW_LOGIN_METHOD": "pkce"}), "pkce")
+        self.assertIsNone(choose(hook=True, cfg={"login_method": "pkce-paste"}))
+
+    def test_learned_refusal_expires(self):
+        st = {"device_unavailable": {"until": 1000}}
+        self.assertEqual(choose(st=st, now=999), "pkce-paste")
+        self.assertEqual(choose(st=st, now=1001), "device")
+        pk = {"pkce_unavailable": {"until": 1000}}
+        self.assertEqual(choose(signals=sig(desktop=True), st=pk, now=999), "device")
+        self.assertIsNone(choose(st=dict(st, **pk), now=999))
+
+    def test_idp_support_from_discovery(self):
+        class Src:
+            def __init__(self, ep):
+                self.ep = ep
+
+            def endpoints(self):
+                return self.ep
+        full = {"device_authorization_endpoint": "x", "authorization_endpoint": "y"}
+        self.assertEqual(A.idp_support(Src(full)), {"device": True, "pkce": True})
+        self.assertEqual(A.idp_support(Src(dict(full, grant_types_supported=["authorization_code"]))), {"device": False, "pkce": True})
+        self.assertEqual(A.idp_support(Src({"authorization_endpoint": "y"})), {"device": False, "pkce": True})
+        self.assertEqual(A.idp_support(Src(dict(full, grant_types_supported=["urn:ietf:params:oauth:grant-type:device_code"]))), {"device": True, "pkce": False})
+
+    def test_config_validation(self):
+        d = Path(tempfile.mkdtemp(prefix="aigw-auth-test-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        f = d / "c.json"
+        for k, v in (("login_method", "pigeon"), ("hook_login", "pkce")):
+            f.write_text(json.dumps({"client_id": "x", k: v}))
+            with self.assertRaises(A.AuthError):
+                A.load_config(f)
+        f.write_text(json.dumps({"client_id": "x", "login_method": "pkce-paste", "hook_login": "auto"}))
+        self.assertEqual(A.load_config(f)["login_method"], "pkce-paste")
+
+    def test_hook_login_env_override(self):
+        self.assertEqual(A.effective_hook_login({"hook_login": "auto"}, {"AIGW_HOOK_LOGIN": "off"}), "off")
+        self.assertEqual(A.effective_hook_login({"hook_login": "off"}, {"AIGW_HOOK_LOGIN": "device"}), "device")
+        self.assertEqual(A.effective_hook_login({"hook_login": "device"}, {}), "device")
+
+    def test_parse_redirect(self):
+        self.assertEqual(A.parse_redirect(" http://127.0.0.1:5/?code=a&state=b#x \n"), {"code": "a", "state": "b"})
+        self.assertEqual(A.parse_redirect("code=a&state=b"), {"code": "a", "state": "b"})
+        self.assertEqual(A.parse_redirect("http://127.0.0.1:5/"), {})
+
+
+def no_redirect_opener():
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    return urllib.request.build_opener(NoRedirect)
+
+
+class PasteStdin:
+    """A stdin that answers like the user would: read the URL we printed, 'sign in', hand back the redirect address."""
+
+    def __init__(self, tamper=None, blank=False):
+        self.tamper, self.blank = tamper, blank
+
+    def readline(self):
+        if self.blank:
+            return "\n"
+        url = [l.strip() for l in sys.stderr.getvalue().splitlines() if l.strip().startswith("http")][0]
+        try:
+            no_redirect_opener().open(url, timeout=10)
+        except urllib.error.HTTPError as e:                      # the 302 to the loopback that nobody serves
+            target = e.headers["Location"]
+        return (self.tamper(target) if self.tamper else target) + "\n"
+
+
+class SignInSelectionTests(Base):
+    def run_cli_keep_stdin(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = A.main(["--config", str(self.config_path), "--state-dir", str(self.state_dir), "--settings", str(self.settings_path), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_paste_flow_end_to_end_with_device_grant_disabled(self):
+        self.idp.advertise_device = False
+        self.idp.grants = ["authorization_code", "refresh_token"]
+        with mock.patch("sys.stdin", PasteStdin()):
+            code, _, err = self.run_cli_keep_stdin("login", "--paste")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+        st = A.State(self.state_dir).load()
+        self.assertEqual(st["last_login_method"], "pkce-paste")
+        self.assertTrue(st["refresh_token"])
+        self.assertNotIn(("POST", "/device", None), self.idp.calls)
+
+    def test_paste_rejects_wrong_state_and_blank(self):
+        for stdin, msg in ((PasteStdin(tamper=lambda u: u.replace("state=", "state=x")), "wrong state"), (PasteStdin(blank=True), "nothing pasted")):
+            with mock.patch("sys.stdin", stdin):
+                code, _, err = self.run_cli_keep_stdin("login", "--paste")
+            self.assertEqual(code, 1)
+            self.assertIn(msg, err)
+        self.assertFalse(self.settings_path.exists())
+        self.assertNotIn("refresh_token", A.State(self.state_dir).load())
+
+    def test_pkce_print_flag(self):
+        port = free_port()
+        self.write_config(redirect_port=port)
+        err = io.StringIO()
+
+        def browser_user():
+            end = time.time() + 10
+            while time.time() < end:
+                time.sleep(0.1)
+                m = [l for l in err.getvalue().splitlines() if "open http" in l]
+                if m:
+                    return urllib.request.urlopen(m[0].split("open ", 1)[1].strip(), timeout=10).read()
+        t = threading.Thread(target=browser_user, daemon=True)
+        t.start()
+        with redirect_stderr(err), mock.patch("webbrowser.open") as wb:
+            code = A.main(["--config", str(self.config_path), "--state-dir", str(self.state_dir), "--settings", str(self.settings_path), "login", "--pkce-print"])
+        t.join(10)
+        self.assertEqual(code, 0, err.getvalue())
+        wb.assert_not_called()
+        self.assertIn(f"ssh -L {port}:127.0.0.1:{port}", err.getvalue())
+        self.assertEqual(A.State(self.state_dir).load()["last_login_method"], "pkce-print")
+
+    def test_remembered_method_is_reused_and_flag_overrides_it(self):
+        self.write_config(redirect_port=free_port())
+        st = A.State(self.state_dir)
+        st.save({"last_login_method": "pkce-print"})
+        # no flag: the remembered pkce-print (viable: fixed port) is chosen over device
+        self.assertEqual(A.choose_method(None, {}, A.load_config(self.config_path), st.load(), SUPPORT, dict(HEADLESS))[0], "pkce-print")
+        with mock.patch("time.sleep"):
+            code, _, err = self.run_cli("login", "--device")                  # the flag wins
+        self.assertEqual(code, 0, err)
+        self.assertIn(("POST", "/device", None), self.idp.calls)
+        self.assertEqual(st.load()["last_login_method"], "device")
+
+    def test_login_learns_device_unavailable_and_falls_back(self):
+        self.idp.device_error = "unauthorized_client"
+        with mock.patch("sys.stdin", PasteStdin()):
+            code, _, err = self.run_cli_keep_stdin("login")
+        self.assertEqual(code, 0, err)
+        self.assertIn("trying another method", err)
+        st = A.State(self.state_dir).load()
+        self.assertEqual(st["last_login_method"], "pkce-paste")
+        d = st["device_unavailable"]
+        self.assertIn("unauthorized_client", d["reason"])
+        self.assertIn("AADSTS50105", d["reason"])
+        self.assertAlmostEqual(d["until"] - time.time(), 86400, delta=60)
+        self.assertEqual(sum(1 for c in self.idp.calls if c[1] == "/device"), 1)
+        self.idp.calls.clear()                                                  # remembered: no second device attempt
+        with mock.patch("sys.stdin", PasteStdin()):
+            self.assertEqual(self.run_cli_keep_stdin("login")[0], 0)
+        self.assertEqual(sum(1 for c in self.idp.calls if c[1] == "/device"), 0)
+
+    def test_explicit_device_is_not_second_guessed(self):
+        self.idp.device_error = "invalid_grant"
+        code, _, err = self.run_cli("login", "--device")
+        self.assertEqual(code, 1)
+        self.assertIn("device_unavailable", A.State(self.state_dir).load())
+
+    def test_unrelated_device_errors_are_not_learned(self):
+        self.idp.device_error = "temporarily_unavailable"
+        self.idp.device_desc = "try again later"
+        self.run_cli("login", "--device")
+        self.assertNotIn("device_unavailable", A.State(self.state_dir).load())
+
+    def test_pkce_redirect_refusal_is_learned(self):
+        self.idp.code_error = "redirect_uri_mismatch"
+        with mock.patch("webbrowser.open", side_effect=lambda url: threading.Thread(target=lambda: urllib.request.urlopen(url, timeout=10).read(), daemon=True).start()):
+            code, _, err = self.run_cli("login", "--pkce")
+        self.assertEqual(code, 1)
+        self.assertIn("pkce_unavailable", A.State(self.state_dir).load())
+
+    # -- in the Claude Code session (precheck hook)
+    def wait_for(self, cond, timeout=15):
+        end = time.time() + timeout
+        while not cond():
+            self.assertLess(time.time(), end, "timed out")
+            time.sleep(0.2)
+
+    def pending(self):
+        return json.loads(self.state_dir.joinpath("hook-login.json").read_text())
+
+    @staticmethod
+    def url_in(reason):
+        return reason.split("open ", 1)[1].split(" ", 1)[0]
+
+    def test_hook_blocks_with_next_steps_when_nothing_is_viable(self):
+        self.idp.device_error = "unauthorized_client"
+        self.put_header("expired")
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        reason = json.loads(out)["reason"]
+        self.assertIn("login --paste", reason)
+        self.assertIn("ssh -L", reason)
+        self.assertIn("device_unavailable", A.State(self.state_dir).load())
+        self.assertFalse(self.state_dir.joinpath("hook-login.json").exists())
+
+    def test_hook_pkce_print_in_session_end_to_end(self):
+        self.idp.device_error = "unauthorized_client"            # the device grant is off: PKCE is the way
+        port = free_port()
+        self.write_config(redirect_port=port)
+        self.put_header("expired")
+        t0 = time.time()
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        self.assertLess(time.time() - t0, 10, "the hook must not wait for the user")
+        reason = json.loads(out)["reason"]
+        self.assertIn(self.idp.url + "/authorize", reason)
+        self.assertIn(f"ssh -L {port}:127.0.0.1:{port}", reason)
+        _, out2, _ = self.run_cli("hook", "precheck", stdin="{}")      # the second prompt reuses the pending sign-in
+        self.assertEqual(self.url_in(json.loads(out2)["reason"]), self.url_in(reason))
+        urllib.request.urlopen(self.url_in(reason), timeout=10).read()  # the user signs in
+        self.wait_for(lambda: self.settings_path.exists() and A.jwt_claims(self.header()).get("kind") == "gateway")
+        self.wait_for(lambda: not self.state_dir.joinpath("hook-login.json").exists())
+        self.assertEqual(sum(1 for c in self.idp.calls if c[1] == "/authorize"), 1)
+        self.assertEqual(A.State(self.state_dir).load()["last_login_method"], "pkce-print")
+        self.assertEqual(self.run_cli("hook", "precheck", stdin="{}")[:2], (0, ""))
+
+    def test_hook_remembered_pkce_print_preferred_over_device(self):
+        self.write_config(redirect_port=free_port())
+        A.State(self.state_dir).save({"last_login_method": "pkce-print"})
+        self.put_header("expired")
+        reason = json.loads(self.run_cli("hook", "precheck", stdin="{}")[1])["reason"]
+        self.assertIn("/authorize", reason)
+        self.assertNotIn("ABCD-EFGH", reason)
+        os.kill(self.pending()["pid"], 15)
+
+    def test_hook_env_overrides_remembered(self):
+        self.write_config(redirect_port=free_port())
+        A.State(self.state_dir).save({"last_login_method": "pkce-print"})
+        self.put_header("expired")
+        os.environ["AIGW_LOGIN_METHOD"] = "device"
+        self.idp.device_pending = 10**6
+        reason = json.loads(self.run_cli("hook", "precheck", stdin="{}")[1])["reason"]
+        self.assertIn("ABCD-EFGH", reason)
+        os.kill(self.pending()["pid"], 15)
+
+    def test_hook_login_off_by_env(self):
+        os.environ["AIGW_HOOK_LOGIN"] = "off"
+        self.put_header("expired")
+        code, out, _ = self.run_cli("hook", "precheck", stdin="{}")
+        d = json.loads(out)
+        self.assertEqual(d["decision"], "block")
+        self.assertNotIn("ABCD-EFGH", d["reason"])
+        self.assertNotIn(("POST", "/device", None), self.idp.calls)
+        self.assertFalse(self.state_dir.joinpath("hook-login.json").exists())
+
+    def test_hook_pkce_worker_opens_browser(self):
+        """`pkce` in the worker (run in-process here so the browser opener can be mocked)."""
+        opened = []
+
+        def browser(url):
+            opened.append(url)
+            threading.Thread(target=lambda: urllib.request.urlopen(url, timeout=10).read(), daemon=True).start()
+            return True
+        argv = ["--config", str(self.config_path), "--state-dir", str(self.state_dir), "--settings", str(self.settings_path), "hook-login-wait", "--method", "pkce"]
+        with mock.patch("webbrowser.open", side_effect=browser), mock.patch.object(A, "notify"):
+            self.assertEqual(A.main(argv), 0)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(A.jwt_claims(self.header())["kind"], "gateway")
+        self.assertEqual(A.State(self.state_dir).load()["last_login_method"], "pkce")
+        self.assertFalse(self.state_dir.joinpath("hook-login.json").exists())
 
 
 class DaemonTests(Base):
