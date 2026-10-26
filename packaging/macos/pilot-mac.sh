@@ -1,15 +1,17 @@
 #!/bin/bash
 # Emulated pilot on this Mac: a real privileged install of the fleet .pkg, checks for the console user and an optional
-# second local user (logged in by hand with fast user switching), then uninstall and restore. A person runs this, from a
+# second local user (logged in by hand with fast user switching), then uninstall. A person runs this, from a
 # terminal that is not a Claude Code session: the managed drop-in reroutes every Claude Code on the machine.
 #
-#   pilot-mac.sh install <fleet.json> [--with-user]   build + `sudo installer`; sets a personal install aside first;
-#                                                     --with-user also creates the standard user `aigwpilot`
+#   pilot-mac.sh install <fleet.json> [--with-user]   build + `sudo installer`; --with-user also creates the standard
+#                                                     user `aigwpilot`
 #   pilot-mac.sh check                                checks for the console user and aigwpilot (if logged in)
-#   pilot-mac.sh uninstall                            purge the users the pilot touched, uninstall, delete aigwpilot,
-#                                                     restore the personal install
+#   pilot-mac.sh uninstall                            purge the users the pilot touched, uninstall, delete aigwpilot
 #
-# Work dir, backups and logs: ~/.aigw-pilot (AIGW_PILOT_DIR). Never prints tokens or the proxy secret (hashes only).
+# A personal install of a user is taken over by the fleet at that user's login (packaging/README.md, "A personal install
+# on the same machine"): the pilot exercises that, it doesn't set one aside or restore it.
+#
+# Work dir and logs: ~/.aigw-pilot (AIGW_PILOT_DIR). Never prints tokens or the proxy secret (hashes only).
 # bash 3.2 (macOS /bin/bash).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -20,9 +22,6 @@ LIBEXEC=/usr/local/libexec/aigw-claude-auth
 MANAGED_DIR="/Library/Application Support/ClaudeCode"
 PILOT_USER=aigwpilot
 IDENTIFIER=org.aigw.claude-auth
-PERSONAL_PLIST="$HOME/Library/LaunchAgents/aigw-claude-auth.plist"
-PERSONAL_LABEL=aigw-claude-auth
-PERSONAL_DIR="$HOME/.config/aigw-claude-auth"
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -55,22 +54,10 @@ cmd_install() {
     local pkg; pkg="$(ls "$W"/dist/*.pkg | head -1)"
     ok "built $(basename "$pkg")"
 
-    step "set the personal install aside"
-    local backup="$W/personal-backup"
-    mkdir -p "$backup"
-    cp -p "$HOME/.claude/settings.json" "$backup/settings.json" 2>/dev/null && ok "copied ~/.claude/settings.json"
-    if [ -f "$PERSONAL_PLIST" ]; then
-        /bin/launchctl bootout "gui/$(id -u)/$PERSONAL_LABEL" >/dev/null 2>&1
-        ok "stopped the personal LaunchAgent $PERSONAL_LABEL (plist left in place)"
-    fi
-    if [ -d "$PERSONAL_DIR" ]; then
-        mv "$PERSONAL_DIR" "$backup/config" && ok "moved $PERSONAL_DIR aside"
-    fi
     cat >"$STATE" <<EOF
 NAME='$name'
 MODE='$mode'
 LABEL='$name.fleet'
-BACKUP='$backup'
 PILOT_CREATED=0
 EOF
 
@@ -197,16 +184,8 @@ cmd_uninstall() {
         fi
         sudo /usr/sbin/sysadminctl -deleteUser "$PILOT_USER" >/dev/null 2>&1 && ok "deleted $PILOT_USER and its home" || bad "sysadminctl -deleteUser failed"
     fi
-    step "restore the personal install"
-    if [ -d "$BACKUP/config" ]; then
-        rm -rf "$PERSONAL_DIR" && mv "$BACKUP/config" "$PERSONAL_DIR" && ok "restored $PERSONAL_DIR"
-    fi
-    [ -f "$BACKUP/settings.json" ] && cp -p "$BACKUP/settings.json" "$HOME/.claude/settings.json" && ok "restored ~/.claude/settings.json"
-    if [ -f "$PERSONAL_PLIST" ]; then
-        /bin/launchctl bootstrap "gui/$(id -u)" "$PERSONAL_PLIST" >/dev/null 2>&1 && ok "restarted $PERSONAL_LABEL" || bad "could not restart $PERSONAL_LABEL"
-    fi
     step "result: $FAILS failure(s)"
-    [ "$FAILS" = 0 ] && rm -f "$STATE" && rm -rf "$BACKUP" && say "pilot state removed; build output and logs stay in $W"
+    [ "$FAILS" = 0 ] && rm -f "$STATE" && say "pilot state removed; build output and logs stay in $W"
 }
 
 case "${1:-}" in

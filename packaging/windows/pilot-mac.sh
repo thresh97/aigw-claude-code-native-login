@@ -6,10 +6,10 @@
 #   pilot-mac.sh phase   <file|proxy> <phase> [user]   run one phase (install, check, concurrent, uninstall, cleanup)
 #   pilot-mac.sh logon   <file|proxy> <user>           logon-prep, wait for the reboot, wait for ssh, then check
 #
-# Env: PILOT_HOST (default aigw-win), PILOT_WORK (default C:\aigw-pilot), PILOT_OUT (default a temp dir for the build).
+# Env: PILOT_HOST (required: an ssh host or alias for the disposable VM), PILOT_WORK (default C:\aigw-pilot), PILOT_OUT (default a temp dir for the build).
 set -euo pipefail
 [ -z "${PILOT_TRACE:-}" ] || set -x
-HOST="${PILOT_HOST:-aigw-win}"
+HOST="${PILOT_HOST:?set PILOT_HOST to the ssh host or alias of a disposable Windows VM}"
 WORK="${PILOT_WORK:-C:\\aigw-pilot}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"

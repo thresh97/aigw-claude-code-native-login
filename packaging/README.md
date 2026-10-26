@@ -154,7 +154,7 @@ Machines where several users are logged in at the same time (terminal servers, f
   unsigned pkg succeeds; drop-in valid without `ANTHROPIC_CUSTOM_HEADERS`, plist lints, receipt present; the postinstall's `launchctl bootstrap`
   started the LaunchAgent for the console user, whose first run wrote only the sentinel line (the launcher logs `install --no-hooks exit 1`:
   not signed in); `doctor` 0 errors, 0 warnings (Info `server-managed`). Uninstall (purge of the console user, then `uninstall.sh`) removed
-  files, drop-in, plist, receipt, the loaded agent and any Keychain item; the personal install set aside before was restored and restarted.
+  files, drop-in, plist, receipt, the loaded agent and any Keychain item; that run's driver also set a personal install aside and restored it (removed since: the fleet now takes a personal install over, client 1.4.1).
   Not run on macOS: a second user's login (LaunchAgent at login), proxy mode, sign-in from the first prompt.
 
 Not covered: a real MDM/Intune push, the macOS LaunchAgent starting at a real login and proxy mode on macOS, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
