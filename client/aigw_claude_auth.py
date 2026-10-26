@@ -82,6 +82,8 @@ DEFAULTS = {
     "notify": "auto",                  # desktop notification (StopFailure renewal, hook sign-in result): auto | off | a command (gets the message as $1)
     "redirect_uri": "http://127.0.0.1:{port}/",  # PKCE loopback redirect; {port} is filled in
     "redirect_port": 0,                # 0 = any free port (fine for Entra and most IdPs); set if the IdP pins the port
+    "secret_store": "auto",            # where the refresh token lives: auto (OS credential store, else file) | file (state.json)
+    "debug_until": 0,                  # epoch seconds; while in the future, each renewal logs an `inspect` summary (`inspect --debug on` sets it in state.json)
     "http_timeout": 30,
     "hook_http_timeout": 5,            # per request inside a hook: Claude Code gives up on a hook after HOOK_TIMEOUT s and
                                        # then sends the prompt anyway, so discovery + refresh + broker + hook_wait must fit
@@ -134,6 +136,8 @@ def load_config(path):
         raise AuthError("idp_token must be access_token or id_token")
     if cfg["hook_login"] not in ("device", "off"):
         raise AuthError("hook_login must be device or off")
+    if cfg["secret_store"] not in ("auto", "file"):
+        raise AuthError("secret_store must be auto or file")
     if not cfg["sentinel"]:
         raise AuthError("sentinel must not be empty (an empty header can't be told apart from a missing one)")
     return cfg
@@ -323,6 +327,7 @@ class State:
         self.dir = Path(directory)
         self.file = self.dir / "state.json"
         self.pending_file = self.dir / "hook-login.json"
+        self.store = None       # a SecretStore (set by main() when secret_store is auto and one is available); None = state.json
 
     def pending(self):
         """The pending hook sign-in, or {} if there is none or it is over (expired, or its process is gone)."""
@@ -337,6 +342,72 @@ class State:
 
     def save(self, data):
         write_private(self.file, json.dumps(data, indent=2) + "\n")
+
+    # -- the refresh token: in the OS credential store when there is one, else in state.json (see "secret store")
+    def get_refresh_token(self):
+        if self.store:
+            try:
+                v = self.store.get()
+                if v:
+                    return v
+            except SecretStoreError as e:
+                warn_store(f"could not read the refresh token from the {self.store.name} ({e}); using state.json")
+        return self.load().get("refresh_token") or ""
+
+    def put_refresh_token(self, rt):
+        """Store first, then drop any copy in state.json. A store failure falls back to the file (with a warning)."""
+        st = self.load()
+        if self.store and self._store_put(rt):
+            if "refresh_token" in st:
+                st.pop("refresh_token")
+                self.save(st)
+            return
+        st["refresh_token"] = rt
+        self.save(st)
+
+    def drop_refresh_token(self):
+        if self.store:
+            try:
+                self.store.delete()
+            except SecretStoreError as e:
+                warn_store(f"could not remove the refresh token from the {self.store.name} ({e})")
+        st = self.load()
+        if "refresh_token" in st:
+            st.pop("refresh_token")
+            self.save(st)
+
+    def _store_put(self, rt):
+        try:
+            self.store.set(rt)
+            if self.store.get() != rt:
+                raise SecretStoreError("read-back differs")
+            return True
+        except SecretStoreError as e:
+            warn_store(f"could not write the refresh token to the {self.store.name} ({e}); keeping it in state.json")
+            return False
+
+    def migrate(self):
+        """secret_store auto: move a refresh token still in state.json into the store. Call under the lock."""
+        rt = self.load().get("refresh_token")
+        if not (self.store and rt):
+            return False
+        if self._store_put(rt):
+            st = self.load()
+            st.pop("refresh_token", None)
+            self.save(st)
+            log(f"moved the refresh token from state.json into the {self.store.name}")
+            return True
+        return False
+
+    def token_location(self):
+        """Where the refresh token is, for `status`: never its value. '' = nowhere."""
+        if self.store:
+            try:
+                if self.store.get():
+                    return self.store.name
+            except SecretStoreError:
+                pass
+        return "state.json" if self.load().get("refresh_token") else ""
 
     @contextmanager
     def lock(self):
@@ -363,6 +434,215 @@ class State:
                 yield
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# --------------------------------------------------------------------------------------------- secret store
+# Where the IdP refresh token lives when `secret_store` is auto: the macOS Keychain, libsecret on Linux, Credential
+# Manager on Windows. Each store has name, get() -> str ("" = none), set(str), delete() and raises SecretStoreError.
+# The entry is named after the state dir (service/target + a short hash of its path), so two configs don't collide.
+# Where the secret travels: macOS stdin of `security -i` (see MacKeychain), Linux stdin of `secret-tool`, Windows an
+# API call in this process. It is never in an argv.
+
+class SecretStoreError(Exception):
+    """The store failed; the caller falls back to state.json. The message never contains the secret."""
+
+
+_warned = set()
+
+
+def warn_store(msg):
+    if msg not in _warned:                      # one line per message per process (the daemon would repeat it)
+        _warned.add(msg)
+        log(f"warning: {msg}")
+
+
+STORE_SERVICE = "aigw-claude-auth"
+
+
+def store_account(state_dir):
+    """A stable name for this state dir: no secret, no user data beyond the path's hash."""
+    return "state-" + hashlib.sha256(str(Path(state_dir).resolve()).encode()).hexdigest()[:12]
+
+
+class MacKeychain:
+    """macOS Keychain through /usr/bin/security.
+
+    `add-generic-password -w <secret>` would put the secret in argv, where `ps` shows it to every local user, and a
+    bare `-w` prompts on /dev/tty, not stdin. `security -i` reads commands from stdin, so the command (and the secret)
+    goes there and argv only shows `security -i`. A secret made only of [A-Za-z0-9._~+/=-] (every IdP refresh token
+    seen) is stored as is; anything else as "b64:" + urlsafe base64, so no quoting rule of security's command parser
+    can matter. `security -i` reads at most ~4000 characters per command line (measured: 2500 ok, 4000 fails), so a
+    longer secret raises SecretStoreError and the caller keeps it in state.json. `find-generic-password -w` output
+    is on a pipe, not argv.
+    keychain: a keychain file to use instead of the default search list (tests use a throwaway one).
+    """
+    name = "macOS Keychain"
+
+    def __init__(self, account, service=STORE_SERVICE, keychain=None, run=None):
+        self.account, self.service, self.keychain = account, service, keychain
+        self.run = run or subprocess.run
+
+    def _kc(self):
+        return [str(self.keychain)] if self.keychain else []
+
+    def _security(self, args, stdin=None):
+        try:
+            return self.run(["/usr/bin/security", *args], input=stdin, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SecretStoreError(f"security: {type(e).__name__}")
+
+    def get(self):
+        p = self._security(["find-generic-password", "-s", self.service, "-a", self.account, "-w", *self._kc()])
+        if p.returncode == 44:                  # errSecItemNotFound
+            return ""
+        if p.returncode != 0:
+            raise SecretStoreError(f"security exit {p.returncode}")
+        out = p.stdout.strip()
+        if not out.startswith("b64:"):
+            return out
+        try:
+            return base64.urlsafe_b64decode(out[4:] + "=" * (-len(out[4:]) % 4)).decode()
+        except ValueError:
+            raise SecretStoreError("unreadable entry")
+
+    def set(self, value):
+        enc = value if re.fullmatch(r"[A-Za-z0-9._~+/=-]+", value) else "b64:" + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+        kc = "".join(' "%s"' % k.replace("\\", "\\\\").replace('"', '\\"') for k in self._kc())
+        cmd = f'add-generic-password -U -s "{self.service}" -a "{self.account}" -w "{enc}"{kc}\n'
+        if len(cmd) > 4000:
+            raise SecretStoreError("secret too long for `security -i`")
+        p = self._security(["-i"], cmd)
+        if p.returncode != 0:
+            raise SecretStoreError(f"security exit {p.returncode}")
+
+    def delete(self):
+        p = self._security(["delete-generic-password", "-s", self.service, "-a", self.account, *self._kc()])
+        if p.returncode not in (0, 44):
+            raise SecretStoreError(f"security exit {p.returncode}")
+
+
+class LibSecret:
+    """Linux Secret Service (GNOME Keyring, KWallet) through `secret-tool`; the secret goes on stdin."""
+    name = "libsecret keyring"
+
+    def __init__(self, account, service=STORE_SERVICE, run=None):
+        self.attrs = ["service", service, "account", account]
+        self.run = run or subprocess.run
+
+    def _tool(self, args, stdin=None):
+        try:
+            return self.run(["secret-tool", *args], input=stdin, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SecretStoreError(f"secret-tool: {type(e).__name__}")
+
+    def get(self):
+        p = self._tool(["lookup", *self.attrs])
+        if p.returncode != 0:
+            if not p.stdout and not p.stderr.strip():
+                return ""                       # secret-tool says nothing when there is no match
+            raise SecretStoreError(f"secret-tool exit {p.returncode}")
+        return p.stdout
+
+    def set(self, value):
+        p = self._tool(["store", "--label=aigw-claude-auth refresh token", *self.attrs], value)
+        if p.returncode != 0:
+            raise SecretStoreError(f"secret-tool exit {p.returncode}")
+
+    def delete(self):
+        p = self._tool(["clear", *self.attrs])
+        if p.returncode != 0 and p.stderr.strip():
+            raise SecretStoreError(f"secret-tool exit {p.returncode}")
+
+
+class WinCredApi:
+    """CredWriteW / CredReadW / CredDeleteW through ctypes (generic credential, persisted for this machine)."""
+    CRED_TYPE_GENERIC, CRED_PERSIST_LOCAL_MACHINE, ERROR_NOT_FOUND = 1, 2, 1168
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes as w
+        self.ct = ctypes
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [("Flags", w.DWORD), ("Type", w.DWORD), ("TargetName", w.LPWSTR), ("Comment", w.LPWSTR),
+                        ("LastWritten", w.FILETIME), ("CredentialBlobSize", w.DWORD),
+                        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)), ("Persist", w.DWORD),
+                        ("AttributeCount", w.DWORD), ("Attributes", ctypes.c_void_p),
+                        ("TargetAlias", w.LPWSTR), ("UserName", w.LPWSTR)]
+        self.CREDENTIAL = CREDENTIAL
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        adv.CredWriteW.argtypes, adv.CredWriteW.restype = [ctypes.POINTER(CREDENTIAL), w.DWORD], w.BOOL
+        adv.CredReadW.argtypes, adv.CredReadW.restype = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.POINTER(ctypes.POINTER(CREDENTIAL))], w.BOOL
+        adv.CredDeleteW.argtypes, adv.CredDeleteW.restype = [w.LPCWSTR, w.DWORD, w.DWORD], w.BOOL
+        adv.CredFree.argtypes, adv.CredFree.restype = [ctypes.c_void_p], None
+        self.adv = adv
+
+    def write(self, target, user, blob):
+        ct = self.ct
+        buf = (ct.c_ubyte * len(blob)).from_buffer_copy(blob)
+        c = self.CREDENTIAL(Type=self.CRED_TYPE_GENERIC, TargetName=target, CredentialBlobSize=len(blob),
+                            CredentialBlob=buf, Persist=self.CRED_PERSIST_LOCAL_MACHINE, UserName=user)
+        if not self.adv.CredWriteW(ct.byref(c), 0):
+            raise SecretStoreError(f"CredWriteW error {ct.get_last_error()}")
+
+    def read(self, target):
+        ct = self.ct
+        p = ct.POINTER(self.CREDENTIAL)()
+        if not self.adv.CredReadW(target, self.CRED_TYPE_GENERIC, 0, ct.byref(p)):
+            err = ct.get_last_error()
+            if err == self.ERROR_NOT_FOUND:
+                return None
+            raise SecretStoreError(f"CredReadW error {err}")
+        try:
+            return ct.string_at(p.contents.CredentialBlob, p.contents.CredentialBlobSize)
+        finally:
+            self.adv.CredFree(p)
+
+    def delete(self, target):
+        ct = self.ct
+        if not self.adv.CredDeleteW(target, self.CRED_TYPE_GENERIC, 0):
+            err = ct.get_last_error()
+            if err != self.ERROR_NOT_FOUND:
+                raise SecretStoreError(f"CredDeleteW error {err}")
+
+
+class WinCredential:
+    """Windows Credential Manager. api: WinCredApi, or a stand-in with write/read/delete (tests on other OSes)."""
+    name = "Windows Credential Manager"
+
+    def __init__(self, account, service=STORE_SERVICE, api=None):
+        self.target, self.user, self.api = f"{service}/{account}", account, api or WinCredApi()
+
+    def get(self):
+        blob = self.api.read(self.target)
+        try:
+            return blob.decode("utf-8") if blob else ""
+        except ValueError:
+            raise SecretStoreError("unreadable entry")
+
+    def set(self, value):
+        self.api.write(self.target, self.user, value.encode("utf-8"))
+
+    def delete(self):
+        self.api.delete(self.target)
+
+
+def make_store(cfg, state_dir, platform=None):
+    """The credential store for this machine, or None (use state.json): secret_store is file, or none is usable."""
+    if cfg["secret_store"] == "file":
+        return None
+    platform, account = platform or sys.platform, store_account(state_dir)
+    try:
+        if platform == "darwin":
+            return MacKeychain(account) if os.access("/usr/bin/security", os.X_OK) else None
+        if platform == "win32":
+            return WinCredential(account)
+        if shutil.which("secret-tool") and (os.environ.get("DBUS_SESSION_BUS_ADDRESS") or
+                                            os.path.exists(f"/run/user/{os.getuid()}/bus")):
+            return LibSecret(account)
+    except Exception as e:                                   # e.g. ctypes missing: just use the file
+        warn_store(f"no credential store ({type(e).__name__}); keeping the refresh token in state.json")
+    return None
 
 
 # --------------------------------------------------------------------------------------------- IdP and broker
@@ -401,10 +681,10 @@ class TokenSource:
 
     def _keep(self, body):
         """Store a (rotated) refresh token and return the IdP token we use."""
-        st = self.state.load()
         self.got_refresh_token = bool(body.get("refresh_token"))
         if self.got_refresh_token:
-            st["refresh_token"] = body["refresh_token"]
+            self.state.put_refresh_token(body["refresh_token"])     # store first; a rotation happens under sync's lock
+        st = self.state.load()
         st["signed_in_at"] = st.get("signed_in_at") or int(time.time())
         self.state.save(st)
         tok = body.get(self.cfg["idp_token"])
@@ -413,16 +693,14 @@ class TokenSource:
         return tok
 
     def refresh(self):
-        st = self.state.load()
-        rt = st.get("refresh_token")
+        rt = self.state.get_refresh_token()
         if not rt:
             raise AuthError("not signed in to the gateway: run `aigw-claude-auth login`")
         status, body = self._token_request({"grant_type": "refresh_token", "refresh_token": rt, "scope": self.cfg["scope"]})
         if status == 200:
             return self._keep(body)
         if body.get("error") in ("invalid_grant", "interaction_required", "login_required"):
-            st.pop("refresh_token", None)
-            self.state.save(st)
+            self.state.drop_refresh_token()
             raise AuthError("gateway sign-in expired: run `aigw-claude-auth login`")
         raise AuthError(f"IdP refresh failed: HTTP {status} {body.get('error', '')} {body.get('error_description', '')[:120]}".strip())
 
@@ -564,6 +842,7 @@ def sync(cfg, state, settings, force=False, idp=None):
     idp: an IdP token from a sign-in that just happened, used instead of a refresh.
     """
     with state.lock():
+        state.migrate()
         current = settings.get()
         if not force and seconds_left(current) > cfg["refresh_before"]:
             return Result(True, False, f"current JWT still valid ({fingerprint(current)})", current)
@@ -581,7 +860,162 @@ def sync(cfg, state, settings, force=False, idp=None):
                 settings.put(cfg["sentinel"])
             return Result(False, False, f"refusing to use it: {msg}", current)
         settings.put(new)
+        debug_summary(cfg, state, new)
         return Result(True, True, f"wrote a new JWT ({fingerprint(new)})", new)
+
+
+# --------------------------------------------------------------------------------------------- inspect
+
+PERSONAL_CLAIMS = ("sub", "email", "preferred_username", "upn", "unique_name", "name", "given_name", "family_name",
+                   "oid", "groups", "roles", "wids")        # redacted unless --show-claims
+DEBUG_HOURS = 24
+
+
+def jwt_header(token):
+    """Decoded JWT header, or {} (same leniency as jwt_claims)."""
+    try:
+        seg = token.split(".")[0]
+        h = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+        return h if isinstance(h, dict) else {}
+    except (IndexError, ValueError, AttributeError):
+        return {}
+
+
+def _when(ts):
+    if not isinstance(ts, (int, float)):
+        return "none"
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))} local, {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts))} UTC"
+
+
+def token_source(cfg):
+    if cfg["token_command"]:
+        return "token_command"
+    if cfg["broker_url"]:
+        return "broker (gateway JWT from the token broker)"
+    return f"IdP direct ({cfg['idp_token'].replace('_', ' ')})"
+
+
+def inspect_token(token, cfg, show_claims=False, now=None):
+    """Interpret a JWT without verifying it. Returns (rows, problems): rows are (label, text), problems are the
+    findings that make the token unusable. Never returns the token or its signature."""
+    now = now or time.time()
+    rows, problems = [], []
+    if not token or token == cfg["sentinel"]:
+        return [("token", "sentinel (no usable JWT)")], ["no JWT in the settings (it holds the sentinel)"]
+    rows.append(("token", fingerprint(token)))
+    rows.append(("source", token_source(cfg)))
+    claims = jwt_claims(token)
+    if not claims:
+        rows.append(("format", "not a JWT (opaque token)"))
+        if not (cfg["token_command"] or cfg["broker_url"]):
+            problems.append(f"the IdP {cfg['idp_token'].replace('_', ' ')} is opaque, the gateway can't validate it (Entra: check the scope's API, not Graph)")
+        rows.append(("signature", "not verified"))
+        return rows, problems
+    hdr = jwt_header(token)
+    rows.append(("header", " ".join(f"{k}={hdr.get(k)}" for k in ("alg", "kid", "typ") if k in hdr) or "none"))
+    if str(hdr.get("alg", "")).lower() == "none":
+        problems.append("alg is none: an unsigned token; the gateway must reject it")
+    for k in ("iat", "nbf", "exp"):
+        if k in claims:
+            rows.append((k, _when(claims[k])))
+    exp, nbf = claims.get("exp"), claims.get("nbf")
+    if isinstance(exp, (int, float)):
+        left = int(exp - now)
+        rows.append(("time left", f"{left}s (refresh_before {cfg['refresh_before']}s: " +
+                     ("renewal due" if left <= cfg["refresh_before"] else "no renewal needed yet") + ")"))
+        if left <= 0:
+            problems.append(f"expired {-left}s ago")
+    else:
+        problems.append("no exp claim")
+    if isinstance(nbf, (int, float)) and nbf > now:
+        problems.append(f"not valid yet (nbf is {int(nbf - now)}s ahead; check the clock)")
+    # verdicts against configuration
+    if cfg["issuer"] and not (cfg["token_command"] or cfg["broker_url"]):
+        ok = str(claims.get("iss", "")).rstrip("/") == cfg["issuer"].rstrip("/")
+        rows.append(("issuer", f"{claims.get('iss')} ({'matches' if ok else 'DIFFERS from'} the configured issuer)"))
+        if not ok:
+            problems.append("iss differs from the configured issuer")
+    elif "iss" in claims:
+        rows.append(("issuer", str(claims["iss"])))
+    if "aud" in claims:
+        aud = claims["aud"] if isinstance(claims["aud"], list) else [claims["aud"]]
+        want = cfg.get("audience")                           # not a config key yet; a profile may add one
+        if want:
+            ok = want in aud
+            rows.append(("audience", f"{', '.join(map(str, aud))} ({'contains' if ok else 'DOES NOT contain'} {want})"))
+            if not ok:
+                problems.append("aud does not contain the configured audience")
+        else:
+            rows.append(("audience", ", ".join(map(str, aud))))
+    # Mode A claims
+    for k in ("portkey_oid", "portkey_workspace"):
+        if k in claims:
+            rows.append((k, str(claims[k])))
+    d = claims.get("defaults")
+    if isinstance(d, dict):
+        for k in ("config_slug", "config_id"):
+            if k in d:
+                rows.append((f"defaults.{k}", str(d[k])))
+    # the rest
+    shown = {"iss", "aud", "iat", "nbf", "exp", "portkey_oid", "portkey_workspace", "defaults"}
+    for k in PERSONAL_CLAIMS:
+        if k in claims:
+            rows.append((k, json.dumps(claims[k]) if show_claims else "<redacted; --show-claims>"))
+    shown.update(PERSONAL_CLAIMS)
+    other = sorted(set(claims) - shown)
+    if other:
+        rows.append(("other claims", ", ".join(other) + " (names only)"))
+    rows.append(("signature", "not verified (this view decodes; it does not prove the token is genuine)"))
+    return rows, problems
+
+
+def debug_active(cfg, state):
+    until = max(float(cfg.get("debug_until") or 0), float(state.load().get("debug_until") or 0))
+    return until if until > time.time() else 0
+
+
+def debug_summary(cfg, state, token):
+    """With debug on: one log line per renewal. Fingerprint and non-secret claims only. Off by itself at debug_until."""
+    try:
+        until = debug_active(cfg, state)
+        if not until:
+            return
+        hdr, claims = jwt_header(token), jwt_claims(token)
+        log(f"debug (until {time.strftime('%H:%M', time.localtime(until))}): renewed {fingerprint(token)} "
+            f"alg={hdr.get('alg')} kid={hdr.get('kid')} iss={claims.get('iss')} workspace={claims.get('portkey_workspace')} "
+            f"source={token_source(cfg).split(' ')[0]}")
+    except Exception:
+        pass                                              # debug output must never fail a renewal
+
+
+def cmd_inspect(a, cfg, state, settings):
+    if a.debug:
+        with state.lock():
+            st = state.load()
+            if a.debug == "on":
+                st["debug_until"] = int(time.time()) + DEBUG_HOURS * 3600
+            else:
+                st.pop("debug_until", None)
+            state.save(st)
+        if a.debug == "off":
+            print("debug: off")
+            return 0
+    if a.fresh:
+        with state.lock():
+            token = TokenSource(cfg, state).gateway_jwt()      # minted, not written to the settings
+        print("(fresh token: minted from the source, not written to the settings; a rotated refresh token is kept)")
+    else:
+        token = settings.get()
+    rows, problems = inspect_token(token, cfg, show_claims=a.show_claims)
+    for k, v in rows:
+        print(f"{k:18} {v}")
+    until = debug_active(cfg, state)
+    if until:
+        print(f"{'debug':18} ON until {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}: each renewal logs a summary; turn off with `inspect --debug off`")
+    for p in problems:
+        print(f"{'PROBLEM':18} {p}")
+    # TODO(phase 4, proxy mode): `inspect --live` asks the running proxy over its control channel; not built yet.
+    return 1 if problems else 0
 
 
 # --------------------------------------------------------------------------------------------- commands
@@ -603,7 +1037,7 @@ def finish_login(cfg, state, settings, src, idp):
     """After a sign-in: drop a stale refresh token if the IdP sent none, then write a JWT from the new IdP token."""
     if not src.got_refresh_token:
         with state.lock():
-            state.save({k: v for k, v in state.load().items() if k != "refresh_token"})
+            state.drop_refresh_token()
         log("warning: the IdP returned no refresh token (is offline_access in scope?); you will have to sign in again when the JWT expires")
     return sync(cfg, state, settings, force=True, idp=idp)
 
@@ -616,7 +1050,7 @@ def browser_available():
 
 def cmd_logout(a, cfg, state, settings):
     with state.lock():
-        state.save({k: v for k, v in state.load().items() if k != "refresh_token"})
+        state.drop_refresh_token()
         settings.put(cfg["sentinel"])
     log("signed out; the settings now hold the sentinel")
     return 0
@@ -638,10 +1072,11 @@ def cmd_token(a, cfg, state, settings):
 
 
 def cmd_status(a, cfg, state, settings):
-    st = state.load()
+    loc = state.token_location()
     source = "token_command" if cfg["token_command"] else ("IdP + broker" if cfg["broker_url"] else "IdP token as the JWT")
     rows = [("version", VERSION), ("settings", str(settings.path)), ("header", cfg["header"]), ("source", source),
-            ("signed in", "yes" if st.get("refresh_token") else ("n/a" if cfg["token_command"] else "no")),
+            ("signed in", "yes" if loc else ("n/a" if cfg["token_command"] else "no")),
+            ("refresh token", loc or "none"),
             ("jwt", fingerprint(settings.get()) if settings.get() != cfg["sentinel"] else "sentinel (no usable JWT)")]
     claims = jwt_claims(settings.get())
     for k in ("iss", "sub", "portkey_workspace"):
@@ -731,7 +1166,7 @@ def hook_precheck(cfg, state, settings):
         return 0
     if cfg["block_on_failure"]:
         reason = f"AI gateway: {r.message}"
-        if cfg["hook_login"] == "device" and not cfg["token_command"] and not state.load().get("refresh_token"):
+        if cfg["hook_login"] == "device" and not cfg["token_command"] and not state.get_refresh_token():
             try:
                 reason = hook_login_reason(cfg, state, settings)
             except Exception as e:                          # fall back to the plain message
@@ -965,6 +1400,10 @@ def main(argv=None):
     p = sub.add_parser("token", help="print a valid JWT")
     p.add_argument("--force", action="store_true")
     sub.add_parser("status", help="where the JWT comes from and when it expires")
+    p = sub.add_parser("inspect", help="decode the JWT: header, times, claims, verdicts against the config (never the token)")
+    p.add_argument("--fresh", action="store_true", help="mint a token from the source without writing it, and decode that")
+    p.add_argument("--show-claims", action="store_true", help="show sub, email, groups and other personal claims (redacted by default)")
+    p.add_argument("--debug", choices=["on", "off"], help="log an inspect summary at each renewal for 24 h (on) or stop (off)")
     p = sub.add_parser("daemon", help="renew ahead of every expiry until stopped")
     p.add_argument("--max-sleep", type=int, default=60, help="longest nap in seconds (bounds the catch-up after sleep)")
     p = sub.add_parser("hook", help="for Claude Code hooks; reads the hook JSON on stdin")
@@ -987,8 +1426,9 @@ def main(argv=None):
         cfg = load_config(a.config or cdir / "config.json")
         cfg["_config_path"] = str((a.config or cdir / "config.json").resolve())   # for the hook's background sign-in
         state = State(cdir)
+        state.store = make_store(cfg, cdir)
         settings = Settings(a.settings or default_settings_path(), cfg["header"])
-        handler = {"login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "token": cmd_token, "status": cmd_status,
+        handler = {"login": cmd_login, "logout": cmd_logout, "sync": cmd_sync, "token": cmd_token, "status": cmd_status, "inspect": cmd_inspect,
                    "daemon": cmd_daemon, "hook": cmd_hook, "hook-login-wait": cmd_hook_login_wait, "install": cmd_install, "task": cmd_task}[a.cmd]
         return handler(a, cfg, state, settings)
     except AuthError as e:
