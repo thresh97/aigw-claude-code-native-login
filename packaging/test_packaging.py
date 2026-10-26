@@ -265,6 +265,25 @@ class Launcher(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_BASE_URL", s.get("env", {}))
         self.assertFalse((self.home / "cfg").exists())
 
+    def test_purge_user_removes_the_windows_log_folder(self):
+        self.config()
+        logs = self.home / "AppData" / "Local" / "aigw-claude-auth" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "daemon.log").write_text("x")
+        with mock.patch.object(aigw_launch, "HERE", str(self.fleet_dir)):
+            real = aigw_launch.load_client()
+        main = real.main
+
+        def main_then_windows(argv):            # the client's own code runs as on this OS; only the launcher's cleanup sees Windows
+            rc = main(argv)
+            real.is_windows = lambda: True
+            return rc
+        real.main = main_then_windows
+        with mock.patch.object(aigw_launch, "HERE", str(self.fleet_dir)), mock.patch.object(aigw_launch, "load_client", lambda: real), \
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.home / "AppData" / "Local")}), mock.patch("sys.stderr"):
+            self.assertEqual(aigw_launch.main(["purge-user"]), 0)
+        self.assertFalse(logs.parent.exists())
+
 
 def shlex_quote(s):
     import shlex

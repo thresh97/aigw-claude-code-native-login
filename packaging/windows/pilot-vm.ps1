@@ -68,6 +68,10 @@ function UserProfilePath([string]$u) {
     if ($p) { return $p.LocalPath }
     return $null
 }
+function Get-Sessions {            # quser exits 1 and writes to stderr when nobody is logged on
+    $ErrorActionPreference = 'Continue'
+    return @((& quser.exe 2>&1 | Out-String) -split "`r?`n")
+}
 function Test-Admin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
@@ -239,7 +243,7 @@ function Phase-Check {
     $end = (Get-Date).AddSeconds($WaitSeconds)
     $logged = $false
     do {
-        $q = (& quser.exe 2>&1 | Out-String)
+        $q = (Get-Sessions) -join "`n"
         if ($q -match "(?m)^\s*>?$User\s") { $logged = $true } else { Start-Sleep -Seconds 5 }
     } while (-not $logged -and (Get-Date) -lt $end)
     Say ("  quser: " + (($q -split "`r?`n" | Where-Object { $_ -match $User }) -join ' | '))
@@ -322,55 +326,49 @@ function Phase-Check {
 }
 
 function Phase-Concurrent {
-    # A real second logon is not possible with a single autologon (Windows 11 Pro keeps one interactive session at a time
-    # in this setup). This starts the same launcher as the second user to see what the fixed loopback port does.
-    if (-not $User) { throw '-User required (the second user)' }
-    $st = Load-State
-    if (@($st.createdUsers) -notcontains $User) { throw "$User was not created by this pilot" }
-    $pw = New-RandomPassword
-    Set-LocalUser -Name $User -Password (ConvertTo-SecureString $pw -AsPlainText -Force)
-    $before = Get-NetTCPConnection -LocalPort $ProxyPort -State Listen -ErrorAction SilentlyContinue
-    Say ("  {0}'s header lines before: {1}" -f $User, (Header-Summary (Describe-UserFiles $User).header))
-    Say ("  before: listener on {0}: {1}" -f $ProxyPort, $(if ($before) { "pid $($before.OwningProcess)" } else { 'none' }))
-    $runner = Join-Path $Work "concurrent-$User.ps1"
-    $prof = UserProfilePath $User
-    if (-not $prof) { $prof = "C:\Users\$User" }
-    # explicit environment: Start-Process -Credential would otherwise hand the caller's USERPROFILE/APPDATA to the child
-    $txt = @"
-`$env:USERPROFILE = '$prof'; `$env:HOME = '$prof'; `$env:APPDATA = '$prof\AppData\Roaming'; `$env:LOCALAPPDATA = '$prof\AppData\Local'
-if ((whoami) -notlike '*\$User') { 'wrong identity: ' + (whoami); exit 9 }
-`$p = Start-Process -FilePath '$Python' -ArgumentList '"$InstallDir\aigw_launch.py"','daemon' -PassThru -WindowStyle Hidden -RedirectStandardError '$Out\concurrent-$User.err' -RedirectStandardOutput '$Out\concurrent-$User.out'
-Start-Sleep -Seconds 12
-if (`$p.HasExited) { 'daemon exited with ' + `$p.ExitCode } else { 'daemon still running pid ' + `$p.Id; `$p.Id | Set-Content '$Out\concurrent-$User.pid' }
-"@
-    Set-Content -LiteralPath $runner -Value $txt -Encoding UTF8
-    $cred = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$User", (ConvertTo-SecureString $pw -AsPlainText -Force))
-    $pw = $null
-    $res = Join-Path $Out "concurrent-$User.txt"
-    $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$runner`"" -Credential $cred -LoadUserProfile -PassThru -RedirectStandardOutput $res -RedirectStandardError "$res.err" -WindowStyle Hidden
-    $null = $p.WaitForExit(90000)
-    Say ("  second user's launcher (emulated logon): " + ((Get-Content -LiteralPath $res -ErrorAction SilentlyContinue) -join ' | '))
-    $errTxt = Get-Content -LiteralPath "$res.err" -ErrorAction SilentlyContinue
-    if ($errTxt) { Say ("  runner stderr: " + (($errTxt | Select-Object -First 3) -join ' | ')) }
-    foreach ($fn in "concurrent-$User.err", "concurrent-$User.out") {
-        Say "  --- $fn (daemon output)"
+    # A second interactive user cannot be had here (one autologon; Start-Process -Credential from ssh dies with 0xC0000142 and
+    # a password task fails with "logon type not granted" for a standard user). So this starts the same launcher a second time
+    # as the admin, with its settings and state redirected to a throwaway folder, while the logged-on user's daemon holds the
+    # fixed port: the bind does not depend on who owns the process. It also starts the fleet task by hand while its
+    # instance is running, which tests MultipleInstancesPolicy IgnoreNew.
+    function Listeners {
+        foreach ($x in @(Get-NetTCPConnection -LocalPort $ProxyPort -State Listen -ErrorAction SilentlyContinue)) {
+            $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($x.OwningProcess)"
+            $o = Invoke-CimMethod -InputObject $pp -MethodName GetOwner
+            Say ("    listener {0}:{1} pid {2} owner {3}" -f $x.LocalAddress, $ProxyPort, $x.OwningProcess, $o.User)
+        }
+    }
+    function Launchers {
+        $procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*aigw_launch.py*' }
+        Say ("    launcher processes: " + (($procs | ForEach-Object { $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner; "$($o.User):pid$($_.ProcessId)" }) -join ', '))
+    }
+    Say '  before:'; Listeners; Launchers
+    $scratch = Join-Path $Work 'second-launcher'
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    $env:AIGW_CLAUDE_AUTH_DIR = Join-Path $scratch 'state'
+    $env:AIGW_CLAUDE_SETTINGS = Join-Path $scratch 'settings.json'
+    $env:CLAUDE_CONFIG_DIR = $scratch
+    try {
+        $p = Start-Process -FilePath $Python -ArgumentList "`"$InstallDir\aigw_launch.py`"", 'daemon' -PassThru -WindowStyle Hidden -RedirectStandardError "$Out\second.err" -RedirectStandardOutput "$Out\second.out"
+    }
+    finally { Remove-Item Env:AIGW_CLAUDE_AUTH_DIR, Env:AIGW_CLAUDE_SETTINGS, Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 12
+    Say ("  second launcher (pid {0}): {1}" -f $p.Id, $(if ($p.HasExited) { "exited with $($p.ExitCode)" } else { 'still running' }))
+    foreach ($fn in 'second.err', 'second.out') {
+        Say "  --- $fn"
         Get-Content -LiteralPath (Join-Path $Out $fn) -ErrorAction SilentlyContinue | Select-Object -First 12 | ForEach-Object { Say "    | $_" }
     }
-    $after = Get-NetTCPConnection -LocalPort $ProxyPort -State Listen -ErrorAction SilentlyContinue
-    foreach ($x in $after) {
-        $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($x.OwningProcess)"
-        $o = Invoke-CimMethod -InputObject $pp -MethodName GetOwner
-        Say ("  after: listener on {0}: pid {1} owner {2}" -f $ProxyPort, $x.OwningProcess, $o.User)
-    }
-    $procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*aigw_launch.py*' }
-    Say ("  launcher processes now: " + (($procs | ForEach-Object { $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner; "$($o.User):pid$($_.ProcessId)" }) -join ', '))
-    Say ("  {0}'s header lines after: {1}" -f $User, (Header-Summary (Describe-UserFiles $User).header))
-    $t = Get-ScheduledTask -TaskName $TaskName
+    Say '  after the second launcher:'; Listeners
+    if ($Mode -eq 'proxy') { Check 'port-still-held-by-first' (@(Get-NetTCPConnection -LocalPort $ProxyPort -State Listen -ErrorAction SilentlyContinue).Count -ge 1) }
+    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    # the fleet task started by hand while a user's instance runs
+    $before = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*aigw_launch.py*' }).Count
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Continue
+    Start-Sleep -Seconds 8
+    $after = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*aigw_launch.py*' }).Count
     $info = Get-ScheduledTaskInfo -TaskName $TaskName
-    Say ("  fleet task now: State={0} LastRunTime={1:u} LastTaskResult=0x{2:x}" -f $t.State, $info.LastRunTime, $info.LastTaskResult)
-    # clean up the extra daemon (only the one we started)
-    $pidFile = Join-Path $Out "concurrent-$User.pid"
-    if (Test-Path -LiteralPath $pidFile) { Stop-Process -Id ([int](Get-Content -LiteralPath $pidFile)) -Force -ErrorAction SilentlyContinue }
+    Say ("  Start-ScheduledTask while an instance runs: launcher processes {0} -> {1}; task State={2} LastRunTime={3:u} LastTaskResult=0x{4:x}" -f $before, $after, (Get-ScheduledTask -TaskName $TaskName).State, $info.LastRunTime, $info.LastTaskResult)
+    Launchers
 }
 
 function Phase-Uninstall {
@@ -405,8 +403,8 @@ function Phase-Purge {              # per-user purge as a user would run it, usi
     if (-not $User) { throw '-User required' }
     $f0 = Describe-UserFiles $User
     Say ("  per-user before purge, {0}: state-dir={1} header-lines={2}" -f $User, (Test-Path -LiteralPath "$($f0.profile)\AppData\Roaming\aigw-claude-auth"), $f0.header.Count)
-    $out = Invoke-AsUser $User 'purge' ("& '$Python' '$InstallDir\aigw_launch.py' purge-user 2>&1")
-    Say ("  purge-user as {0}: {1}" -f $User, (($out -split "`r?`n" | Where-Object { $_ }) -join ' | '))
+    $purgeOut = Invoke-AsUser $User 'purge' ("& '$Python' '$InstallDir\aigw_launch.py' purge-user 2>&1")
+    Say ("  purge-user as {0}: {1}" -f $User, (($purgeOut -split "`r?`n" | Where-Object { $_ }) -join ' | '))
     $f = Describe-UserFiles $User
     $left = @()
     if (Test-Path -LiteralPath "$($f.profile)\AppData\Roaming\aigw-claude-auth") { $left += 'state-dir' }
@@ -422,10 +420,14 @@ function Phase-Cleanup {
     Check 'winlogon-restored' ((Winlogon-Read).ContainsKey('AutoAdminLogon') -eq ($null -ne $st.winlogon -and $null -ne $st.winlogon.PSObject.Properties['AutoAdminLogon']))
     foreach ($u in @($st.createdUsers)) {
         $lu = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
-        if (-not $lu) { continue }
-        $sid = $lu.SID.Value
-        Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $sid } | Remove-CimInstance -ErrorAction Continue
-        Remove-LocalUser -Name $u
+        $sid = if ($lu) { $lu.SID.Value } else { '' }
+        # a profile that is loaded cannot be removed: log the user off first
+        foreach ($l in (Get-Sessions)) {
+            if ($l -match "^\s*>?$u\s+(\S+\s+)?(\d+)\s") { Say "  logging off $u (session $($Matches[2]))"; & logoff.exe $Matches[2] }
+        }
+        for ($i = 0; $i -lt 30 -and ((Get-Sessions) -match "^\s*>?$u\s"); $i++) { Start-Sleep -Seconds 2 }
+        Get-CimInstance Win32_UserProfile | Where-Object { ($sid -and $_.SID -eq $sid) -or $_.LocalPath -eq "C:\Users\$u" } | Remove-CimInstance -ErrorAction Continue
+        if ($lu) { Remove-LocalUser -Name $u }
         Check "removed-user:$u" (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue))
         Check "removed-profile:$u" (-not (Test-Path -LiteralPath "C:\Users\$u"))
     }
