@@ -1084,6 +1084,10 @@ class WinCredentialRealTests(unittest.TestCase):
     def setUp(self):
         self.service = "aigw-claude-auth-test-" + os.urandom(4).hex()
         self.store = A.WinCredential("acct", service=self.service)
+        try:
+            self.store.get()
+        except A.SecretStoreError as e:       # 1312: a network-logon session (ssh, a service) has no credential set
+            self.skipTest(f"no usable Credential Manager in this session ({e}); the client falls back to state.json here")
         self.addCleanup(self.cleanup)
 
     def cleanup(self):
@@ -1104,6 +1108,38 @@ class WinCredentialRealTests(unittest.TestCase):
         self.store.delete()
         self.assertEqual(self.store.get(), "")
         self.store.delete()
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows only")
+class WinClientRealTests(Base):
+    """The client with the real Credential Manager driver (test-prefixed target). Works in any session: where the
+    store is unusable (ssh: error 1312) the token must end up in state.json with a warning, and sync must still work."""
+
+    def test_sync_with_the_real_store_or_its_fallback(self):
+        A._warned.clear()
+        service = "aigw-claude-auth-test-" + os.urandom(4).hex()
+        store = A.WinCredential(A.store_account(self.state_dir), service=service)
+
+        def cleanup():
+            try:
+                store.delete()
+            except A.SecretStoreError:
+                pass
+        self.addCleanup(cleanup)
+        self.write_config(secret_store="auto")
+        rt = self.sign_in()
+        with mock.patch.object(A, "make_store", lambda c, d, platform=None: store):
+            code, out, err = self.run_cli("sync", "--force")
+        self.assertEqual(code, 0, err)
+        in_file = "refresh_token" in A.State(self.state_dir).load()
+        try:
+            in_store = bool(store.get())
+        except A.SecretStoreError:
+            in_store = False
+        self.assertTrue(in_store != in_file, f"the token must be in exactly one place (store {in_store}, file {in_file})")
+        self.assertNotIn(rt, out + err)
+        if in_file:
+            self.assertIn("state.json", err)
 
 
 class InspectTests(Base):
