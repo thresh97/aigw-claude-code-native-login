@@ -12,7 +12,7 @@ offline (see "What was tested"). The client stays one stdlib file, copied as is.
 | --- | --- |
 | `name` | Package and drop-in name; must contain `aigw` (the client finds its hooks by that) |
 | `gateway_url` | File mode: managed `ANTHROPIC_BASE_URL`. Proxy mode: where the proxy forwards (`gateway_url` in the config) |
-| `mode`, `proxy_listen` | `file` or `proxy`; proxy mode needs a fixed loopback port, and managed `ANTHROPIC_BASE_URL` becomes `http://<proxy_listen>` |
+| `mode`, `proxy_listen` | `file` or `proxy`; proxy mode needs a fixed loopback port, and managed `ANTHROPIC_BASE_URL` becomes `http://<proxy_listen>`. Proxy mode is for one logged-in user per machine: see "Several users at once" |
 | `idp` | Any client config keys: `issuer`, `client_id`, `scope`, `broker_url`, `redirect_port`, `login_method`, `hook_login`, ... (validated with the client's own `load_config`) |
 | `options` | `pin_allowed_providers` (managed `allowedProviders: ["customEndpoint"]`, default on), `allow_managed_hooks_only`, `notify` |
 | `python` | Interpreter per OS (`macos`, `linux`, `windows`) used by the hooks, launcher and background entry |
@@ -88,6 +88,18 @@ header lines in `~/.claude/settings.json`) is not touched by default because the
 user via `sudo -u`; Windows `-PurgeCurrentUser` for the caller) logs out, removes our header lines and deletes the state folder.
 Without the managed base URL and hooks, the leftovers are inert. Running daemons stop at the next logout (Linux/Windows
 disable the entry; macOS `uninstall.sh` boots the agent out).
+
+## Several users at once (not supported / untested)
+
+Machines where several users are logged in at the same time (terminal servers, fast user switching) are out of scope for now.
+
+- **Proxy mode: not supported.** The port is fixed, so only the first user's proxy listens; a second user's proxy exits with
+  "Address already in use" and that user's Claude Code gets 498 from the other proxy (observed on Linux, see below). Use file mode on
+  shared hosts. A per-user port would need the base URL in user settings instead of managed settings (not built).
+- **Windows, file mode: untested.** The fleet task (one task for the Users group) has `MultipleInstancesPolicy IgnoreNew`; whether a
+  second user's at-logon start is dropped while the first user's daemon runs was not observed.
+- **macOS and Linux, file mode:** each user gets their own LaunchAgent / user unit instance; the Linux pilot ran two users at once in
+  file mode (both active).
 
 ## What was tested (offline, 2026-10-26)
 
