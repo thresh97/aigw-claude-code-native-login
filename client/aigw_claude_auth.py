@@ -41,6 +41,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1498,9 +1499,17 @@ def cmd_daemon(a, cfg, state, settings):
     for name in ("SIGTERM", "SIGINT", "SIGBREAK"):          # SIGBREAK exists on Windows only
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), lambda *_: stop.set())
-    backoff = 30
+    backoff, blocked_by = 30, None
     log(f"daemon started (settings {settings.path})")
     while not stop.is_set():
+        errors = preflight_errors(cfg, state, settings)     # a config Error: write nothing, retry later (recovers by itself)
+        if errors:
+            if blocked_by != errors[0]["message"]:
+                log(f"not renewing: {errors[0]['message']} ({errors[0]['id']})")
+                blocked_by = errors[0]["message"]
+            stop.wait(max(5, min(60, a.max_sleep)))
+            continue
+        blocked_by = None
         r = sync(cfg, state, settings)
         if r.changed or not r.ok:
             log(r.message)
@@ -1546,6 +1555,10 @@ def cmd_hook(a, cfg, state, settings):
 
 def hook_precheck(cfg, state, settings):
     """UserPromptSubmit. Silent and instant while the JWT is good; otherwise refresh and give Claude Code time to reload."""
+    errors = preflight_errors(cfg, state, settings)         # a config Error (doctor) is the block reason; nothing is written
+    if errors:
+        print(json.dumps({"decision": "block", "reason": block_message(errors)}))
+        return 0
     try:
         r = sync(cfg, state, settings)
     except Exception as e:                                  # a bug, or the settings file can't be written
@@ -1776,6 +1789,581 @@ def cmd_task(a, cfg, state, settings):
     return r.returncode
 
 
+# --------------------------------------------------------------------------------------------- doctor
+# `doctor` and the preflight: read every config source, predict what Claude Code will send, name conflicts.
+# Self-contained: every source has its own small reader (tests mock these), every finding its own check.
+#
+# Where each location comes from:
+#   docs (https://code.claude.com/docs/en/managed-settings.md, "Where each mechanism stores the policy" and
+#   "How Claude Code combines managed sources"): the managed file directories and managed-settings.d/ (merged after
+#   managed-settings.json, *.json in alphabetical order, hidden files ignored), the macOS managed preferences domain
+#   com.anthropic.claudecode, the Windows value `Settings` (REG_SZ/REG_EXPAND_SZ, JSON) under
+#   HKLM\SOFTWARE\Policies\ClaudeCode and HKCU\SOFTWARE\Policies\ClaudeCode, the source ranking (remote > MDM plist or
+#   HKLM > files > HKCU; the first source with a policy key wins unless managedSourcesBehavior is "merge"), and
+#   "a managed document that is not a JSON object stops Claude Code from starting".
+#   observed (repro `managed` scenario, README findings 11 and 15): a managed env ANTHROPIC_CUSTOM_HEADERS replaces the
+#   user's value; allowManagedHooksOnly stops user hooks; unknown top-level keys are ignored; AIGW_* in managed env
+#   reach hooks and win over the user's env; drop-ins merge in name order.
+#   standard macOS, not from the docs: the plist file is /Library/Managed Preferences/com.anthropic.claudecode.plist
+#   (or .../<user>/com.anthropic.claudecode.plist), read with plutil.
+#   Server-managed settings are fetched by Claude Code at sign-in; the helper cannot read them (reported as unknown).
+
+SEVERITIES = ("Error", "Warning", "Info")
+POLICY_CONTROL_KEYS = ("wslInheritsWindowsSettings", "managedSourcesBehavior")
+CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+CHECKS = []             # (id, function), in report order
+
+
+def check(check_id):
+    def register(fn):
+        CHECKS.append((check_id, fn))
+        return fn
+    return register
+
+
+# ---- readers (one per source; tests mock these)
+
+def managed_dir():
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    if is_windows():
+        return Path(os.environ.get("ProgramFiles") or r"C:\Program Files") / "ClaudeCode"
+    return Path("/etc/claude-code")
+
+
+def read_json_file(path):
+    """(dict, error). A missing file is ({}, ""); anything that is not a JSON object is an error."""
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}, ""
+    except OSError as e:
+        return {}, f"cannot read {path}: {e}"
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except ValueError as e:
+        return {}, f"{path} is not valid JSON ({e})"
+    return (data, "") if isinstance(data, dict) else ({}, f"{path} is not a JSON object")
+
+
+def read_helper_config(path):
+    """The helper's own config file as written (before defaults): (dict, error)."""
+    return read_json_file(path)
+
+
+def read_user_settings(path):
+    return read_json_file(path)
+
+
+def deep_merge(base, over):
+    """Later wins on scalars, dicts merge, lists concatenate (hooks for one event from several files all run: finding 15)."""
+    out = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        elif isinstance(v, list) and isinstance(out.get(k), list):
+            out[k] = out[k] + v
+        else:
+            out[k] = v
+    return out
+
+
+def read_managed_files():
+    """managed-settings.json, then managed-settings.d/*.json in name order. -> (merged dict or None, [paths], [errors])."""
+    base = managed_dir()
+    paths = [base / "managed-settings.json"]
+    try:
+        paths += sorted(p for p in (base / "managed-settings.d").iterdir() if p.suffix == ".json" and not p.name.startswith(".") and p.is_file())
+    except OSError:
+        pass
+    merged, found, errors = {}, [], []
+    for p in paths:
+        if not p.exists():
+            continue
+        data, err = read_json_file(p)
+        found.append(str(p))
+        if err:
+            errors.append(err)
+        merged = deep_merge(merged, data)
+    return (merged if found else None), found, errors
+
+
+def plist_paths():
+    import getpass
+    root = Path("/Library/Managed Preferences")
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = ""
+    return [root / "com.anthropic.claudecode.plist"] + ([root / user / "com.anthropic.claudecode.plist"] if user else [])
+
+
+def read_plist_policy():
+    """macOS managed preferences (MDM profile), read-only through plutil. -> (dict or None, error, location)."""
+    if sys.platform != "darwin":
+        return None, "", ""
+    for p in plist_paths():
+        if not p.exists():
+            continue
+        try:
+            r = subprocess.run(["plutil", "-convert", "json", "-o", "-", str(p)], capture_output=True, text=True, timeout=5)
+            data = json.loads(r.stdout) if r.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            return None, f"{p} is not a readable plist with a dictionary", str(p)
+        return data, "", str(p)
+    return None, "", ""
+
+
+def read_registry_policy(hive):
+    """Windows: the JSON string `Settings` under <hive>\\SOFTWARE\\Policies\\ClaudeCode, read-only. hive: HKLM or HKCU."""
+    if not is_windows():
+        return None, "", ""
+    where = fr"{hive}\SOFTWARE\Policies\ClaudeCode"
+    try:
+        import winreg
+        root = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}[hive]
+        with winreg.OpenKey(root, r"SOFTWARE\Policies\ClaudeCode", 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            value, kind = winreg.QueryValueEx(k, "Settings")
+        data = json.loads(value) if kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) else None
+    except OSError:
+        return None, "", ""
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return None, f"{where} Settings is not a JSON object", where
+    return data, "", where
+
+
+def has_policy_key(d):
+    return bool(d) and any(k not in POLICY_CONTROL_KEYS for k in d)
+
+
+def managed_effective():
+    """What the managed tier contributes, by the docs' ranking. -> dict(settings, source, sources, errors).
+
+    source is the winning source ("plist", "HKLM", "file", "HKCU" or ""); sources lists every one found, with its
+    location. HKCU only counts when no admin source is present (it is user-writable)."""
+    found, errors = [], []
+    plist, err, loc = read_plist_policy()
+    if err:
+        errors.append(err)
+    if plist is not None or err:
+        found.append(("plist", loc, plist or {}))
+    hklm, err, loc = read_registry_policy("HKLM")
+    if err:
+        errors.append(err)
+    if hklm is not None or err:
+        found.append(("HKLM", loc, hklm or {}))
+    files, paths, ferrs = read_managed_files()
+    errors += ferrs
+    if files is not None:
+        found.append(("file", ", ".join(paths), files))
+    if not found:
+        hkcu, err, loc = read_registry_policy("HKCU")      # a malformed HKCU value never blocks Claude Code: no error
+        if hkcu is not None:
+            found.append(("HKCU", loc, hkcu))
+    with_keys = [s for s in found if has_policy_key(s[2])]
+    settings, source = {}, ""
+    if with_keys:
+        top = with_keys[0]
+        if top[2].get("managedSourcesBehavior") == "merge":
+            for _, _, d in reversed(with_keys):             # approximation of the docs' per-kind rules
+                settings = deep_merge(settings, d)
+        else:
+            settings = top[2]
+        source = top[0]
+    return {"settings": settings, "source": source, "sources": [(n, l) for n, l, _ in found], "errors": errors}
+
+
+def settings_blocker(path):
+    """Why the user's settings.json can't be replaced by the user ("" if it can). The client renames over the file,
+    so mode 444 is fine; an immutable flag or a directory the user can't write is not (finding 11)."""
+    path = Path(path)
+    if path.exists():
+        st = path.stat()
+        if getattr(st, "st_flags", 0) & (getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "SF_IMMUTABLE", 0)):
+            return f"{path} has the immutable flag (chflags nouchg)"
+        if is_windows() and getattr(st, "st_file_attributes", 0) & 1:
+            return f"{path} has the read-only attribute (attrib -r)"
+        if sys.platform.startswith("linux") and shutil.which("lsattr"):
+            try:
+                r = subprocess.run(["lsattr", "-d", str(path)], capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and "i" in (r.stdout.split() or [""])[0]:
+                    return f"{path} has the immutable attribute (chattr -i)"
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    parent = path.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    if not os.access(str(parent), os.W_OK | os.X_OK):
+        return f"the directory {parent} is not writable by this user"
+    return ""
+
+
+# ---- findings
+
+def finding(check_id, severity, message, fix):
+    return {"id": check_id, "severity": severity, "message": message, "fix": fix}
+
+
+def our_hooks(data, event, sub):
+    """(argv words, timeout) of our hook entries for `event` in a settings dict. Exec form (args) keeps its words;
+    a command string is split the way the platform's shell would (roughly)."""
+    out = []
+    for entry in (data.get("hooks") or {}).get(event) or []:
+        for h in (entry.get("hooks") or []) if isinstance(entry, dict) else []:
+            if not isinstance(h, dict):
+                continue
+            if h.get("args"):
+                words = [str(h.get("command", ""))] + [str(x) for x in h["args"]]
+            else:
+                try:
+                    words = split_command(str(h.get("command", "")), windows=is_windows())
+                except ValueError:
+                    words = str(h.get("command", "")).split()
+            text = " ".join(words)
+            if MARKER.search(text) and re.search(rf"\bhook\s+{sub}\b", text):
+                out.append((words, h.get("timeout")))
+    return out
+
+
+def hook_target(words):
+    """The aigw-claude-auth program a hook runs: (path or name, exists) or ("", False)."""
+    for w in words:
+        if MARKER.search(Path(w).name):
+            return w, bool(os.path.exists(w) or shutil.which(w))
+    return "", False
+
+
+def ctx_env(ctx, who):
+    env = ctx[who].get("env")
+    return env if isinstance(env, dict) else {}
+
+
+@check("config-invalid")
+def chk_config(ctx):
+    if ctx["config_error"]:
+        empty = "sentinel must not be empty" in ctx["config_error"]
+        return [finding("sentinel-empty" if empty else "config-invalid", "Error", ctx["config_error"],
+                        "set the sentinel to the value the load balancer rule expects (an empty header can't be told from a missing one)" if empty
+                        else f"fix {ctx['config_path']}")]
+
+
+@check("sentinel")
+def chk_sentinel(ctx):
+    if ctx["cfg"]["sentinel"] and ctx["cfg"]["sentinel"] != DEFAULTS["sentinel"]:
+        return [finding("sentinel-custom", "Info", f"sentinel is {ctx['cfg']['sentinel']!r}, not the documented default",
+                        "the load balancer rule (gateway/alb-guard-ingress.yaml) must match this value; the helper can't read it")]
+
+
+@check("user-settings-invalid")
+def chk_user_invalid(ctx):
+    if ctx["user_error"]:
+        return [finding("user-settings-invalid", "Error", ctx["user_error"], "fix the JSON; the helper can't edit the file until then")]
+
+
+@check("managed-unparseable")
+def chk_managed_invalid(ctx):
+    return [finding("managed-unparseable", "Error", e + "; Claude Code refuses to start with it", "fix or remove the managed document (IT)")
+            for e in ctx["managed_info"]["errors"]]
+
+
+@check("managed-custom-headers")
+def chk_headers(ctx):
+    if ctx["cfg"].get("mode", "file") == "proxy":
+        ctx["na"]["managed-custom-headers"] = "proxy mode does not use ANTHROPIC_CUSTOM_HEADERS"
+        return
+    if "ANTHROPIC_CUSTOM_HEADERS" in ctx_env(ctx, "managed"):
+        return [finding("managed-custom-headers", "Error",
+                        f"managed settings ({ctx['managed_info']['source']}) define env.ANTHROPIC_CUSTOM_HEADERS; it replaces the user's value, so the JWT is not sent",
+                        "remove it from managed settings and keep the JWT in the user's settings.json (README finding 11)")]
+
+
+@check("hooks-only-missing")
+def chk_hooks_only(ctx):
+    if ctx["managed"].get("allowManagedHooksOnly") is True:
+        miss = [sub for ev, sub in (("UserPromptSubmit", "precheck"), ("StopFailure", "stop-failure")) if not our_hooks(ctx["managed"], ev, sub)]
+        if miss:
+            return [finding("hooks-only-missing", "Error",
+                            f"allowManagedHooksOnly is set and the managed hooks lack: {', '.join(miss)}; user hooks do not run",
+                            "add the hooks to managed settings (aigw-claude-auth install --print)")]
+
+
+@check("hook-entries")
+def chk_hooks(ctx):
+    out = []
+    only = ctx["managed"].get("allowManagedHooksOnly") is True
+    for ev, sub in (("UserPromptSubmit", "precheck"), ("StopFailure", "stop-failure")):
+        mine = our_hooks(ctx["managed"], ev, sub) + ([] if only else our_hooks(ctx["user"], ev, sub))
+        if not mine:
+            if not (only and our_hooks(ctx["user"], ev, sub)):          # that case is hooks-only-missing
+                out.append(finding("hook-missing", "Warning", f"no {ev} hook runs `hook {sub}`",
+                                   "aigw-claude-auth install (or ship the entry in managed settings)"))
+            continue
+        for words, timeout in mine:
+            if timeout is None:
+                out.append(finding("hook-no-timeout", "Warning", f"the {ev} hook has no timeout; Claude Code's 30 s default may cut a slow precheck and send the prompt",
+                                   f"add \"timeout\": {HOOK_TIMEOUT} (finding 8)"))
+            target, exists = hook_target(words)
+            if not target:
+                continue
+            if not exists:
+                out.append(finding("hook-binary-missing", "Error", f"the {ev} hook runs {target}, which does not exist; Claude Code ignores the failure and sends the prompt",
+                                   "re-run install, or point --hook-command at the installed copy"))
+            elif os.path.exists(target) and Path(target).resolve() != Path(__file__).resolve():
+                out.append(finding("hook-other-binary", "Warning", f"the {ev} hook runs {target}, not this copy ({Path(__file__).resolve()})",
+                                   "make sure both are the same version, or re-run install"))
+    return out
+
+
+@check("settings-not-writable")
+def chk_writable(ctx):
+    why = settings_blocker(ctx["settings"].path)
+    if why:
+        return [finding("settings-not-writable", "Error", f"the user's settings can't be replaced: {why}; renewal fails",
+                        "remove the flag or fix the permissions (mode 444 is fine, immutable is not; finding 11)")]
+
+
+@check("base-url")
+def chk_base_url(ctx):
+    m, u = ctx_env(ctx, "managed").get("ANTHROPIC_BASE_URL"), ctx_env(ctx, "user").get("ANTHROPIC_BASE_URL")
+    out = []
+    if m and u and m.rstrip("/") != u.rstrip("/"):
+        out.append(finding("base-url-mismatch", "Error", f"managed ANTHROPIC_BASE_URL ({m}) differs from the user's ({u}); the managed value wins",
+                           "make them equal, or remove the user's"))
+    if ctx["cfg"].get("mode", "file") == "proxy":
+        listen = str(ctx["cfg"].get("proxy_listen", ""))
+        url = m or u or ""
+        hostport = urllib.parse.urlsplit(url).netloc
+        if listen and not listen.endswith(":0") and hostport and hostport != listen:
+            out.append(finding("proxy-listen", "Error", f"ANTHROPIC_BASE_URL ({url}) is not proxy_listen ({listen}); requests bypass the proxy",
+                               "set ANTHROPIC_BASE_URL to the proxy address"))
+    else:
+        ctx["na"]["proxy-listen"] = "n/a until mode 2 (proxy)"
+    return out
+
+
+@check("settings-file-mismatch")
+def chk_settings_file(ctx):
+    cdir, mine = os.environ.get("CLAUDE_CONFIG_DIR"), ctx["settings"].path
+    if cdir:
+        theirs = Path(cdir) / "settings.json"
+        if theirs.resolve() != mine.resolve():
+            return [finding("settings-file-mismatch", "Error", f"this helper writes {mine}, but Claude Code (CLAUDE_CONFIG_DIR) reads {theirs}; the JWT lands in the wrong file",
+                            "point --settings / AIGW_CLAUDE_SETTINGS at it, or run one helper per CLAUDE_CONFIG_DIR")]
+    elif mine.resolve() != (Path.home() / ".claude" / "settings.json").resolve():
+        return [finding("settings-file-mismatch", "Warning", f"this helper writes {mine}, not ~/.claude/settings.json, and CLAUDE_CONFIG_DIR is not set here",
+                        "fine if Claude Code runs with CLAUDE_CONFIG_DIR pointing there; otherwise the JWT lands in the wrong file")]
+
+
+@check("block-on-failure")
+def chk_block(ctx):
+    url = ctx_env(ctx, "managed").get("ANTHROPIC_BASE_URL") or ctx_env(ctx, "user").get("ANTHROPIC_BASE_URL") or ""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if ctx["cfg"]["block_on_failure"] is False and (host == "portkey.ai" or host.endswith(".portkey.ai")):
+        return [finding("block-on-failure", "Error", "block_on_failure is false against the SaaS gateway; the sentinel gets a 401 and the OAuth loop",
+                        "set block_on_failure to true")]
+
+
+@check("credential-override")
+def chk_credentials(ctx):
+    m, env = ctx["managed"], ctx_env(ctx, "managed")
+    keys = (["apiKeyHelper"] if m.get("apiKeyHelper") else []) + [k for k in CREDENTIAL_ENV if env.get(k)]
+    if keys:
+        return [finding("credential-override", "Warning", f"managed settings set {', '.join(keys)}; it replaces the Anthropic login the passthrough relies on",
+                        "remove it unless the gateway is meant to use that credential")]
+
+
+@check("allowed-providers")
+def chk_allowed(ctx):
+    if ctx_env(ctx, "managed").get("ANTHROPIC_BASE_URL") and ctx["managed"].get("allowedProviders") != ["customEndpoint"]:
+        return [finding("allowed-providers", "Info", "managed settings set ANTHROPIC_BASE_URL but not allowedProviders [\"customEndpoint\"]; a user can point Claude Code at Anthropic directly",
+                        "add allowedProviders: [\"customEndpoint\"] (Claude Code 2.1.285+, docs)")]
+
+
+@check("managed-config-conflict")
+def chk_conflict(ctx):
+    out, raw = [], ctx["helper_raw"]
+    for name, value in sorted(ctx_env(ctx, "managed").items()):
+        if not name.startswith("AIGW_"):
+            continue
+        key = name[5:].lower()
+        if key not in DEFAULTS and key != "mode":
+            out.append(finding("managed-unknown-key", "Warning", f"managed env {name} is not a config key", "check the spelling"))
+        elif key in raw and str(raw[key]) != str(value):
+            sev = "Error" if key in ("mode", "issuer", "client_id", "header") else "Warning"
+            out.append(finding("managed-config-conflict", sev, f"{name} in managed settings differs from {key} in the helper config; the managed value should win",
+                               f"make them equal, or remove {key} from the helper config"))
+    return out
+
+
+@check("jwt-claims")
+def chk_jwt(ctx):
+    cfg, tok = ctx["cfg"], ctx["jwt"]
+    claims = jwt_claims(tok) if tok and tok != cfg["sentinel"] else {}
+    if claims and cfg["issuer"] and not cfg["broker_url"] and not cfg["token_command"]:
+        iss = claims.get("iss")
+        if iss and str(iss).rstrip("/") != cfg["issuer"].rstrip("/"):
+            return [finding("jwt-claims", "Error", f"the current JWT's iss ({iss}) is not the configured issuer ({cfg['issuer']}); the gateway will refuse it",
+                            "run `aigw-claude-auth sync --force` after fixing the configuration")]
+
+
+@check("secret-store")
+def chk_secret_store(ctx):
+    if ctx["cfg"].get("secret_store", "auto") != "auto":
+        ctx["na"]["secret-store"] = "secret_store is file"
+        return
+    if ctx["state"].load().get("refresh_token") and make_store(ctx["cfg"], ctx["state"].dir) is not None:
+        return [finding("secret-store", "Warning", "the refresh token is in state.json although an OS credential store is available (secret_store: auto)",
+                        "run `aigw-claude-auth login` once to migrate it")]
+
+
+@check("server-managed")
+def chk_server(ctx):
+    return [finding("server-managed", "Info", "server-managed settings can't be read by the helper; if your organization uses them they rank above everything checked here (unknown)",
+                    "Claude Code's /status shows the sources it applied")]
+
+
+# ---- running the checks
+
+def _safe(fn, default):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def doctor_context(cfg, state, settings, helper_raw=None, config_error="", config_path=""):
+    user, user_error = read_user_settings(settings.path)
+    info = managed_effective()
+    if helper_raw is None:
+        helper_raw, _ = read_helper_config(config_path or cfg.get("_config_path") or config_dir() / "config.json")
+    return {"cfg": cfg, "state": state, "settings": settings, "user": user, "user_error": user_error, "managed": info["settings"],
+            "managed_info": info, "helper_raw": helper_raw, "config_error": config_error, "config_path": str(config_path), "na": {},
+            "jwt": _safe(lambda: settings.get(), "")}
+
+
+def run_checks(ctx):
+    findings = []
+    for check_id, fn in CHECKS:
+        try:
+            findings += fn(ctx) or []
+        except Exception as e:                                  # a broken check must not break the others
+            findings.append(finding(check_id, "Warning", f"the check failed: {type(e).__name__}: {e}", "report this"))
+    findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
+    return findings
+
+
+def findings_hash(findings):
+    """Of Errors and Warnings only: Info rows never change and must not cause a notification."""
+    rows = sorted(f"{f['id']}|{f['severity']}|{f['message']}" for f in findings if f["severity"] != "Info")
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()[:16]
+
+
+def preflight(cfg, state, settings):
+    """All findings for this configuration."""
+    return run_checks(doctor_context(cfg, state, settings, config_path=cfg.get("_config_path", "")))
+
+
+def notify_on_change(cfg, state, findings):
+    """Notify when the set of Errors/Warnings changes (an Error appears, or the last one clears); not on every run.
+    The hash lives in preflight.json next to the state (no secrets)."""
+    path, new = state.dir / "preflight.json", findings_hash(findings)
+    errors = [f for f in findings if f["severity"] == "Error"]
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        old = {}
+    if old.get("hash") == new:
+        return False
+    try:
+        write_private(path, json.dumps({"hash": new, "errors": len(errors)}) + "\n")
+    except OSError:
+        pass                                                    # can't remember: better to notify twice than never
+    if errors:
+        notify(cfg, f"AI gateway: {errors[0]['message']}. Fix: {errors[0]['fix']} (aigw-claude-auth doctor)")
+    elif old.get("errors"):
+        notify(cfg, "AI gateway: the configuration problem is fixed.")
+    return True
+
+
+def block_message(errors):
+    f = errors[0]
+    more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+    return f"AI gateway: {f['message']}. Fix: {f['fix']}{more}. Run `aigw-claude-auth doctor` for details. [{f['id']}]"
+
+
+def preflight_errors(cfg, state, settings):
+    """The Errors that stop a write or a prompt, [] if none. AIGW_CLAUDE_PREFLIGHT=off skips the gate (the repro
+    harness uses it to observe Claude Code's own behavior; doctor ignores it). Never raises."""
+    if os.environ.get("AIGW_CLAUDE_PREFLIGHT", "").lower() == "off":
+        return []
+    try:
+        findings = preflight(cfg, state, settings)
+        notify_on_change(cfg, state, findings)
+        return [f for f in findings if f["severity"] == "Error"]
+    except Exception as e:
+        log(f"preflight failed: {e}")
+        return []
+
+
+def doctor_sources(ctx):
+    cfg, info = ctx["cfg"], ctx["managed_info"]
+    st = _safe(lambda: ctx["state"].load(), {})
+    return {
+        "helper_config": ctx["config_path"] or "defaults",
+        "helper_state": {"path": str(ctx["state"].file), "signed_in": bool(st.get("refresh_token"))},
+        "user_settings": {"path": str(ctx["settings"].path), "exists": ctx["settings"].path.exists()},
+        "managed": {"winning_source": info["source"] or "none", "found": [{"source": n, "location": l} for n, l in info["sources"]]},
+        "server_managed": "unknown (not readable by the helper)",
+        "jwt": fingerprint(ctx["jwt"]) if ctx["jwt"] and ctx["jwt"] != cfg["sentinel"] else ("sentinel" if ctx["jwt"] else "none"),
+        "mode": cfg.get("mode", "file"),
+    }
+
+
+def cmd_doctor(a, config_path, state, settings_path):
+    raw, config_error = read_helper_config(config_path)
+    cfg = dict(DEFAULTS)
+    cfg.update({k: v for k, v in raw.items() if k in DEFAULTS})
+    if not config_error:
+        try:
+            cfg = load_config(config_path)
+        except (AuthError, ValueError) as e:
+            config_error = str(e)
+    cfg["_config_path"] = str(config_path)
+    settings = Settings(settings_path or default_settings_path(), cfg["header"])
+    ctx = doctor_context(cfg, state, settings, helper_raw=raw, config_error=config_error, config_path=config_path)
+    findings = run_checks(ctx)
+    errors, warnings = (sum(1 for f in findings if f["severity"] == s) for s in ("Error", "Warning"))
+    report = {"version": VERSION, "platform": sys.platform, "python": sys.version.split()[0], "sources": doctor_sources(ctx),
+              "findings": findings, "checked": [c for c, _ in CHECKS],
+              "not_applicable": [{"id": k, "reason": v} for k, v in sorted(ctx["na"].items())],
+              "hash": findings_hash(findings), "errors": errors, "warnings": warnings}
+    if a.json:
+        print(json.dumps(report, indent=2))
+        return 1 if errors else 0
+    s = report["sources"]
+    print(f"aigw-claude-auth doctor {VERSION} ({sys.platform}, python {report['python']}, mode {s['mode']})")
+    print("Sources")
+    for label, value in (("helper config", s["helper_config"]),
+                         ("helper state", f"{s['helper_state']['path']} (signed in: {'yes' if s['helper_state']['signed_in'] else 'no'})"),
+                         ("user settings", f"{s['user_settings']['path']} ({'present' if s['user_settings']['exists'] else 'missing'})"),
+                         ("managed", s["managed"]["winning_source"] + "".join(f"; {f['source']}: {f['location'] or 'present'}" for f in s["managed"]["found"])),
+                         ("server-managed", s["server_managed"]), ("jwt", s["jwt"])):
+        print(f"  {label:15} {value}")
+    print("Findings")
+    for f in findings:
+        print(f"  [{f['severity']}] {f['id']}: {f['message']}\n      fix: {f['fix']}")
+    if not findings:
+        print("  none")
+    for n in report["not_applicable"]:
+        print(f"  [n/a] {n['id']}: {n['reason']}")
+    print(f"Result: {errors} error(s), {warnings} warning(s), {len(findings) - errors - warnings} info")
+    return 1 if errors else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="aigw-claude-auth", description=__doc__.split("\n\n")[0])
     ap.add_argument("--config", type=Path, help="config file (default: <config dir>/config.json)")
@@ -1812,6 +2400,8 @@ def main(argv=None):
     p.add_argument("--no-hooks", action="store_true", help="only the base URL (for example when IT ships the hooks)")
     p.add_argument("--hook-command", help="how hooks call this tool (default: this interpreter and file; must contain 'aigw-claude-auth')")
     p.add_argument("--print", action="store_true", help="print the snippet for managed settings instead of writing")
+    p = sub.add_parser("doctor", help="read every config source, predict what Claude Code sends, report conflicts (exit 1 on an Error)")
+    p.add_argument("--json", action="store_true", help="machine-readable report")
     p = sub.add_parser("task", help="Windows: install or remove the Task Scheduler task that runs the daemon at log on")
     p.add_argument("action", choices=["install", "remove", "print"], help="print shows the task definition (XML) and registers nothing")
     p.add_argument("--name", default=TASK_NAME, help="task name (default: %(default)s)")
@@ -1821,6 +2411,8 @@ def main(argv=None):
     try:
         if a.cmd == "task":                                     # needs no config
             return cmd_task(a, None, None, None)
+        if a.cmd == "doctor":                                   # must work when the config itself is broken
+            return cmd_doctor(a, a.config or cdir / "config.json", State(cdir), a.settings)
         cfg = load_config(a.config or cdir / "config.json")
         cfg["_config_path"] = str((a.config or cdir / "config.json").resolve())   # for the hook's background sign-in
         state = State(cdir)
