@@ -177,7 +177,9 @@ cmd_uninstall() {
     id "$PILOT_USER" >/dev/null 2>&1 && touched="$touched $PILOT_USER"
     step "purge the users the pilot touched ($touched), not every account"
     for u in $touched; do
-        [ -f "$LIBEXEC/aigw_launch.py" ] && sudo -u "$u" -H /usr/bin/python3 "$LIBEXEC/aigw_launch.py" purge-user 2>&1 | tail -1 | sed 's/^/  /'
+        # the launcher logs to ~/Library/Logs/aigw-claude-auth.log when stderr is not a terminal: show its last line
+        [ -f "$LIBEXEC/aigw_launch.py" ] && sudo -u "$u" -H /usr/bin/python3 "$LIBEXEC/aigw_launch.py" purge-user </dev/null >/dev/null 2>&1
+        sudo tail -1 "$(eval echo "~$u")/Library/Logs/aigw-claude-auth.log" 2>/dev/null | sed "s/^/  $u: /"
     done
     step "uninstall.sh (without --purge-users)"
     [ -x "$LIBEXEC/uninstall.sh" ] && sudo "$LIBEXEC/uninstall.sh" | sed 's/^/  /'

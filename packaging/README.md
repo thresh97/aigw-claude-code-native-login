@@ -131,7 +131,14 @@ Machines where several users are logged in at the same time (terminal servers, f
   - Uninstall: task, drop-in, install folder (and the empty `ClaudeCode` folders) gone, no daemon left. Per user, as documented: the user who ran `purge-user` has no header line and no state folder (the log folder stays while the running daemon holds `daemon.log`); the other user keeps the state folder, the log folder and the inert header line.
   - Bugs found and fixed: the installer's `PayloadDir` default used `$PSScriptRoot`, which is empty under `powershell -File` (so the installer did not run that way); `purge-user` now also removes the Windows log folder.
 
-Not covered: a real MDM/Intune push, the macOS privileged install and LaunchAgent at login (driver `macos/pilot-mac.sh`, person-run), signing, a logged-in-user `launchctl bootstrap` from the postinstall.
+- Emulated pilot (macOS, 2026-10-26; macOS 26.6, person-run `macos/pilot-mac.sh`, file mode, the console user only): `sudo installer` of the
+  unsigned pkg succeeds; drop-in valid without `ANTHROPIC_CUSTOM_HEADERS`, plist lints, receipt present; the postinstall's `launchctl bootstrap`
+  started the LaunchAgent for the console user, whose first run wrote only the sentinel line (the launcher logs `install --no-hooks exit 1`:
+  not signed in); `doctor` 0 errors, 0 warnings (Info `server-managed`). Uninstall (purge of the console user, then `uninstall.sh`) removed
+  files, drop-in, plist, receipt, the loaded agent and any Keychain item; the personal install set aside before was restored and restarted.
+  Not run on macOS: a second user's login (LaunchAgent at login), proxy mode, sign-in from the first prompt.
+
+Not covered: a real MDM/Intune push, the macOS LaunchAgent starting at a real login and proxy mode on macOS, signing, a logged-in-user `launchctl bootstrap` from the postinstall.
 Not covered on Windows: two users logged on at the same time (the VM had one autologon, `Start-Process -Credential` from ssh fails with 0xC0000142 and a standard user may not run password tasks), so whether the second user's At-logon trigger is dropped by `IgnoreNew` while the first user's daemon runs is inferred from the manual start above, not observed; in proxy mode that user would have no proxy (the fixed port is taken anyway). A user signing in to the IdP, renewal, and Claude Code itself against the gateway were not run.
 
 ## What the emulated pilot needs
