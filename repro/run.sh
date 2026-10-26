@@ -62,6 +62,7 @@ check() {
       echo "gateway JWT: len ${#t} sha $(printf %s "$t" | sha | cut -c1-12)"
     else echo "gateway JWT: TOKEN_COMMAND failed (sign in first: python3 $CLIENT login)"; fi
   else echo "gateway: GATEWAY_URL not set (gateway, live_login, client_live will refuse to run)"; fi
+  if docker info >/dev/null 2>&1; then echo "docker: ok (the keycloak scenario can run)"; else echo "docker: not available (the keycloak scenario will SKIP unless KEYCLOAK_URL is set)"; fi
   echo "check: ok"; }
 
 declare -A SEEN
@@ -74,7 +75,7 @@ harness() { # harness <scenario>: run repro/harness.py, keep its key=value obser
 expect_seen() { # stdin: "<key> <expected...>" lines (# comments allowed); compares each with SEEN[key]
   local k want; while read -r k want; do [[ -z $k || $k == \#* ]] && continue; expect "$k" "$want" "${SEEN[$k]:-missing}"; done; }
 
-SCENARIOS=(unit headers errors precheck stopfailure proxy stored_login stored_login_proxy gateway live_login client_live managed)
+SCENARIOS=(unit headers errors precheck stopfailure proxy stored_login stored_login_proxy gateway live_login client_live managed keycloak)
 
 describe_unit() { echo "unit: the client's offline tests (fake IdP and broker): settings edits, refresh, sentinel, device/PKCE sign-in, hooks, daemon. Changes: nothing. Under 1 min."; }
 scenario_unit() {
@@ -458,6 +459,91 @@ dropinonly_base_url_from_managed yes
 dropinonly_hook_userprompt_ran yes
 dropinonly_hook_stopfailure_ran yes
 dropinonly_env_userprompt AIGW_ONLY_DROPIN=yes
+EOF
+  finish; }
+
+describe_keycloak() { echo "keycloak: the client against a local Keycloak 26 in Docker (127.0.0.1 only, realm aigw-test, dummy user with a password made up for the run): device code and PKCE sign-in with the user's side done over HTTP, Mode A claims straight from the IdP (protocol mappers, nested defaults, no broker), refresh and Revoke Refresh Token behavior, offline_access vs SSO session end, Claude Code sending the IdP's JWT to the mock gateway, and Mode B (the plain IdP token). Needs Docker (or KEYCLOAK_URL and KEYCLOAK_ADMIN_PASSWORD for a Keycloak already running); SKIP (docker) without. Changes: starts and removes one container. About 4 min."; }
+scenario_keycloak() {
+  start keycloak
+  if [[ -z ${KEYCLOAK_URL:-} ]] && ! docker info >/dev/null 2>&1; then
+    echo "SKIP keycloak: docker is not available (install/start Docker, or set KEYCLOAK_URL and KEYCLOAK_ADMIN_PASSWORD)"; finish "SKIP (docker)"; return; fi
+  harness keycloak
+  expect_seen <<'EOF'
+# the pinned Keycloak image (repro/keycloak/kc.py IMAGE)
+keycloak_version 26.4.7
+# Mode A from the IdP (no broker): device code sign-in, the user's side done over HTTP; token claims from the protocol mappers
+device_prompt yes
+device_login_exit 0
+device_page_confirms yes
+login_stores_refresh_token yes
+state_file_mode 0o600
+token_is_jwt yes
+claim_iss_is_issuer yes
+claim_aud_has_gateway yes
+claim_defaults_keys config_id,config_slug
+claim_defaults_nested_object yes
+claim_config_slug yes
+claim_config_id yes
+claim_portkey_workspace yes
+claim_portkey_oid_is_user_id yes
+claim_kind gateway
+token_lifetime_s 900
+token_second_call_cached yes
+refresh_token_typ Offline
+settings_holds_token yes
+# `inspect` decodes the stored JWT, redacted, and finds no problem
+inspect_exit 0
+inspect_problem_lines 0
+inspect_shows_workspace yes
+inspect_leaks_token no
+# refresh: Keycloak's default keeps old refresh tokens valid; with Revoke Refresh Token on, a reused one is refused and revokes the chain
+refresh_gives_new_jwt yes
+refresh_token_replaced_by_client yes
+old_refresh_token_still_valid_default yes
+realm_revoke_set 204
+revoke_on_client_refresh_ok yes
+revoke_on_client_stores_new_token yes
+revoke_on_old_token_rejected 400
+revoke_on_reuse_kills_current_token yes
+relogin_after_reuse_exit 0
+# Claude Code sends the IdP's JWT to the mock gateway (Mode A, broker_url empty)
+modea_broker_url_empty yes
+modea_login_exit 0
+modea_install_exit 0
+modea_settings_has_jwt yes
+modea_turn ok
+modea_gateway_got_idp_jwt yes
+modea_authorization_oauth yes
+modeb_login_exit 0
+modeb_install_exit 0
+# Mode B: a client without the custom mappers; the plain IdP token (no portkey claims) reaches a gateway that accepts it
+modeb_jwt_differs_from_modea yes
+modeb_claim_iss_is_issuer yes
+modeb_no_portkey_claims yes
+modeb_has_sub_and_azp yes
+modeb_turn ok
+modeb_gateway_got_idp_jwt yes
+# browser flow: PKCE S256 with a loopback redirect on any port; a client with PKCE enforced refuses the device flow (the client sends no code_challenge there)
+pkce_login_exit 0
+pkce_loopback_port_accepted yes
+pkce_stores_refresh_token yes
+pkce_enforced_device_login_exit 1
+pkce_enforced_device_error code_challenge_method
+pkce_enforced_pkce_login_exit 0
+# offline_access: ending the SSO session kills a normal refresh token, not the offline one; the admin 'logout user' call also revokes offline tokens
+normal_login_exit 0
+normal_refresh_token_typ Refresh
+normal_refresh_before_logout yes
+sessions_before_logout sso+,offline+
+sso_sessions_deleted 1
+sessions_after_sso_end sso0,offline+
+normal_refresh_after_sso_end_exit 1
+normal_refresh_after_sso_end_message sign-in-expired
+offline_refresh_after_sso_end_exit 0
+offline_jwt_after_sso_end yes
+admin_logout_status 204
+offline_refresh_after_admin_logout_exit 1
+offline_refresh_after_admin_logout_message sign-in-expired
 EOF
   finish; }
 

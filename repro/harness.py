@@ -1212,7 +1212,8 @@ class KcClient:
         self.dir.mkdir(parents=True)
         self.kcs = kcs
         self.settings = self.dir / "settings.json"
-        self.cfg = {"issuer": kcs.issuer, "client_id": client_id, "scope": "openid offline_access", "notify": "off", "hook_wait": 3, **cfg}
+        self.cfg = {"issuer": kcs.issuer, "client_id": client_id, "scope": "openid offline_access", "notify": "off", "hook_wait": 3,
+                    "secret_store": "file", **cfg}       # file: never the real login Keychain
         self.configure()
 
     def configure(self, **kw):
@@ -1234,8 +1235,13 @@ class KcClient:
         watchdog.start()
         page = ""
         try:
-            first = p.stderr.readline()
-            m = re.search(r"(https?://\S+)", first)
+            first = ""
+            for _ in range(6):                               # the prompt may follow a status line ("signing in with device ...")
+                line = p.stderr.readline()
+                first += line
+                m = re.search(r"(https?://\S+)", line)
+                if m or not line:
+                    break
             if m and m.group(1).startswith(self.kcs.base):
                 try:
                     page = self.kcs.browse(m.group(1))
@@ -1320,6 +1326,12 @@ def scenario_keycloak(out):
         observe("token_second_call_cached", yn(a.token() == tok))
         observe("refresh_token_typ", claims_of(rt1).get("typ", "unknown"))
         observe("settings_holds_token", yn(header_of(json.loads(a.settings.read_text(encoding="utf-8"))) == tok) if a.settings.exists() else "no-settings")
+
+        ins = a.run("inspect")
+        observe("inspect_exit", ins.returncode)
+        observe("inspect_problem_lines", sum(1 for line in ins.stdout.splitlines() if line.startswith("PROBLEM")))
+        observe("inspect_shows_workspace", yn(KC_WORKSPACE in ins.stdout))
+        observe("inspect_leaks_token", yn(tok in ins.stdout or tok in ins.stderr))
 
         # ---- refresh: Keycloak's default (old refresh tokens stay valid), then with "Revoke Refresh Token" on
         tok2 = a.token(force=True)
@@ -1407,15 +1419,21 @@ def scenario_keycloak(out):
         observe("normal_refresh_before_logout", yn(bool(n.token(force=True))))
         before = kcs.sessions()
         observe("sessions_before_logout", f"sso{'+' if before[0] > 0 else '0'},offline{'+' if before[1] > 0 else '0'}")
-        observe("admin_logout_status", kcs.logout_user())
+        observe("sso_sessions_deleted", kcs.end_sso_sessions())
         after = kcs.sessions()
-        observe("sessions_after_logout", f"sso{'+' if after[0] > 0 else '0'},offline{'+' if after[1] > 0 else '0'}")
+        observe("sessions_after_sso_end", f"sso{'+' if after[0] > 0 else '0'},offline{'+' if after[1] > 0 else '0'}")
         r = n.run("sync", "--force")
-        observe("normal_refresh_after_logout_exit", r.returncode)
-        observe("normal_refresh_after_logout_message", "sign-in-expired" if "sign-in expired" in r.stderr else mask_tokens(r.stderr.strip())[:80])
+        observe("normal_refresh_after_sso_end_exit", r.returncode)
+        observe("normal_refresh_after_sso_end_message", "sign-in-expired" if "sign-in expired" in r.stderr else mask_tokens(r.stderr.strip())[:80])
         r = a.run("sync", "--force")
-        observe("offline_refresh_after_logout_exit", r.returncode)
-        observe("offline_jwt_after_logout", yn(claims_of(header_of(json.loads(a.settings.read_text(encoding="utf-8")))).get("iss") == kcs.issuer))
+        observe("offline_refresh_after_sso_end_exit", r.returncode)
+        observe("offline_jwt_after_sso_end", yn(bool(a.token())))
+        # the admin API's "logout user" also sets the user's not-before: that revokes offline tokens too
+        time.sleep(3)                                  # not-before is whole seconds: tokens from this second would still pass
+        observe("admin_logout_status", kcs.logout_user())
+        r = a.run("sync", "--force")
+        observe("offline_refresh_after_admin_logout_exit", r.returncode)
+        observe("offline_refresh_after_admin_logout_message", "sign-in-expired" if "sign-in expired" in r.stderr else mask_tokens(r.stderr.strip())[:80])
     finally:
         if claude:
             claude.cleanup()

@@ -153,8 +153,17 @@ class Keycloak:
         s, _ = self.admin("PUT", "", attrs)
         return s
 
+    def end_sso_sessions(self):
+        """Deletes the user's online (SSO) sessions one by one, as when they time out; offline sessions stay. Returns how many."""
+        s, sessions = self.admin("GET", f"/users/{self.user_id}/sessions")
+        n = 0
+        for sess in sessions if isinstance(sessions, list) else []:
+            n += self.admin("DELETE", f"/sessions/{sess['id']}?isOffline=false")[0] == 204
+        return n
+
     def logout_user(self):
-        """Ends the user's SSO sessions (what an admin's 'sign out' does). Offline sessions are separate."""
+        """The admin API's user logout: ends the SSO sessions and also sets the user's not-before, which revokes every
+        token issued before now, offline ones included (found by running it)."""
         s, _ = self.admin("POST", f"/users/{self.user_id}/logout")
         return s
 
