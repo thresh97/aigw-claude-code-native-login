@@ -119,7 +119,7 @@ Unconfirmed (treat as such):
 ## Open questions
 
 - Refresh grants (above). The client refreshes silently; a refreshed token without the Portkey claims fails closed.
-- `usage_limits`: does the gateway count per JWT or per user? A new token each hour could reset a per-JWT counter.
+- `usage_limits`: counted against the user, not the token, so renewals don't reset a budget (the operator's statement; to confirm in the gateway test).
 - `defaults.config_slug` vs `config_id`: Portkey's SaaS docs name `config_id`; this repo's README says the hybrid
   gateway reads `config_slug`. The example sets both; keep the one your gateway type uses.
 - `rate_limits` shape is undocumented; the mapping passes it through.

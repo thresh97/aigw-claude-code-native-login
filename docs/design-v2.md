@@ -267,7 +267,7 @@ Fleets need users in different IdP groups to land in different gateway workspace
 | `portkey_oid`, `portkey_workspace` | string | Required on AI Gateway Cloud |
 | `scope` / `scopes` | string or array | Okta writes `scp`; add `scopes` = `access.scope` (README finding 21) |
 | `defaults` | object: `config_id`, `metadata` | The hybrid gateway reads `defaults.config_slug` (README); the JWT reference lists only `config_id` |
-| `usage_limits` | array of objects: `id`, `type`, `credit_limit`, `status` | Top level, not in `defaults`. "Each unique JWT is tracked separately for token-level limits": with hourly renewal a per-token budget may reset each hour (open question 1) |
+| `usage_limits` | array of objects: `id`, `type`, `credit_limit`, `status` | Top level, not in `defaults`. Counted against the user, not the token, so renewing the JWT doesn't reset a budget (the operator's statement; to confirm in the gateway test) |
 | `rate_limits` | undocumented | |
 | `email_id`, then `sub`, then `uid` | string | User attribution |
 
@@ -300,10 +300,9 @@ Fleets need users in different IdP groups to land in different gateway workspace
 
 **Open questions for Portkey**
 
-1. Are `usage_limits` in a JWT counted per token or per user (`sub`/`email_id`)? If per token, hourly renewal resets them; keep budgets on the workspace or in user-keyed policies until this is answered.
-2. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both, and what applies when `defaults` is absent (workspace default config)?
-3. Is a scope such as `completions.write` required, and is it checked per route?
-4. What shape does `rate_limits` take?
+1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both, and what applies when `defaults` is absent (workspace default config)?
+2. Is a scope such as `completions.write` required, and is it checked per route?
+3. What shape does `rate_limits` take?
 
 ## Sign-in method selection and in-session re-login (new in v2)
 
