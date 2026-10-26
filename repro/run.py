@@ -60,7 +60,7 @@ DESCRIBE = {
         "managed: the OS managed-settings file next to the user's settings.json: a managed ANTHROPIC_CUSTOM_HEADERS vs the user's JWT; hooks from managed settings with the JWT in the user file; allowManagedHooksOnly; a read-only or immutable settings.json; proxyAuthHelper; spike S4 (an unknown top-level key, AIGW_* in managed env, managed-settings.d/ drop-ins). Mock gateway, fake IdP. Changes: writes /Library/Application Support/ClaudeCode/managed-settings.json (Linux: /etc/claude-code/) with sudo for a minute per case and removes it; refuses if a managed-settings file exists. Drop-in cases also write files in managed-settings.d/ (and remove them, and the directory if it created it). Other Claude Code sessions on the machine see each case's settings while it runs: close them first (--yes). About 8 min.",
 }
 
-EXPECT_HEADERS_0 = r'''\
+EXPECT_HEADERS_0 = r'''
 install_exit 0
 settings_base_url gateway
 settings_hooks StopFailure,UserPromptSubmit
@@ -73,7 +73,7 @@ turn2_gateway_header jwt2
 turn2_hook_refreshed no
 '''
 
-EXPECT_ERRORS_0 = r'''\
+EXPECT_ERRORS_0 = r'''
 portkey401_attempts 2
 portkey401_fast yes
 portkey401_message portkey
@@ -97,7 +97,7 @@ anthropic401_stopfailure_error authentication_failed
 recovery ok
 '''
 
-EXPECT_PRECHECK_0 = r'''\
+EXPECT_PRECHECK_0 = r'''
 # expired JWT, IdP fine: renewed before the first request
 expired_turn1 ok
 expired_turn1_requests 1
@@ -153,7 +153,7 @@ lbguard_turn2 gateway-token
 lbguard_turn2_requests 1
 '''
 
-EXPECT_STOPFAILURE_0 = r'''\
+EXPECT_STOPFAILURE_0 = r'''
 baseline ok
 refused_turn portkey
 jwt_replaced yes
@@ -163,7 +163,7 @@ anthropic_turn anthropic
 anthropic_jwt_kept yes
 '''
 
-EXPECT_PROXY_0 = r'''\
+EXPECT_PROXY_0 = r'''
 # a normal turn through the proxy
 normal_result ok
 normal_header_injected yes
@@ -235,7 +235,7 @@ socket_env_var_authorization oauth
 socket_env_var_in_settings no-request (still retrying after 15s)
 '''
 
-EXPECT_STORED_LOGIN_0 = r'''\
+EXPECT_STORED_LOGIN_0 = r'''
 login_present yes
 baseline ok
 498_attempts 1
@@ -249,7 +249,7 @@ portkey401_login_still_valid yes
 recovery ok
 '''
 
-EXPECT_STORED_LOGIN_PROXY_0 = r'''\
+EXPECT_STORED_LOGIN_PROXY_0 = r'''
 login_present yes
 baseline ok
 portkey401_attempts 1
@@ -267,7 +267,7 @@ notoken_login_still_valid yes
 recovery ok
 '''
 
-EXPECT_GATEWAY_0 = r'''\
+EXPECT_GATEWAY_0 = r'''
 missing $refused
 garbage 401 portkey
 tampered 401 portkey
@@ -278,7 +278,7 @@ valid_no_login 401 anthropic
 lb_guard $lb_guard
 '''
 
-EXPECT_LIVE_LOGIN_0 = r'''\
+EXPECT_LIVE_LOGIN_0 = r'''
 ok_result ok
 ok_attempts 1
 ok_login_still_valid yes
@@ -290,7 +290,7 @@ tampered_login_rotated yes
 tampered_login_still_valid yes
 '''
 
-EXPECT_LIVE_LOGIN_1 = r'''\
+EXPECT_LIVE_LOGIN_1 = r'''
 sentinel_result gateway-token
 sentinel_attempts 1
 sentinel_statuses 498
@@ -302,7 +302,7 @@ missing_statuses 498
 missing_login_rotated no
 '''
 
-EXPECT_CLIENT_LIVE_0 = r'''\
+EXPECT_CLIENT_LIVE_0 = r'''
 signed_in yes
 install_exit 0
 sync_exit 0
@@ -313,7 +313,7 @@ turn_after_expiry_statuses 200
 turn_after_expiry_fast yes
 '''
 
-EXPECT_MANAGED_0 = r'''\
+EXPECT_MANAGED_0 = r'''
 # no managed file: the client hooks renew the expired JWT (control)
 none_turn1 ok
 none_turn1_jwt renewed

@@ -101,5 +101,6 @@ What differs on Windows:
 - The live scenarios (`gateway`, `stored_login`, `stored_login_proxy`, `live_login`, `client_live`) are ported but not run
   on Windows yet. `TOKEN_COMMAND` runs through `cmd.exe` there: use double quotes and `%VAR%`; single quotes do not quote.
   Paths in `repro\env` can use either slash.
-- Until the client's Windows port is merged, `import fcntl` in the client fails, so every scenario that imports the client
-  (all of them via the harness, and `unit`) stops at once with `ERROR`. Do not work around it in the runner.
+- Until the client's Windows port is merged, `import fcntl` in the client fails: `unit` ends `CHANGED` (the test module
+  cannot import), and the scenarios that install the client (`headers`, `precheck`, `stopfailure`) end `CHANGED` with
+  failed expectations. `errors` and `proxy` do not run the client and can pass. Do not work around it in the runner.
