@@ -28,7 +28,7 @@ A JWT isn't the only way to authenticate to the gateway. The gateway's own API k
 - **AI Gateway service API keys:** one key per workspace, team or machine. The gateway knows the key, not the person.
 - **AI Gateway user API keys:** one key per user, so requests are attributed to the person. This needs the SCM tenant onboarded with the customer's directory through Cloud Identity Engine (CIE), so the gateway knows the users.
 
-Set it once, in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings (`x-portkey-api-key: <key>`), with the passthrough config bound to the key (or as the workspace default, see [The passthrough config](#what-you-need)). No client, broker or IdP sign-in is needed. The trade-offs, compared with the JWT:
+Set it once, in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings (`x-portkey-api-key: <key>`), with the passthrough config bound to the key (`defaults.config_id` set to the config's UUID; a slug is refused). A workspace default doesn't reach service keys on a hybrid gateway, so bind it to the key. No client, broker or IdP sign-in is needed. The trade-offs, compared with the JWT:
 - The key is a long-lived secret in the settings file. Rotation is manual, or done by another tool such as an MDM that rewrites the settings. Revoking it takes effect at once, unlike a JWT, which stays valid until it expires.
 - A revoked or wrong key gets the gateway's 401, which sends a logged-in Claude Code into the OAuth loop described below. The StopFailure hook can't help: there's nothing to renew. The LB guard can only catch a missing header.
 
@@ -62,9 +62,9 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
   - **"Mode B":** your IdP's ordinary token; the gateway works out the organization and workspace from its own settings. Hybrid gateway only: the SaaS gateway takes Mode A only.
 - **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), as the config the users' requests get. Either:
   - bind it to the credential: named in the JWT's claims, or bound to the service or user API key. Different users or groups in one workspace can then get different configs, and Claude Code's settings (or the MDM or Claude Enterprise policy that manages them) need to know nothing about configs or workspaces;
-  - or make it the workspace default. That's simpler, but then everyone in the workspace who doesn't name a config gets that one.
+  - or make it the workspace default: the workspace's `defaults.user_api_key_config`, the only supported workspace-level config default. That's simpler, but then every JWT request in the workspace that doesn't name a config gets that one. On a hybrid gateway it doesn't apply to service API keys.
 
-  In the JWT, the hybrid gateway reads `defaults.config_slug` and ignores `defaults.config_id`; the SaaS gateway reads `defaults.config_id` (reported 2026-10-24, SaaS not tested here). The broker `aigw-entra-jwt-broker` sends both, with `config_id` falling back to the slug. The config's `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
+  In the JWT, the hybrid gateway reads `defaults.config_slug` and ignores `defaults.config_id`; the SaaS gateway reads `defaults.config_id`, as a slug or a UUID (separate lab tests, 2026-10-01; SaaS not run by this article). Write both claims; the broker `aigw-entra-jwt-broker` does, with `config_id` falling back to the slug. A wrong claim fails open on hybrid (HTTP 200, no config). The config's `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
 - **An IdP public client** (no secret) for the client to sign in with:
   - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra: platform "Mobile and desktop applications"; it accepts any port on loopback). Without it, the browser sign-in fails with `AADSTS500113` (no reply address registered);
   - `offline_access` granted, so the IdP issues a refresh token;
@@ -77,7 +77,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 
 ### 1.1 Gateway
 
-1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get: bound to the credential (the JWT's `defaults.config_slug` on a hybrid gateway or `defaults.config_id` on SaaS, or the API key), or as the workspace default (see What you need).
+1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get: bound to the credential (the JWT's `defaults.config_slug` on a hybrid gateway or `defaults.config_id` on SaaS, or the API key), or as the workspace default `defaults.user_api_key_config` (JWT requests only; see What you need).
 2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens.
 
 ### 1.2 Optional: answer token problems at the load balancer
@@ -345,6 +345,10 @@ Open questions and gaps, not tested here:
 
   Claude Code has no documented helper that supplies headers for model requests (as of 2.1.286). `apiKeyHelper` doesn't fit, since its value replaces the Anthropic login, and `proxyAuthHelper` doesn't reach the gateway (finding 11).
 - **Token lifetime guidance.** The broker default is 1 h, renewed 5 min before expiry. A shorter JWT narrows the window for a stolen token or an offboarded user, because a Mode A JWT can't be revoked before it expires. A longer one means fewer IdP and broker calls and fewer renewals at prompt time. There's no recommendation yet. Also untested: how renewals behave across sleep, and the gateway's clock-skew tolerance on `exp`.
+
+## Private (not published)
+
+- `aigw-config-selection`: which config the gateway applies (JWT claims, API key and workspace defaults) on SaaS and hybrid, tracked by release. Article under development.
 
 ## License
 
