@@ -13,6 +13,7 @@ What it compares (AGENTS.md says "keep these in step"; this makes it a check, no
   links      every relative Markdown link points at a file, and every #anchor at a heading that exists
   matrix     docs/support-matrix.md has a row for this client version and a review date that is not in the future
   evidence   docs/evidence/findings.md: records 1..N, each with claim, versions, environment, method, date, status and rerun
+  diagrams   docs/flow-*.svg are what tools/build_diagrams.py writes, are well-formed XML, and name no single IdP
   guard      the 498 text matches in the client, the mock gateway and the load balancer rules
   informational (never fails): the version ARTICLE.md says the evidence was gathered on
 
@@ -270,6 +271,32 @@ def evidence_problems(findings_text, cited_text=""):
     return out
 
 
+IDP_NAMES = ("Entra", "Okta", "Keycloak", "Azure")
+
+
+def diagram_problems(root):
+    """docs/flow-*.svg: they are what tools/build_diagrams.py writes, they parse as XML, and they name no single IdP (they are the same
+    for Okta, Entra ID and Keycloak)."""
+    import xml.etree.ElementTree as ET
+    out = []
+    builder = load_module("aigw_build_diagrams_gate", root / "tools" / "build_diagrams.py")
+    for rel in builder.stale(root):
+        out.append(f"{rel} is not what tools/build_diagrams.py writes: edit the builder and rerun it, not the SVG")
+    for rel in builder.build_all():
+        p = root / rel
+        if not p.exists():
+            continue
+        try:
+            ET.parse(p)
+        except ET.ParseError as e:
+            out.append(f"{rel} is not well-formed XML: {e}")
+        text = p.read_text(encoding="utf-8")
+        for name in IDP_NAMES:
+            if name in text:
+                out.append(f"{rel} names a single IdP ({name!r}); the diagrams must be the same for every IdP")
+    return out
+
+
 def guard_problems(root):
     name = "client.test_aigw_claude_auth.ProxyRefusalTests.test_the_498_text_matches_the_lb_guard_everywhere"
     result = unittest.TestResult()
@@ -322,6 +349,7 @@ def run_all(root=ROOT, only=None):
         "matrix": lambda: matrix_problems(client, matrix.read_text(encoding="utf-8") if matrix.exists() else None),
         "evidence": lambda: evidence_problems((root / "docs" / "evidence" / "findings.md").read_text(encoding="utf-8"),
                                               "\n".join(t for n, t in files.items() if not n.startswith("docs/evidence/"))),
+        "diagrams": lambda: diagram_problems(root),
         "guard": lambda: guard_problems(root),
     }
     results = {name: fn() for name, fn in checks.items() if only is None or name in only}

@@ -20,9 +20,15 @@ How it works today: [docs/architecture.md](docs/architecture.md). What has been 
 
 > **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
 
-![How it fits together: the client keeps a gateway JWT in Claude Code's settings; every request carries the user's Anthropic login and the JWT; the gateway checks the JWT and forwards the login to Anthropic](docs/flow.svg)
+**File mode.** The JWT sits in Claude Code's settings; an optional load balancer rule answers a missing JWT with a 498.
 
-Shown with Entra ID and a token broker, as tested: Entra ID can't add Portkey's claims to its tokens, so the broker exchanges the IdP token for a JWT that carries them (Mode A). If your IdP can add the claims itself (Mode A), or you use its standard token as it is (Mode B), there is no broker and the client puts the IdP's own token into the header. What "Mode A" and "Mode B" mean is under [What you need](#what-you-need).
+![File mode: the client keeps a gateway JWT in Claude Code's settings; every request carries the user's Anthropic login and the JWT; an optional load balancer rule answers a missing JWT with 498; the gateway checks the JWT and forwards the login to Anthropic](docs/flow-file-mode.svg)
+
+**Proxy mode.** Claude Code sends to a local proxy with a per-user secret; the proxy adds the JWT it keeps in memory and answers 498 itself.
+
+![Proxy mode: Claude Code sends to a local proxy with a per-user secret; the proxy adds the gateway JWT it keeps in memory, answers 498 itself when it has no JWT or the gateway refuses it, and forwards to the gateway, which checks the JWT and forwards the user's login to Anthropic](docs/flow-proxy-mode.svg)
+
+Both diagrams show an IdP and an optional token broker. The broker is needed only when the IdP can't add Portkey's claims to its tokens (Entra ID can't, and Okta can't nest `defaults`): it exchanges the IdP token for a JWT that carries them (Mode A). If your IdP can add the claims itself (Keycloak can), or you use its standard token as it is (Mode B), there is no broker and the client puts the IdP's own token into the header. What "Mode A" and "Mode B" mean is under [What you need](#what-you-need). Tested with Okta, Entra ID and Keycloak: see the [support matrix](docs/support-matrix.md).
 
 | Piece                                    | What it does                                                                                                                                     | Where                                                              |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |

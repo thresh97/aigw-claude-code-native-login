@@ -81,7 +81,7 @@ unit on Linux and a Task Scheduler task on Windows.
 | `repro/` | The reproducibility harness: fake IdP, mock gateway, scenarios, `WINDOWS.md` | Test kit |
 | `packaging/` | Fleet packages (macOS `.pkg`, `.deb`, `.rpm`, a Windows installer), the Linux systemd smoke test | Pilot / administrator preview: see the [fleet guide](fleet-deployment.md) |
 | `docs/` | This page, the support matrix, the evidence, the fleet guide, the historical design | Documentation |
-| `tools/` | The release gate | Maintainer tool |
+| `tools/` | The release gate, and the builder for the two flow diagrams in `docs/` | Maintainer tools |
 
 Two things that used to live here are separate, independently owned repositories with their own lifecycle: the Okta token inline hook
 ([idp-okta-webhook-custom-claims](https://github.com/thresh97/idp-okta-webhook-custom-claims)) and the Azure Windows test VM ([azure-win-vm-ssh](https://github.com/thresh97/azure-win-vm-ssh)).

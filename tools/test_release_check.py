@@ -171,5 +171,49 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(__import__("re").findall(r"(?m)^### Finding \d+$", text)), 22)
 
 
+class DiagramTests(unittest.TestCase):
+    def tree(self, d, mutate=None):
+        """A copy of the diagram sources and builder in d, with one SVG changed by `mutate` (a function on its text)."""
+        import shutil
+        (Path(d) / "tools").mkdir()
+        (Path(d) / "docs").mkdir()
+        shutil.copy(rc.ROOT / "tools" / "build_diagrams.py", Path(d) / "tools")
+        for name in ("flow-file-mode.svg", "flow-proxy-mode.svg"):
+            text = (rc.ROOT / "docs" / name).read_text(encoding="utf-8")
+            (Path(d) / "docs" / name).write_text(mutate(name, text) if mutate else text, encoding="utf-8")
+        return Path(d)
+
+    def test_the_committed_diagrams_are_what_the_builder_writes(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(rc.diagram_problems(self.tree(d)), [])
+
+    def test_a_hand_edited_svg_is_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            problems = rc.diagram_problems(self.tree(d, lambda n, t: t.replace("Local proxy", "Edited proxy") if "proxy" in n else t))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("flow-proxy-mode.svg", problems[0])
+
+    def test_naming_one_idp_is_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            problems = rc.diagram_problems(self.tree(d, lambda n, t: t.replace("Identity provider (IdP)", "Entra ID (IdP)") if "file" in n else t))
+        self.assertTrue(any("names a single IdP ('Entra')" in p for p in problems), problems)
+
+    def test_broken_xml_is_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            problems = rc.diagram_problems(self.tree(d, lambda n, t: t.replace("</svg>", "") if "file" in n else t))
+        self.assertTrue(any("not well-formed" in p for p in problems), problems)
+
+    def test_both_modes_share_the_idp_gateway_and_anthropic_boxes(self):
+        sys.path.insert(0, str(rc.ROOT / "tools"))
+        import build_diagrams as bd
+        f, p = bd.file_mode(), bd.proxy_mode()
+        for shared in ("Identity provider (IdP)", "Token broker (optional)", "Portkey AI Gateway", "Anthropic API", "TWO CREDENTIALS ON EVERY REQUEST"):
+            self.assertIn(shared, f)
+            self.assertIn(shared, p)
+        self.assertIn("ALB guard", f)
+        self.assertNotIn("ALB guard", p)
+        self.assertIn("Local proxy", p)
+
+
 if __name__ == "__main__":
     unittest.main()

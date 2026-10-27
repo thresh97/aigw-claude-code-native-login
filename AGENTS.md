@@ -78,6 +78,11 @@ Guidance for coding agents running or changing this repo. Read README.md first.
   - the sentinel and the 498 bodies: client `sentinel`, `gateway/alb-guard-ingress.yaml`, `GUARD_MESSAGES` in
     `repro/mock_gateway.py`, `SENTINEL` in `repro/env.example`;
   - hook entries: `hook_entry()` (used by `install` and `install --print`).
+  - diagrams: `docs/flow-file-mode.svg` and `docs/flow-proxy-mode.svg` are written by `tools/build_diagrams.py`, which holds the
+    parts both share (the IdP, the broker, the credentials callout, the gateway, Anthropic) once and each mode's own machine and data
+    path; its docstring has the conventions (canvas, color per role, arrow markers, step numbers). To change a box, a label or a color,
+    edit the builder, run it, and look at the result with `python3 tools/render_svg.py docs/flow-proxy-mode.svg` (macOS). Commit the
+    builder and the SVGs together; the gate fails if the SVGs are not what the builder writes. Name no single IdP in them.
 - Hooks must finish well inside Claude Code's 30 s hook timeout, or Claude Code ignores their decision. Anything
   that does network I/O in a hook uses `hook_http_timeout`. Anything that waits for the user (the precheck's sign-in)
   runs in a detached process whose stdout is not the hook's: Claude Code reads the hook's stdout until it closes.

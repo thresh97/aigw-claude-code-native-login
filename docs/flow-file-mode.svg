@@ -1,0 +1,178 @@
+<svg viewBox="0 0 1180 640" width="1180" height="640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#64748b" />
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#2563eb" />
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#d97706" />
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#7c3aed" />
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#16a34a" />
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#dc2626" />
+    </marker>
+  </defs>
+
+  <!-- Canvas frame -->
+  <rect x="5" y="5" width="1170" height="630" rx="16" ry="16" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5" />
+
+  <!-- ============================================================== -->
+  <!-- USER'S MACHINE (container)                                     -->
+  <!-- ============================================================== -->
+  <rect x="25" y="25" width="445" height="555" rx="12" ry="12" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4" />
+  <text x="45" y="48" font-size="12" font-weight="700" fill="#475569">USER'S MACHINE (macOS / Linux / Windows) · FILE MODE</text>
+
+  <!-- Client (yellow) -->
+  <rect x="60" y="62" width="390" height="148" rx="10" ry="10" fill="#fffbeb" stroke="#d97706" stroke-width="2" />
+  <text x="75" y="88" font-size="14" font-weight="700" fill="#92400e">aigw-claude-auth (one Python file)</text>
+  <text x="75" y="108" font-size="10" fill="#78350f">• daemon (launchd / systemd / Task Scheduler): renews the JWT before it expires</text>
+  <text x="75" y="125" font-size="10" fill="#78350f">• precheck hook: renews before the turn, or blocks it;</text>
+  <text x="85" y="140" font-size="10" fill="#78350f">signed out → starts a device code sign-in, code in the message</text>
+  <text x="75" y="157" font-size="10" fill="#78350f">• StopFailure hook: gateway refused the JWT → renew + notify</text>
+  <text x="75" y="174" font-size="10" fill="#78350f">• no usable JWT → writes the sentinel "expired" (guard: 498)</text>
+  <text x="75" y="194" font-size="10" font-weight="600" fill="#b45309">state.json: IdP refresh token only (mode 600)</text>
+
+  <!-- settings.json (white inner) -->
+  <rect x="60" y="262" width="390" height="92" rx="8" ry="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" />
+  <text x="75" y="285" font-size="12" font-weight="700" fill="#0f172a">Claude Code settings.json</text>
+  <text x="75" y="304" font-size="10" font-family="monospace" fill="#334155">ANTHROPIC_BASE_URL       = https://&lt;gateway&gt;</text>
+  <text x="75" y="320" font-size="10" font-family="monospace" fill="#7c3aed">ANTHROPIC_CUSTOM_HEADERS = x-portkey-api-key: &lt;JWT&gt;</text>
+  <text x="75" y="336" font-size="10" font-family="monospace" fill="#334155">hooks: UserPromptSubmit, StopFailure</text>
+
+  <!-- Claude Code (orange) -->
+  <rect x="60" y="406" width="390" height="150" rx="10" ry="10" fill="#fff7ed" stroke="#ea580c" stroke-width="2" />
+  <text x="75" y="432" font-size="14" font-weight="700" fill="#9a3412">Claude Code</text>
+  <text x="75" y="451" font-size="11" fill="#7c2d12">The user's own Anthropic login (/login), unchanged</text>
+  <text x="75" y="472" font-size="10" font-family="monospace" fill="#c2410c">Authorization: Bearer &lt;Anthropic login&gt;</text>
+  <text x="75" y="488" font-size="10" font-family="monospace" fill="#7c3aed">x-portkey-api-key: &lt;gateway JWT&gt;</text>
+  <text x="75" y="510" font-size="10" fill="#475569">• picks up a rewritten settings file about 1 s later</text>
+  <text x="75" y="526" font-size="10" fill="#475569">• a gateway 401 looks like its own expired login:</text>
+  <text x="85" y="541" font-size="10" fill="#475569">13 OAuth refresh-and-retry attempts over about 4 min</text>
+
+  <!-- Step 3: client writes JWT into settings.json -->
+  <line x1="255" y1="210" x2="255" y2="254" stroke="#d97706" stroke-width="1.8" marker-end="url(#arrow-amber)" />
+  <circle cx="277" cy="232" r="10" fill="#d97706" />
+  <text x="273.5" y="236" font-size="11" font-weight="700" fill="#ffffff">3</text>
+  <text x="295" y="236" font-size="10" font-weight="600" fill="#92400e">writes the JWT</text>
+
+  <!-- settings.json -> Claude Code -->
+  <line x1="255" y1="354" x2="255" y2="398" stroke="#64748b" stroke-width="1.8" marker-end="url(#arrow)" />
+  <text x="270" y="381" font-size="10" fill="#64748b">reads</text>
+
+  <!-- Claude Code runs the hooks (left rail, up) -->
+  <path d="M 60 480 L 42 480 L 42 136 L 52 136" fill="none" stroke="#d97706" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-amber)" />
+  <text x="37" y="330" font-size="10" font-weight="600" fill="#b45309" transform="rotate(-90 37 330)" text-anchor="middle">runs the hooks</text>
+
+  <!-- ============================================================== -->
+  <!-- IDENTITY: the IdP and the optional token broker (blue)         -->
+  <!-- ============================================================== -->
+  <rect x="540" y="45" width="250" height="120" rx="10" ry="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2" />
+  <text x="555" y="72" font-size="14" font-weight="700" fill="#1e40af">Identity provider (IdP)</text>
+  <text x="555" y="92" font-size="10" fill="#475569">Public client, no secret:</text>
+  <text x="555" y="108" font-size="10" fill="#475569">• browser sign-in (PKCE, http://127.0.0.1)</text>
+  <text x="555" y="124" font-size="10" fill="#475569">• device code (ssh, no display, the hook)</text>
+  <text x="555" y="145" font-size="10" font-weight="600" fill="#2563eb">Refresh token → access tokens</text>
+
+  <rect x="850" y="45" width="305" height="120" rx="10" ry="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2" />
+  <text x="865" y="72" font-size="14" font-weight="700" fill="#1e40af">Token broker (optional)</text>
+  <text x="865" y="92" font-size="10" fill="#475569">Adds Portkey's claims when the IdP can't (Mode A)</text>
+  <text x="865" y="108" font-size="10" fill="#475569">• IdP access token in, gateway JWT out (1 h)</text>
+  <text x="865" y="124" font-size="10" fill="#475569">• IdP groups → workspace and config</text>
+  <text x="865" y="145" font-size="10" font-weight="600" fill="#2563eb">Publishes /.well-known/jwks.json</text>
+
+  <!-- Step 1: client <-> IdP -->
+  <line x1="450" y1="85" x2="532" y2="85" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrow-blue)" />
+  <line x1="540" y1="120" x2="458" y2="120" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrow-blue)" />
+  <circle cx="495" cy="70" r="10" fill="#2563eb" />
+  <text x="491.5" y="74" font-size="11" font-weight="700" fill="#ffffff">1</text>
+  <text x="479" y="104" font-size="9" fill="#475569">sign in</text>
+  <text x="479" y="138" font-size="9" fill="#475569">tokens</text>
+
+  <!-- Step 2: client -> broker -->
+  <path d="M 450 190 L 1100 190 L 1100 173" fill="none" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrow-blue)" />
+  <circle cx="580" cy="190" r="10" fill="#2563eb" />
+  <text x="576.5" y="194" font-size="11" font-weight="700" fill="#ffffff">2</text>
+  <text x="598" y="208" font-size="10" font-weight="600" fill="#1e40af">POST /token/exchange (Bearer IdP token) → gateway JWT</text>
+
+  <!-- ============================================================== -->
+  <!-- REQUEST HEADERS CALLOUT (step 4)                               -->
+  <!-- ============================================================== -->
+  <rect x="540" y="232" width="380" height="150" rx="8" ry="8" fill="#f5f3ff" stroke="#ddd6fe" stroke-width="1.2" />
+  <circle cx="562" cy="256" r="11" fill="#7c3aed" />
+  <text x="558.5" y="260" font-size="11" font-weight="700" fill="#ffffff">4</text>
+  <text x="582" y="260" font-size="11" font-weight="700" fill="#6b21a8">TWO CREDENTIALS ON EVERY REQUEST</text>
+  <text x="560" y="284" font-size="10" fill="#334155"><tspan font-family="monospace" fill="#c2410c">Authorization</tspan>: the user's Anthropic login,</text>
+  <text x="572" y="299" font-size="10" fill="#334155">checked by Anthropic (their own seat)</text>
+  <text x="560" y="320" font-size="10" fill="#334155"><tspan font-family="monospace" fill="#7c3aed">x-portkey-api-key</tspan>: the gateway JWT,</text>
+  <text x="572" y="335" font-size="10" fill="#334155">checked by the gateway (who, which workspace)</text>
+  <text x="560" y="356" font-size="10" fill="#64748b">No Anthropic key at the gateway: the passthrough</text>
+  <text x="560" y="371" font-size="10" fill="#64748b">config forwards the user's own login</text>
+
+  <!-- ============================================================== -->
+  <!-- DATA PATH: ALB guard -> gateway -> Anthropic                   -->
+  <!-- ============================================================== -->
+  <!-- ALB guard (slate, dashed = optional) -->
+  <rect x="540" y="400" width="175" height="160" rx="10" ry="10" fill="#f1f5f9" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4" />
+  <text x="555" y="426" font-size="14" font-weight="700" fill="#334155">ALB guard</text>
+  <text x="555" y="443" font-size="10" font-weight="600" fill="#64748b">optional, hybrid only</text>
+  <text x="555" y="456" font-size="10" font-weight="600" fill="#64748b">file mode only</text>
+  <text x="555" y="476" font-size="10" fill="#475569">Sentinel, or no</text>
+  <text x="555" y="491" font-size="10" fill="#475569">x-portkey-api-key:</text>
+  <text x="555" y="506" font-size="10" font-weight="600" fill="#dc2626">498, before the gateway</text>
+  <text x="555" y="525" font-size="10" fill="#475569">Claude Code fails at</text>
+  <text x="555" y="540" font-size="10" fill="#475569">once, login untouched</text>
+
+  <!-- Gateway (purple) -->
+  <rect x="765" y="400" width="210" height="160" rx="10" ry="10" fill="#faf5ff" stroke="#7c3aed" stroke-width="2" />
+  <text x="780" y="426" font-size="14" font-weight="700" fill="#6b21a8">Portkey AI Gateway</text>
+  <text x="780" y="445" font-size="10" fill="#7c3aed">JWT auth (Mode A or B)</text>
+  <text x="780" y="466" font-size="10" fill="#334155">• verifies the JWT (JWKS)</text>
+  <text x="780" y="482" font-size="10" fill="#334155">• passthrough config from</text>
+  <text x="790" y="497" font-size="10" fill="#334155">JWT or workspace default</text>
+  <text x="780" y="513" font-size="10" fill="#334155">• forward_headers:</text>
+  <text x="790" y="528" font-size="10" font-family="monospace" fill="#334155">authorization,</text>
+  <text x="790" y="543" font-size="10" font-family="monospace" fill="#334155">anthropic-beta</text>
+
+  <!-- Anthropic (green) -->
+  <rect x="1015" y="420" width="140" height="120" rx="10" ry="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2" />
+  <text x="1030" y="447" font-size="14" font-weight="700" fill="#15803d">Anthropic API</text>
+  <text x="1030" y="468" font-size="10" fill="#166534">Checks the user's</text>
+  <text x="1030" y="483" font-size="10" fill="#166534">own login</text>
+  <text x="1030" y="504" font-size="10" fill="#166534">Its refusals come</text>
+  <text x="1030" y="519" font-size="10" fill="#166534">back as 401 with</text>
+  <text x="1030" y="534" font-size="10" font-family="monospace" fill="#166534">"provider"</text>
+
+  <!-- Step 4: Claude Code -> ALB guard -->
+  <line x1="450" y1="455" x2="532" y2="455" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)" />
+  <circle cx="491" cy="439" r="10" fill="#7c3aed" />
+  <text x="487.5" y="443" font-size="11" font-weight="700" fill="#ffffff">4</text>
+
+  <!-- 498 back to Claude Code -->
+  <line x1="540" y1="520" x2="458" y2="520" stroke="#dc2626" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#arrow-red)" />
+  <text x="478" y="512" font-size="10" font-weight="700" fill="#dc2626">498</text>
+
+  <!-- Step 5: ALB -> gateway -->
+  <line x1="715" y1="455" x2="757" y2="455" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)" />
+  <circle cx="738" cy="439" r="10" fill="#7c3aed" />
+  <text x="734.5" y="443" font-size="11" font-weight="700" fill="#ffffff">5</text>
+
+  <!-- Step 6: gateway -> Anthropic -->
+  <line x1="975" y1="455" x2="1007" y2="455" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)" />
+  <circle cx="993" cy="439" r="10" fill="#16a34a" />
+  <text x="989.5" y="443" font-size="11" font-weight="700" fill="#ffffff">6</text>
+
+  <!-- JWKS: gateway -> broker (dashed, out of band) -->
+  <line x1="950" y1="400" x2="950" y2="173" stroke="#64748b" stroke-width="1.8" stroke-dasharray="5 5" marker-end="url(#arrow)" />
+  <text x="958" y="372" font-size="9" font-weight="600" fill="#475569">JWKS (cached)</text>
+
+  <!-- Footer -->
+  <text x="25" y="605" font-size="10" fill="#475569"><tspan font-weight="700">Gateway refuses the JWT (401 "Portkey Error")</tspan>: Claude Code retries for minutes, then the StopFailure hook renews the JWT and notifies; resend the prompt.</text>
+  <text x="25" y="621" font-size="10" fill="#475569"><tspan font-weight="700">Anthropic refuses the login (401 "anthropic error", "provider")</tspan>: left to Claude Code (/login).</text>
+</svg>
