@@ -12,6 +12,7 @@ What it compares (AGENTS.md says "keep these in step"; this makes it a check, no
   fleet      the example fleet profile renders for every OS and its client config passes the client's own validation
   links      every relative Markdown link points at a file, and every #anchor at a heading that exists
   matrix     docs/support-matrix.md has a row for this client version and a review date that is not in the future
+  evidence   docs/evidence/findings.md: records 1..N, each with claim, versions, environment, method, date, status and rerun
   guard      the 498 text matches in the client, the mock gateway and the load balancer rules
   informational (never fails): the version ARTICLE.md says the evidence was gathered on
 
@@ -237,6 +238,38 @@ def matrix_problems(client, matrix_text, today=None):
     return out
 
 
+EVIDENCE_FIELDS = ("Claim", "Component and version", "Environment", "Method", "Date", "Status", "Rerun")
+
+
+def evidence_problems(findings_text, cited_text=""):
+    """docs/evidence/findings.md: numbered 1..N without gaps, every record has all of EVIDENCE_FIELDS, the date and status are
+    well formed; and no 'finding N' cited in `cited_text` (the README and the other docs) points past the last record."""
+    out = []
+    blocks = re.split(r"(?m)^### Finding (\d+)\s*$", findings_text)
+    numbers = [int(n) for n in blocks[1::2]]
+    if not numbers:
+        return ["docs/evidence/findings.md has no '### Finding N' records"]
+    if numbers != list(range(1, len(numbers) + 1)):
+        out.append(f"finding numbers must run 1..{len(numbers)} without gaps or repeats (got {numbers})")
+    for n, body in zip(numbers, blocks[2::2]):
+        for field in EVIDENCE_FIELDS:
+            m = re.search(rf"(?m)^- \*\*{re.escape(field)}:\*\*\s*(.+)$", body)
+            if not m or not m.group(1).strip():
+                out.append(f"finding {n}: no '{field}' field")
+        d = re.search(r"(?m)^- \*\*Date:\*\*\s*(.+)$", body)
+        if d and not re.match(r"^\d{4}-\d{2}-\d{2}( and \d{4}-\d{2}-\d{2})?$", d.group(1).strip()):
+            out.append(f"finding {n}: Date must be YYYY-MM-DD (got {d.group(1).strip()!r})")
+        s = re.search(r"(?m)^- \*\*Status:\*\*\s*(.+)$", body)
+        if s and not re.match(r"^(observed|reported|inferred)", s.group(1).strip()):
+            out.append(f"finding {n}: Status must start with observed, reported or inferred (got {s.group(1).strip()!r})")
+    last = len(numbers)
+    for m in re.finditer(r"\bfindings? (\d+)(?:\s*(?:,|and|to)\s*(\d+))*", cited_text):
+        for num in re.findall(r"\d+", m.group(0)):
+            if int(num) > last:
+                out.append(f"'{m.group(0)}' is cited but there is no finding {num} (the last is {last})")
+    return out
+
+
 def guard_problems(root):
     name = "client.test_aigw_claude_auth.ProxyRefusalTests.test_the_498_text_matches_the_lb_guard_everywhere"
     result = unittest.TestResult()
@@ -287,6 +320,8 @@ def run_all(root=ROOT, only=None):
         "fleet": lambda: fleet_problems(client, root, build),
         "links": lambda: link_problems(files),
         "matrix": lambda: matrix_problems(client, matrix.read_text(encoding="utf-8") if matrix.exists() else None),
+        "evidence": lambda: evidence_problems((root / "docs" / "evidence" / "findings.md").read_text(encoding="utf-8"),
+                                              "\n".join(t for n, t in files.items() if not n.startswith("docs/evidence/"))),
         "guard": lambda: guard_problems(root),
     }
     results = {name: fn() for name, fn in checks.items() if only is None or name in only}

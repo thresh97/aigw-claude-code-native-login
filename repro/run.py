@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run.py: re-run this article's tests. See the README's "Re-run" section. Python 3.8+, standard library only; the
+"""run.py: re-run this article's tests. See docs/evidence/rerun.md. Python 3.8+, standard library only; the
 cross-platform equivalent of run.sh (macOS, Linux, Windows: `py -3 repro\\run.py ...`).
 
   run.py list                 scenarios, what each changes, how long it takes
@@ -32,7 +32,7 @@ ROOT = HERE.parent
 CLIENT = ROOT / "client" / "aigw_claude_auth.py"
 IS_WIN = sys.platform == "win32"
 
-# ---------------------------------------------------------------- scenario text (expectations are the contract; see README Findings)
+# ---------------------------------------------------------------- scenario text (expectations are the contract; see docs/evidence/findings.md)
 DESCRIBE = {
     'unit':
         "unit: the client's offline tests (fake IdP and broker): settings edits, refresh, sentinel, device/PKCE sign-in, hooks, daemon. Changes: nothing. Under 1 min.",

@@ -142,5 +142,34 @@ class VersionAndMatrixTests(unittest.TestCase):
         self.assertEqual(len(rc.help_problems(argparse.ArgumentParser(prog="x"))), 5)
 
 
+class EvidenceTests(unittest.TestCase):
+    RECORD = ("### Finding {n}\n\n**T**\n\n- **Claim:** c\n- **Component and version:** v\n- **Environment:** e\n- **Method:** m\n"
+              "- **Date:** 2026-10-26\n- **Status:** observed\n- **Rerun:** r\n")
+
+    def doc(self, n=2):
+        return "# Findings\n\n" + "\n".join(self.RECORD.format(n=i) for i in range(1, n + 1))
+
+    def test_complete_records_pass(self):
+        self.assertEqual(rc.evidence_problems(self.doc(3), "see finding 2 and findings 1 to 3"), [])
+
+    def test_a_missing_field_a_bad_date_and_a_bad_status_are_caught(self):
+        text = self.doc(2).replace("- **Environment:** e\n", "", 1).replace("2026-10-26", "Oct 26", 1).replace("observed", "probably", 1)
+        problems = rc.evidence_problems(text)
+        self.assertEqual(len(problems), 3, problems)
+
+    def test_gaps_and_repeats_in_the_numbering_are_caught(self):
+        text = self.doc(3).replace("### Finding 2", "### Finding 5")
+        self.assertTrue(any("without gaps" in p for p in rc.evidence_problems(text)))
+
+    def test_citing_a_finding_that_does_not_exist_is_caught(self):
+        problems = rc.evidence_problems(self.doc(2), "as finding 7 shows")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("finding 7", problems[0])
+
+    def test_the_real_findings_have_all_22_records(self):
+        text = (rc.ROOT / "docs" / "evidence" / "findings.md").read_text(encoding="utf-8")
+        self.assertEqual(len(__import__("re").findall(r"(?m)^### Finding \d+$", text)), 22)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3453,7 +3453,7 @@ def take_over_personal(cfg, state, settings, run=None, platform=None):
 #   HKLM\SOFTWARE\Policies\ClaudeCode and HKCU\SOFTWARE\Policies\ClaudeCode, the source ranking (remote > MDM plist or
 #   HKLM > files > HKCU; the first source with a policy key wins unless managedSourcesBehavior is "merge"), and
 #   "a managed document that is not a JSON object stops Claude Code from starting".
-#   observed (repro `managed` scenario, README findings 11 and 15): a managed env ANTHROPIC_CUSTOM_HEADERS replaces the
+#   observed (repro `managed` scenario, docs/evidence findings 11 and 15): a managed env ANTHROPIC_CUSTOM_HEADERS replaces the
 #   user's value; allowManagedHooksOnly stops user hooks; unknown top-level keys are ignored; AIGW_* in managed env
 #   reach hooks and win over the user's env; drop-ins merge in name order.
 #   standard macOS, not from the docs: the plist file is /Library/Managed Preferences/com.anthropic.claudecode.plist
@@ -3728,10 +3728,10 @@ def chk_headers(ctx):
         if ctx["cfg"]["mode"] == "proxy":
             return [finding("managed-custom-headers", "Error",
                             f"managed settings ({ctx['managed_info']['source']}) define env.ANTHROPIC_CUSTOM_HEADERS; it replaces the user's value, so the per-user secret ({LOCAL_HEADER}) is not sent and the proxy refuses every request",
-                            "remove it from managed settings (README finding 11)")]
+                            "remove it from managed settings (docs/evidence finding 11)")]
         return [finding("managed-custom-headers", "Error",
                         f"managed settings ({ctx['managed_info']['source']}) define env.ANTHROPIC_CUSTOM_HEADERS; it replaces the user's value, so the JWT is not sent",
-                        "remove it from managed settings and keep the JWT in the user's settings.json (README finding 11)")]
+                        "remove it from managed settings and keep the JWT in the user's settings.json (docs/evidence finding 11)")]
 
 
 @check("hooks-only-missing")

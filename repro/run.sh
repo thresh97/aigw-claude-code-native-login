@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh: re-run this article's tests. See the README's "Re-run" section.
+# run.sh: re-run this article's tests. See docs/evidence/rerun.md.
 #   run.sh list                 scenarios, what each changes, how long it takes
 #   run.sh check                read-only preflight: tools, env, credentials, versions
 #   run.sh <scenario> [--yes]   one scenario; --yes is required for scenarios that change shared state

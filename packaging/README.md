@@ -1,5 +1,7 @@
 # Fleet packaging
 
+> This page is the implementation reference and the test record. The operator-facing guide, with the maturity label, the shortcomings and the supported OS and mode matrix, is [docs/fleet-deployment.md](../docs/fleet-deployment.md).
+
 Artifacts to roll aigw-claude-auth out to many machines: one fleet file in, a macOS `.pkg`, a Linux `.deb`/`.rpm` and a
 Windows PowerShell installer out. Nothing here is signed yet and nothing has run on a real fleet; the checks below are
 offline (see "What was tested"). The client stays one stdlib file, copied as is.

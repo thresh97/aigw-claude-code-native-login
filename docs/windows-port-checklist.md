@@ -10,7 +10,7 @@ on 2026-10-25. None of them has been tried on Windows yet. Line numbers are as o
 - `:673` `start_new_session`. Windows needs `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
 - `:588-589` `signal.SIGTERM` handler. Windows has only `SIGINT`/`SIGBREAK`.
 - `:723-733` notify: `osascript`/`notify-send`, with no toast path. Use PowerShell 5.1 WinRT with `-EncodedCommand`.
-- `:739` hook commands quoted with `shlex.quote`. S7 (README finding 17): this runs under Git Bash but not under Windows
+- `:739` hook commands quoted with `shlex.quote`. S7 ([finding 17](evidence/findings.md#finding-17)): this runs under Git Bash but not under Windows
   PowerShell 5.1, which Claude Code uses when Git for Windows is absent. Use a form that parses in both. Per the hooks docs
   (not run here): exec form (`"command": "<python.exe>", "args": [...]`) spawns the executable with no shell on any
   platform, which avoids quoting entirely; `command` must be a real `.exe`, not a `.cmd` shim. A per-hook

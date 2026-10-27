@@ -2,6 +2,13 @@
 
 Oct 25, 2026 · @Matt Harms
 
+> **Historical document: the v2 design and decision record, not the current specification.** It was written on 2026-10-25, when the client was
+> 1.1.1 (the "v1.1.1 baseline" below), and describes v2 as work to do. Much of that is built: native Windows (1.2.0), the OS credential
+> store, sign-in selection and `doctor` (1.3.0), the proxy (1.4.0), fleet packaging (1.4.x), and more since. Some details changed (for example
+> `proxy_listen` defaults to `127.0.0.1:18787`, not `127.0.0.1:0`). "Mode 1" and "Mode 2" here are this document's names for what the client
+> calls file mode and proxy mode; they are unrelated to Portkey's Mode A and Mode B. Read it for the reasoning and the open questions. For what is
+> true now, read [architecture.md](architecture.md), the [README](../README.md), the [support matrix](support-matrix.md) and the code.
+
 ## Summary and goals
 
 v2 extends the tested v1.1.1 client in [aigw-claude-code-native-login](https://github.com/thresh97/aigw-claude-code-native-login) from macOS and Linux with one delivery path to all three desktop platforms, four IdPs, and two delivery modes. The core idea is unchanged: Claude Code keeps sending the user's own Anthropic login in `Authorization: Bearer`, the gateway passes it through, and a short-lived IdP-minted JWT in a second header (default `x-portkey-api-key`) tells the gateway who the user is.
@@ -252,7 +259,7 @@ On the gateway config claim: the hybrid gateway reads `defaults.config_slug`, th
 | Provider | Issuer shape | Configure and test |
 | --- | --- | --- |
 | Entra ID (tested) | `https://login.microsoftonline.com/{tenant}/v2.0` | Public client; "Allow public client flows" for device code; platform "Mobile and desktop applications" with `http://127.0.0.1` (any port) for PKCE, else `AADSTS500113`; `offline_access`; broker scope such as `api://<broker app>/access_as_user`; cannot emit nested claims, so Mode A needs the broker. Refresh tokens rotate |
-| Okta (by hand, README finding 21) | `https://{org}/oauth2/{authServerId}` | Custom authorization server (org-server tokens can't be validated by third parties); Native app with device grant; exact redirect match, so set `redirect_port`. Claim expressions emit `portkey_oid` and `portkey_workspace` but can't nest: `defaults` needs a token inline hook ([Portkey: JWT authentication with Okta](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta#jwt-authentication-with-okta)) or the broker. Add `scopes` = `access.scope` (the gateway reads `scope`/`scopes`, Okta writes `scp`). Rotation has a grace period; a later replay revokes the whole chain |
+| Okta (by hand, [finding 21](evidence/findings.md#finding-21)) | `https://{org}/oauth2/{authServerId}` | Custom authorization server (org-server tokens can't be validated by third parties); Native app with device grant; exact redirect match, so set `redirect_port`. Claim expressions emit `portkey_oid` and `portkey_workspace` but can't nest: `defaults` needs a token inline hook ([Portkey: JWT authentication with Okta](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta#jwt-authentication-with-okta)) or the broker. Add `scopes` = `access.scope` (the gateway reads `scope`/`scopes`, Okta writes `scp`). Rotation has a grace period; a later replay revokes the whole chain |
 | Keycloak | `https://{host}/realms/{realm}` (older: `/auth` prefix) | Protocol mappers can emit nested claims; normal refresh tokens follow SSO idle timeout, `offline_access` gives an offline token; enable the device grant. Easiest to run in Docker for tests |
 | Ping | PingOne `https://auth.pingone.com/{envId}/as`; PingFederate `https://{host}:9031` | Endpoints and policies differ between the two; exact redirect match |
 
@@ -267,7 +274,7 @@ Fleets need users in different IdP groups to land in different gateway workspace
 | Claim | Shape | Notes |
 | --- | --- | --- |
 | `portkey_oid`, `portkey_workspace` | string | Required on AI Gateway Cloud |
-| `scope` / `scopes` | string or array | Okta writes `scp`; add `scopes` = `access.scope` (README finding 21) |
+| `scope` / `scopes` | string or array | Okta writes `scp`; add `scopes` = `access.scope` ([finding 21](evidence/findings.md#finding-21)) |
 | `defaults` | object: `config_id`, `metadata` | The hybrid gateway reads `defaults.config_slug` (README); the JWT reference lists only `config_id` |
 | `usage_limits` | array of objects: `id`, `type`, `credit_limit`, `status` | Top level, not in `defaults`. Counted against the user, not the token, so renewing the JWT doesn't reset a budget (the operator's statement; to confirm in the gateway test) |
 | `rate_limits` | undocumented | |
@@ -302,7 +309,7 @@ Fleets need users in different IdP groups to land in different gateway workspace
 
 **Open questions for Portkey**
 
-1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both? (Without `defaults`, the workspace's default config for user API keys applies: README finding 22.)
+1. Does the hybrid gateway read `defaults.config_id`, `defaults.config_slug` or both? (Without `defaults`, the workspace's default config for user API keys applies: [finding 22](evidence/findings.md#finding-22).)
 2. Is a scope such as `completions.write` required, and is it checked per route? (Not required on the hybrid gateway for `/v1/messages`: finding 22. SaaS and other routes not tested.)
 3. What shape does `rate_limits` take?
 
@@ -486,7 +493,7 @@ The tested fleet recipe from v1.1.1 is: hooks and `ANTHROPIC_BASE_URL` in Claude
 **Gateway side (once)**
 
 1. Create the passthrough config: it forwards the caller's `authorization` and `anthropic-beta` to Anthropic; its `api_key` is a placeholder. Bind it to the credential (JWT `defaults.config_slug` on hybrid, `config_id` on SaaS) or make it the workspace default.
-2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker. The JWKS URL is per org (one org per tenant service group) and takes a comma-separated list, so a broker and an IdP can be trusted side by side (with both listed, Okta's JWT is accepted: README finding 22; the broker's JWT not re-sent).
+2. Point the gateway's JWT validation (JWKS, issuer, audience) at the IdP or broker. The JWKS URL is per org (one org per tenant service group) and takes a comma-separated list, so a broker and an IdP can be trusted side by side (with both listed, Okta's JWT is accepted: [finding 22](evidence/findings.md#finding-22); the broker's JWT not re-sent).
 3. Optional, hybrid only, file mode: the LB guard (proxy mode answers 498 itself and needs none). On an L7 load balancer, answer the sentinel with 498 "expired", forward any other header value, answer a missing header on OAuth requests (`anthropic-beta` contains `oauth-2025-04-20`) with 498 "missing", forward the rest.
 
 **Client side**
@@ -551,11 +558,11 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S4 | Are unknown keys in managed settings stripped? Can `AIGW_*` keys ride in managed `env` safely? | Answered: unknown keys are ignored silently; `AIGW_*` in managed `env` reaches hooks and the Bash tool, managed wins per key; drop-ins merge in name order (finding 15) | `managed` scenario guards it |
 | S5 | Desktop app and Cowork: do they read user `settings.json` `env`, run hooks, honor `ANTHROPIC_BASE_URL`? Which config dir (a GUI app doesn't inherit `CLAUDE_CONFIG_DIR`)? Same OAuth loop on a 401? How is a block message shown? | Answered: the desktop app's Code sessions use `~/.claude`, apply settings `env` and run hooks, show a block reason as is, but keep `https://api.anthropic.com` whatever the user or project settings say (finding 16). Per the docs, desktop and Cowork route only through Claude Desktop on 3P, which replaces the claude.ai login with an organization credential (see Claude apps through the gateway). The 401 and 498 questions don't arise | By hand, mock gateway |
 | S6 | Do server-managed settings apply to users behind the gateway? | Open | Anthropic account team; pilot tenant |
-| S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Answered: hooks run under Git Bash when Git for Windows is installed and under Windows PowerShell 5.1 when it isn't, so hook commands must parse in both (`powershell -NoProfile -Command "& '...'"` or `py -3 "..."`; today's `shlex.quote` form fails under PowerShell). Claude Code doesn't hold `settings.json` open: no PermissionError in 60 replacements, pickup 1.3 to 1.8 s. A PowerShell 5.1 WinRT toast from a hook appears in about 1 s (README finding 17) | `winprobe`; then the Windows port of the offline scenarios |
+| S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Answered: hooks run under Git Bash when Git for Windows is installed and under Windows PowerShell 5.1 when it isn't, so hook commands must parse in both (`powershell -NoProfile -Command "& '...'"` or `py -3 "..."`; today's `shlex.quote` form fails under PowerShell). Claude Code doesn't hold `settings.json` open: no PermissionError in 60 replacements, pickup 1.3 to 1.8 s. A PowerShell 5.1 WinRT toast from a hook appears in about 1 s ([finding 17](evidence/findings.md#finding-17)) | `winprobe`; then the Windows port of the offline scenarios |
 | S8 | SaaS gateway: Mode A only, `config_id`, hooks-only behavior | Open (reported, untested) | Run `gateway` and `live_login` scenarios against SaaS |
 | S9 | Mode B (plain IdP token, hybrid only) | Open | `client_live` with an empty `broker_url` |
 | S10 | Okta, Keycloak and Ping profiles, including Mode A claims straight from the IdP | Open | `client_live` per IdP; Keycloak in Docker |
-| S11 | Mode 2 proxy: can Claude Code use a socket base URL? Does a proxy 498 behave like the LB's? | Answered: no socket base URL form works (`unix://`, `http+unix://`, `http://unix:...:/`); the undocumented `ANTHROPIC_UNIX_SOCKET` env var works from the process environment (not from `settings.json` `env`) but is meant for sessions with `CLAUDE_CODE_OAUTH_TOKEN`, so stay on loopback TCP. A proxy 498 behaves like the LB's: 1 attempt, shown at once, with an env-token login and with a stored login, which is left untouched (README findings 12 to 14) | `proxy`, `stored_login_proxy` |
+| S11 | Mode 2 proxy: can Claude Code use a socket base URL? Does a proxy 498 behave like the LB's? | Answered: no socket base URL form works (`unix://`, `http+unix://`, `http://unix:...:/`); the undocumented `ANTHROPIC_UNIX_SOCKET` env var works from the process environment (not from `settings.json` `env`) but is meant for sessions with `CLAUDE_CODE_OAUTH_TOKEN`, so stay on loopback TCP. A proxy 498 behaves like the LB's: 1 attempt, shown at once, with an env-token login and with a stored login, which is left untouched ([findings 12](evidence/findings.md#finding-12) to 14) | `proxy`, `stored_login_proxy` |
 | S12 | 403 and 407 with a stored login | Open | `stored_login` |
 | S13 | macOS live scenarios, `claude -p` while signed out, device code expiry | Open | Run by hand |
 
@@ -582,9 +589,9 @@ Phases are ordered, not dated; dates need an owner and staffing. The Windows por
 2. **Native Windows port.** Lock, process check without `os.kill`, detached worker, rename retry, toast, Task Scheduler entry, hook quoting, non-bash repro runner; tested against Entra ID.
    - Gate: all offline scenarios pass on Windows. **Passed 2026-10-26** (client 1.2.0, Windows 11 24H2, Claude Code 2.1.310, `repro/run.py`): `unit headers errors precheck stopfailure proxy` all PASS; the proxy's 7 Unix-socket checks are SKIP (no `AF_UNIX`). Hooks are written in exec form on Windows (finding 17).
 3. **Credential store, sign-in method selection, `doctor`, `inspect`.** Refresh token out of `state.json`; `login_method` precedence, remembered method, in-session PKCE and `--paste`, learned `device_unavailable`; managed-settings findings; full JWT interpretation.
-   - Gate: one passing `managed` case per `doctor` finding; sign-in matrix tests pass with the device grant disabled; no secrets in any output. **Passed 2026-10-26 with client 1.3.0, with one gap:** `managed` PASS (77 observations, 19 cases; README finding 19); the sign-in matrix and the FakeIdP runs with the device grant disabled pass on macOS and Windows; tests assert no token in `status`, `inspect` and `doctor` output. The gap: 8 findings have a `managed` case; the rest can't be set up through a managed file (for example an unparseable one stops Claude Code) and have unit tests only.
+   - Gate: one passing `managed` case per `doctor` finding; sign-in matrix tests pass with the device grant disabled; no secrets in any output. **Passed 2026-10-26 with client 1.3.0, with one gap:** `managed` PASS (77 observations, 19 cases; [finding 19](evidence/findings.md#finding-19)); the sign-in matrix and the FakeIdP runs with the device grant disabled pass on macOS and Windows; tests assert no token in `status`, `inspect` and `doctor` output. The gap: 8 findings have a `managed` case; the rest can't be set up through a managed file (for example an unparseable one stops Claude Code) and have unit tests only.
 4. **More IdP profiles.** Keycloak in Docker first (no tenant needed); Okta and Ping once dev tenants exist, including a fixed `redirect_port` and Mode A claims straight from the IdP; Mode B.
-   - Gate: `client_live` passes per IdP. **Keycloak done 2026-10-26** with the new `keycloak` scenario (local Keycloak 26.4.7, mock gateway, Mode A from the IdP and Mode B; README finding 18). Okta by hand on 2026-10-26 (README finding 21); its scenario is next. Ping waits for a dev tenant.
+   - Gate: `client_live` passes per IdP. **Keycloak done 2026-10-26** with the new `keycloak` scenario (local Keycloak 26.4.7, mock gateway, Mode A from the IdP and Mode B; [finding 18](evidence/findings.md#finding-18)). Okta by hand on 2026-10-26 ([finding 21](evidence/findings.md#finding-21)); its scenario is next. Ping waits for a dev tenant.
 5. **Mode 2 local proxy.** JWT in memory; gateway 401 translated to 498; Anthropic 401 passed through; SSE pass-through; fail closed.
    - Gate: a refused JWT through the proxy fails in one attempt with a stored login. **Built 2026-10-26 (client 1.4.0):** `mode: proxy` with `proxy_listen` `127.0.0.1:18787`, per-user secret header `x-aigw-local`, renew-and-retry once, 498 on gateway refusals, Anthropic 401 passed through, fail closed with an in-session sign-in, `inspect --live`, `doctor` proxy findings. Offline `proxy` scenario PASS on macOS (79) and Windows (72, 7 Unix-socket SKIP). **Gate passed 2026-10-26:** `stored_login_proxy` PASS (15 observations) with a stored login on macOS: a refused JWT and a missing JWT each fail in one attempt, the login is neither rotated nor invalidated.
 6. **Packaging and fleet pilot.** Signed packages, managed policy and background entries per OS, pilot users on each platform.
@@ -621,7 +628,7 @@ The repo's `repro/run.sh` is the regression suite: it runs the real Claude Code 
 | Mode 2 proxy | SSE and chunked pass-through; gateway 401 to 498 translation; Anthropic 401 passed through; renew-and-retry once; fail closed; concurrent requests; not reachable off loopback; `stored_login` with the proxy shows no OAuth loop | Mock gateway, then live |
 | Soak | Days of real use across sleep, network loss, clock change | Developer machines |
 
-**Rules carried over from `AGENTS.md`.** No tokens in logs or results (fingerprints only); new behavior needs a `FakeIdP` test; changing an expectation changes the README findings; the `managed` scenario is run by a person, never an agent.
+**Rules carried over from `AGENTS.md`.** No tokens in logs or results (fingerprints only); new behavior needs a `FakeIdP` test; changing an expectation changes the [the findings](evidence/findings.md); the `managed` scenario is run by a person, never an agent.
 
 **Exit criteria for v2**
 
@@ -661,7 +668,7 @@ Where the tested repo and the earlier chat draft disagreed, the repo wins unless
 
 ## Sources
 
-- [aigw-claude-code-native-login](https://github.com/thresh97/aigw-claude-code-native-login): README (findings 1 to 11, client reference, Not covered yet), `AGENTS.md`, `client/aigw_claude_auth.py` 1.1.1; commit `ca5ab19`, 2026-10-25.
+- [aigw-claude-code-native-login](https://github.com/thresh97/aigw-claude-code-native-login): README and [evidence](evidence/findings.md) (findings 1 to 11, client reference, Not covered yet), `AGENTS.md`, `client/aigw_claude_auth.py` 1.1.1; commit `ca5ab19`, 2026-10-25.
 - [Claude Code settings](https://code.claude.com/docs/en/settings) and [managed settings](https://code.claude.com/docs/en/managed-settings): managed file paths, MDM policy locations, precedence.
 - [Other LLM gateways → Subscriptions and gateways](https://code.claude.com/docs/en/llm-gateway#subscriptions-and-gateways): with only `ANTHROPIC_BASE_URL` set, the saved claude.ai login stays the active credential and its billing applies; the gateway must forward the OAuth capability in `anthropic-beta`.
 - [Connect Claude Code to an LLM gateway → Desktop app](https://code.claude.com/docs/en/llm-gateway-connect#desktop-app): the desktop app reads gateway routing from its third-party inference configuration, not from `ANTHROPIC_BASE_URL` or `settings.json`.

@@ -101,7 +101,7 @@ def rmtree(path):
 
 def command_hook(argv, **extra):
     """A hook entry for the command argv. Windows: exec form (command + args), which runs with no shell under both Git
-    Bash and PowerShell and passes the arguments verbatim (README finding 17). Elsewhere: one POSIX-quoted string."""
+    Bash and PowerShell and passes the arguments verbatim (docs/evidence/findings.md finding 17). Elsewhere: one POSIX-quoted string."""
     if IS_WIN:
         return {"type": "command", "command": argv[0], "args": list(argv[1:]), **extra}
     return {"type": "command", "command": " ".join(shlex.quote(a) for a in argv), **extra}
