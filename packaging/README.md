@@ -1,4 +1,4 @@
-# Fleet packaging (client 1.4.0)
+# Fleet packaging
 
 Artifacts to roll aigw-claude-auth out to many machines: one fleet file in, a macOS `.pkg`, a Linux `.deb`/`.rpm` and a
 Windows PowerShell installer out. Nothing here is signed yet and nothing has run on a real fleet; the checks below are

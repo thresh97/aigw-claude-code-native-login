@@ -4105,7 +4105,8 @@ https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt
 """
 
 
-def main(argv=None):
+def build_parser():
+    """The command line, on its own so that tools (the release gate) can read the commands and flags."""
     ap = argparse.ArgumentParser(prog="aigw-claude-auth", description=__doc__.split("\n\n")[0], epilog=HELP_EPILOG,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, help="config file (default: <config dir>/config.json)")
@@ -4159,6 +4160,11 @@ def main(argv=None):
     p = sub.add_parser("task", help="Windows: install or remove the Task Scheduler task that runs the daemon at log on")
     p.add_argument("action", choices=["install", "remove", "print"], help="print shows the task definition (XML) and registers nothing")
     p.add_argument("--name", default=TASK_NAME, help="task name (default: %(default)s)")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
     a = ap.parse_args(argv)
 
     cdir = a.state_dir or config_dir()

@@ -65,9 +65,16 @@ Guidance for coding agents running or changing this repo. Read README.md first.
 - Run `python3 -m unittest -v client/test_aigw_claude_auth.py` (about a minute, the `unit` scenario). New behavior needs a
   test against the `FakeIdP` there. Tests set `secret_store: file`; real credential-store tests use only a throwaway
   keychain file (macOS) or `aigw-claude-auth-test-*` credentials (Windows), removed afterwards.
-- Keep these in step:
-  - config keys: `DEFAULTS` in the client, `client/config.example.json`, the README's config table;
-  - commands and flags: the client's argparse, the README's client reference;
+- Keep these in step. `python3 tools/release_check.py` checks them (run it after touching any of them and before a release;
+  `python3 -m unittest tools/test_release_check.py` tests the gate itself, and a test there fails if the repository does not pass it):
+  - config keys: `DEFAULTS` and `SCHEMA` in the client (a key needs an entry in both, saying what it may hold), the README's config
+    table, `client/config.example.json` and `client/config.proxy.example.json`;
+  - commands and flags: the client's argparse (`build_parser()`), the README's client reference, `--help`;
+  - the version: `VERSION` in the client is the only place; the fleet packages read it from there, so no reader-facing header
+    states one. `docs/support-matrix.md` needs a row for the current `major.minor.x` and a `Last reviewed` date; add one when you
+    bump, after you have rerun what the bump touched. Results in the README's findings keep the version they were run on;
+  - the fleet: `packaging/fleet.example.json` must render for every OS and pass the client's own validation;
+  - links: every relative Markdown link and `#anchor` must resolve (renaming a heading breaks them; the gate says which);
   - the sentinel and the 498 bodies: client `sentinel`, `gateway/alb-guard-ingress.yaml`, `GUARD_MESSAGES` in
     `repro/mock_gateway.py`, `SENTINEL` in `repro/env.example`;
   - hook entries: `hook_entry()` (used by `install` and `install --print`).
