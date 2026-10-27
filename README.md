@@ -21,7 +21,7 @@ Shown with Entra ID and a token broker, as tested: Entra ID can't add Portkey's 
 | `aigw-claude-auth`                       | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings                                     | [client/aigw_claude_auth.py](client/aigw_claude_auth.py)           |
 | Precheck hook (UserPromptSubmit)         | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message                    | `aigw-claude-auth hook precheck`                                   |
 | StopFailure hook                         | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works                                            | `aigw-claude-auth hook stop-failure`                               |
-| LB guard (optional, hybrid gateway only) | Answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once                                                           | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml)   |
+| LB guard (optional, file mode, hybrid gateway only) | File mode: answers "no usable JWT" with 498 at the load balancer, which Claude Code shows at once. Proxy mode does this itself                                                           | [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml)   |
 
 ## Without a JWT: gateway API keys
 
@@ -54,7 +54,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
    - If no JWT can be had, it **blocks the prompt**. Nothing reaches the gateway, so there is no 401 and no OAuth loop.
    - When the reason is that the user is signed out, the hook also starts a device code sign-in in the background, and the block message says what to do: "AI gateway sign-in needed: open <the IdP's device page> and enter the code ABCD-EFGH (within 15 min), then send your prompt again." Once the user has signed in, in any browser on any device, a background process stores the refresh token, writes a JWT and sends a notification. The resent prompt goes through. A prompt sent too early gets the same code again. So nobody has to leave the session for a terminal, and it works over ssh as well as on a desktop.
    - For other failures (IdP unreachable, broker refusing) the message is the error, e.g. "AI gateway: cannot reach ...".
-3. **The sentinel.** When the client can't get a JWT and the current one is unusable, it writes `x-portkey-api-key: expired` instead of an old or empty value. With the optional LB guard, that request gets a 498 at once, also on machines where the hooks are off.
+3. **The sentinel (file mode).** When the client can't get a JWT and the current one is unusable, it writes `x-portkey-api-key: expired` instead of an old or empty value. With the optional LB guard (also file mode), that request gets a 498 at once, also on machines where the hooks are off. In proxy mode there is no sentinel: the local proxy holds the JWT and answers 498 itself when it has none.
 4. **The StopFailure hook** handles the rest: the gateway refused a JWT that still looked valid (revoked, or the signing key rotated). By then Claude Code has already failed the turn, so the hook renews the JWT and tells the user to retry.
 
 ## What you need
@@ -67,9 +67,11 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
   - or make it the workspace default. That's simpler, but then everyone in the workspace who doesn't name a config gets that one.
 
   In the JWT, the hybrid gateway reads `defaults.config_slug` and ignores `defaults.config_id`; the SaaS gateway reads `defaults.config_id` (reported 2026-10-24, SaaS not tested here). The broker `aigw-entra-jwt-broker` sends both, with `config_id` falling back to the slug. The config's `api_key` is a placeholder. `forward_headers` sends the caller's `authorization` and `anthropic-beta` to Anthropic, so Anthropic sees the user's own login.
-- **An IdP public client** (no secret) for the client to sign in with:
-  - device code flow allowed (Entra: "Allow public client flows"), and/or the loopback redirect URI `http://127.0.0.1` for the browser flow (Entra: platform "Mobile and desktop applications"; it accepts any port on loopback). Without it, the browser sign-in fails with `AADSTS500113` (no reply address registered);
-  - `offline_access` granted, so the IdP issues a refresh token;
+- **An IdP public client** (no secret) for the client to sign in with. There are two ways to sign in, and the app has to allow the one your users' machines can use:
+  - **Authorization code with PKCE**, in a browser on the same machine. The client opens the IdP's sign-in page and receives the answer on a loopback address, `http://127.0.0.1:<port>/`. Use it on a desktop or laptop with a browser: macOS, Windows, a Linux desktop. The app needs that redirect URI registered (Entra: platform "Mobile and desktop applications" with `http://127.0.0.1`, which accepts any port; Okta and others match the exact URI and port, so also set `redirect_port`). Without it, Entra's sign-in fails with `AADSTS500113` (no reply address registered). It does not suit a headless host, an ssh session or a container: the browser is somewhere else and the loopback port can't be reached. `login --pkce-print` with an `ssh -L` forward, or `login --paste`, can work around that;
+  - **Device authorization grant** (device code). The client prints a URL and a short code, and the user signs in on any device that has a browser, so the machine running the client needs none. Use it on headless machines, ssh sessions, containers and CLI-only environments. It needs no redirect URI, but the app must allow the grant (Entra: "Allow public client flows"; Okta: the Device Authorization grant type). Some IdPs or policies refuse it; then fall back to PKCE;
+  - **Which one is used:** the client decides by itself. It tries PKCE where it can reach a browser on this machine, the device code over ssh, in a container or with no display, and it remembers what worked last. `login --device`, `--pkce`, `--pkce-print` and `--paste` force a method. [Sign-in method](#sign-in-method) has the exact order;
+  - either way, `offline_access` granted, so the IdP issues a refresh token;
   - with a broker, permission for its API scope (Entra: `api://<broker app>/access_as_user`).
 - **Okta specifics** (finding 21; Portkey's setup: [JWT authentication with Okta](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta#jwt-authentication-with-okta)):
   - a custom authorization server (`https://<org>.okta.com/oauth2/default` or your own); the gateway's JWKS URL is `<issuer>/v1/keys` and must start with the token's `iss`;
@@ -79,7 +81,7 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
   - `defaults` only through a token inline hook or a broker; check the token with `aigw-claude-auth inspect`. For mapping Okta groups to workspaces, defaults and limits, see the design's [Mapping IdP groups to gateway workspaces](docs/design-v2.md#mapping-idp-groups-to-gateway-workspaces-mode-a): the broker is the recommended route; the Okta-native route uses the reference hook in [gateway/okta-token-hook/](gateway/okta-token-hook/) (offline tests only so far). Put every Mode A claim in the hook: it fails open.
 - **Users with an Anthropic login** in Claude Code (`claude`, then `/login`).
 - **Python 3.8+** on the users' machines: macOS, Linux or native Windows (`py -3` from python.org). No packages.
-- **Optional, for the LB guard:** an AWS ALB in front of a hybrid gateway. Any L7 load balancer that can match headers and return a fixed response works the same way. With the SaaS gateway there's no load balancer of yours in front of it, and an L4/TLS passthrough load balancer can't match headers; in both cases rely on the hooks alone (a refused or missing JWT is then the gateway's 401).
+- **Optional, for the LB guard (file mode only):** an AWS ALB in front of a hybrid gateway. Any L7 load balancer that can match headers and return a fixed response works the same way. With the SaaS gateway there's no load balancer of yours in front of it, and an L4/TLS passthrough load balancer can't match headers; in both cases rely on the hooks alone (a refused or missing JWT is then the gateway's 401).
 
 ## 1. Build
 
@@ -88,7 +90,11 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 1. Create the passthrough config from [gateway/passthrough-config.json](gateway/passthrough-config.json) in the users' workspace, and make it the config their requests get: bound to the credential (the JWT's `defaults.config_slug` on a hybrid gateway or `defaults.config_id` on SaaS, or the API key), or as the workspace default (see What you need).
 2. Check that the gateway's JWT validation (JWKS URL, issuer, audience) accepts your IdP's or broker's tokens. The JWKS URL setting is per org and takes a comma-separated list, so one gateway can trust a broker and an IdP at once (operator's statement; with both listed, Okta's JWT is accepted, finding 22). Without `defaults` in the JWT, set the passthrough as the workspace's default config ("default config for user API keys"); a per-request `x-portkey-config` is refused when the org blocks inline config (finding 22).
 
-### 1.2 Optional: answer token problems at the load balancer
+### 1.2 Optional, file mode: answer token problems at the load balancer
+
+This is extra configuration for **file mode**. There Claude Code itself sends the JWT, or the sentinel `expired` when none can be had, so a load balancer in front of the gateway can recognize "no usable JWT" and answer with a 498 that Claude Code shows at once.
+
+**Proxy mode doesn't need it.** The local proxy adds the JWT to every request, writes no sentinel, answers 498 itself when it has no JWT (and sends nothing upstream), and also turns a gateway 401 into a 498 after one renew-and-retry, which a load balancer cannot do. A proxy-mode client never sends the sentinel or a request without the header, so rules 1 and 3 below never match its traffic: the guard is inert for it and rule 2 forwards its requests. That comes from reading the rules and the proxy's behavior (finding 13), not from a run of the two together. If one gateway serves both kinds of client, the guard still protects the file-mode ones.
 
 [gateway/alb-guard-ingress.yaml](gateway/alb-guard-ingress.yaml) has the rules as AWS Load Balancer Controller annotations. They are evaluated in this order:
 
@@ -303,7 +309,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `broker_url` | | Full exchange URL. A broker turns an IdP token that can't carry Portkey's claims (Entra ID, for one) into a JWT that does (Mode A). The IdP token is sent as `Authorization: Bearer`, and the response's `token` (or `access_token`) is the gateway JWT. Empty: the IdP token itself is the JWT: Mode A if your IdP adds Portkey's claims itself, Mode B if it is a standard token the gateway handles with its own settings |
 | `token_command` | | Instead of an IdP: a command that prints a JWT, for example a corporate token tool. `login` doesn't apply then |
 | `header` | `x-portkey-api-key` | The header the gateway reads the JWT from |
-| `sentinel` | `expired` | Written when no usable JWT can be had. Must match the LB rule, and can't be empty |
+| `sentinel` | `expired` | File mode: written when no usable JWT can be had. Must match the LB rule, and can't be empty. Proxy mode writes none |
 | `refresh_before` | `300` | Renew when fewer seconds than this are left |
 | `hook_wait` | `3` | Seconds the precheck hook waits after a write, so the request carries the new value |
 | `block_on_failure` | `true` | When there's no usable JWT, the precheck blocks the prompt. With `false` the prompt goes out with the sentinel, for setups that rely on the LB guard (never with the SaaS gateway, where the sentinel gets a 401 and the OAuth loop) |

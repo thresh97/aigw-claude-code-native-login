@@ -2,6 +2,9 @@
 # so Claude Code with a native login shows the message at once instead of treating the gateway's 401 as its own
 # OAuth failure (about 3 minutes of refresh and retry).
 #
+# File mode only. A proxy-mode client (mode: proxy) never sends the sentinel or a request without the header: the local proxy
+# injects the JWT, or answers 498 itself when it has none. Rules 1 and 3 never match its traffic, so this guard is inert for it.
+#
 # Rules are evaluated in path order:
 #   1. x-portkey-api-key == "expired" (the client's sentinel)                  -> 498 "expired"
 #   2. x-portkey-api-key present (any value, also empty)                         -> forward to the gateway
