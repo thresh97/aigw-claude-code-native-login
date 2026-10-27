@@ -673,10 +673,10 @@ class MethodSelectionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, True)
         f = d / "c.json"
         for k, v in (("login_method", "pigeon"), ("hook_login", "pkce")):
-            f.write_text(json.dumps({"client_id": "x", k: v}))
+            f.write_text(json.dumps({"client_id": "x", "issuer": "https://idp.example", k: v}))
             with self.assertRaises(A.AuthError):
                 A.load_config(f)
-        f.write_text(json.dumps({"client_id": "x", "login_method": "pkce-paste", "hook_login": "auto"}))
+        f.write_text(json.dumps({"client_id": "x", "issuer": "https://idp.example", "login_method": "pkce-paste", "hook_login": "auto"}))
         self.assertEqual(A.load_config(f)["login_method"], "pkce-paste")
 
     def test_hook_login_env_override(self):
@@ -2551,6 +2551,109 @@ class ProxyControlTests(ProxyBase):
         self.assertEqual(self.ps.holder.token, "")
         self.assertFalse(self.settings_path.exists())
         self.assertNotIn("refresh_token", A.State(self.state_dir).load())
+
+
+class ConfigSchemaTests(Base):
+    """config.json is checked against one schema when it is loaded, and every problem is reported, not only the first."""
+
+    def load(self, **over):
+        cfg = {"client_id": "x", "issuer": "https://idp.example/v2.0"}
+        cfg.update(over)
+        p = self.tmp / "schema.json"
+        p.write_text(json.dumps(cfg))
+        return A.load_config(p)
+
+    def problems(self, **over):
+        with self.assertRaises(A.ConfigError) as cm:
+            self.load(**over)
+        return cm.exception.problems
+
+    def keys(self, **over):
+        return [k for k, _ in self.problems(**over)]
+
+    def test_every_config_key_has_a_schema_entry_and_the_defaults_pass_it(self):
+        self.assertEqual(set(A.SCHEMA), set(A.DEFAULTS))
+        self.assertEqual(A.config_problems(dict(A.DEFAULTS, client_id="x", issuer="https://idp.example")), [])
+
+    def test_a_wrong_json_type_is_named_at_load_time(self):
+        for key, bad in (("refresh_before", "300"), ("refresh_before", True), ("hook_wait", None), ("block_on_failure", "yes"),
+                         ("redirect_port", 1.5), ("proxy_log_requests", "5"), ("issuer", 5), ("scope", ["a"]), ("header", 5),
+                         ("fleet", 1), ("debug_until", "soon"), ("http_timeout", [30])):
+            with self.subTest(key=key, bad=bad):
+                found = dict(self.problems(**{key: bad}))
+                self.assertIn(key, found)
+                self.assertIn(key, found[key])
+
+    def test_ranges(self):
+        for key, bad in (("refresh_before", -1), ("refresh_before", 90000), ("hook_http_timeout", 0), ("hook_http_timeout", 26),
+                         ("redirect_port", 70000), ("redirect_port", -1), ("http_timeout", 0), ("proxy_max_body_mb", 0)):
+            with self.subTest(key=key, bad=bad):
+                self.assertIn(key, self.keys(**{key: bad}))
+        self.assertEqual(self.load(hook_wait=0.5, refresh_before=60.5)["hook_wait"], 0.5)           # seconds may be fractions
+
+    def test_urls_need_a_scheme_and_a_host(self):
+        for key in ("issuer", "broker_url", "gateway_url", "token_endpoint"):
+            for bad in ("idp.example", "ftp://idp.example", "https://", "http:///path"):
+                with self.subTest(key=key, bad=bad):
+                    self.assertIn(key, self.keys(**{key: bad}))
+        self.assertEqual(self.load(gateway_url="http://127.0.0.1:1234")["gateway_url"], "http://127.0.0.1:1234")
+
+    def test_header_name_grammar_and_the_sentinel(self):
+        for bad in ("x portkey", "x:portkey", "", "x-\u00e9"):
+            self.assertIn("header", self.keys(header=bad))
+        self.assertEqual(self.load(header="X-Portkey-Api-Key")["header"], "X-Portkey-Api-Key")
+        for bad in ("", " expired", "expired ", "ex\npired", "ex\x7fpired"):
+            self.assertIn("sentinel", self.keys(sentinel=bad))
+
+    def test_redirect_uri_must_be_a_loopback_http_address_that_matches_the_port_setting(self):
+        for bad in ("https://127.0.0.1:{port}/", "http://example.com:{port}/", "http://127.0.0.1:{port}/{other}", "http://127.0.0.1:{"):
+            with self.subTest(bad=bad):
+                self.assertIn("redirect_uri", self.keys(redirect_uri=bad))
+        self.assertIn("redirect_uri", self.keys(redirect_uri="http://127.0.0.1/callback"))            # a fixed URI with a random port
+        self.assertEqual(self.load(redirect_uri="http://127.0.0.1:8765/callback", redirect_port=8765)["redirect_port"], 8765)
+        self.assertEqual(self.load(redirect_uri="http://127.0.0.1:{port}/callback", redirect_port=8765)["redirect_port"], 8765)
+
+    def test_a_client_id_needs_somewhere_to_sign_in(self):
+        self.assertIn("issuer", self.keys(issuer=""))
+        self.assertEqual(self.load(issuer="", token_endpoint="https://idp.example/token")["token_endpoint"], "https://idp.example/token")
+        self.assertEqual(self.load(client_id="", issuer="", token_command="echo x")["token_command"], "echo x")
+        self.assertIn("client_id", self.keys(client_id="", issuer=""))
+
+    def test_every_problem_is_reported_together(self):
+        with self.assertRaises(A.ConfigError) as cm:
+            self.load(refresh_before="soon", header="x y", mode="both", gateway_url="gw")
+        self.assertEqual(sorted(k for k, _ in cm.exception.problems), ["gateway_url", "header", "mode", "refresh_before"])
+        msg = str(cm.exception)
+        self.assertIn("4 problems", msg)
+        for key in ("refresh_before", "header", "mode", "gateway_url"):
+            self.assertIn(key, msg)
+        self.assertNotIn("problems", str(self.problems(mode="both")[0][1]))                       # a single problem is just its message
+
+    def test_an_unknown_key_gets_a_suggestion(self):
+        with self.assertRaises(A.ConfigError) as cm:
+            self.load(proxy_listn="127.0.0.1:1", gateway_ur="https://gw.example")
+        self.assertIn("proxy_listn (did you mean proxy_listen?)", str(cm.exception))
+        self.assertIn("gateway_ur (did you mean gateway_url?)", str(cm.exception))
+
+    def test_doctor_reports_the_same_problems(self):
+        self.config_path.write_text(json.dumps({"client_id": "x", "issuer": "https://idp.example", "refresh_before": "soon", "header": "x y"}))
+        code, out, _ = self.run_cli("doctor", "--json")
+        found = {f["id"]: f for f in json.loads(out)["findings"]}
+        self.assertEqual(code, 1)
+        self.assertEqual(found["config-invalid"]["severity"], "Error")
+        for key in ("refresh_before", "header"):
+            self.assertIn(key, found["config-invalid"]["message"])
+
+    def test_the_example_configs_pass_once_their_placeholders_are_filled_in(self):
+        fill = {"issuer": "https://idp.example/v2.0", "client_id": "cid", "scope": "openid offline_access api://broker/access_as_user",
+                "broker_url": "https://broker.example/token/exchange", "gateway_url": "https://gw.example.com"}
+        for name in ("config.example.json", "config.proxy.example.json"):
+            with self.subTest(name=name):
+                ex = json.loads((Path(A.__file__).resolve().parent / name).read_text())
+                filled = {k: (fill[k] if isinstance(v, str) and "<" in v else v) for k, v in ex.items()}
+                (self.tmp / "ex.json").write_text(json.dumps(filled))
+                self.assertEqual(A.config_problems(dict(A.DEFAULTS, **filled)), [])
+                A.load_config(self.tmp / "ex.json")
 
 
 class MaskingTests(unittest.TestCase):

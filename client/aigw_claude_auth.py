@@ -43,6 +43,7 @@ Windows process check, a PowerShell toast and a Task Scheduler task on Windows).
 import argparse
 import base64
 import collections
+import difflib
 import hashlib
 import hmac
 import http.client
@@ -149,8 +150,116 @@ def default_settings_path():
     return Path(base) / "settings.json"
 
 
+# the sign-in methods `login` knows (config login_method, the login flags, AIGW_LOGIN_METHOD)
+LOGIN_METHODS = ("pkce", "pkce-print", "pkce-paste", "device")
+
+
+class ConfigError(AuthError):
+    """config.json fails validation. `problems` lists every one, as (key, message), not only the first."""
+
+    def __init__(self, path, problems):
+        self.problems = problems
+        super().__init__(problems[0][1] if len(problems) == 1
+                         else f"{len(problems)} problems in {path}:\n" + "\n".join(f"  - {m}" for _, m in problems))
+
+
+# What each config key may hold. One table, so a new key cannot be added without saying what it is (a test checks that it has an
+# entry), and so a wrong JSON type is a clear message at load time instead of a TypeError later in a daemon or a hook.
+#   str / url / choice / header / sentinel / bool / int (whole number, min, max) / number (int or float, min, max)
+SCHEMA = {
+    "issuer": ("url",), "token_endpoint": ("url",), "device_authorization_endpoint": ("url",), "authorization_endpoint": ("url",),
+    "broker_url": ("url",), "gateway_url": ("url",),
+    "client_id": ("str",), "scope": ("str",), "token_command": ("str",), "redirect_uri": ("str",), "notify": ("str",), "proxy_listen": ("str",),
+    "idp_token": ("choice", ("access_token", "id_token")), "hook_login": ("choice", ("auto", "device", "off")),
+    "login_method": ("choice", ("auto",) + LOGIN_METHODS), "secret_store": ("choice", ("auto", "file")), "mode": ("choice", ("file", "proxy")),
+    "header": ("header",), "sentinel": ("sentinel",),
+    "refresh_before": ("number", 0, 86400), "hook_wait": ("number", 0, 25), "device_unavailable_ttl": ("number", 0, 31536000),
+    "http_timeout": ("number", 1, 600), "hook_http_timeout": ("number", 1, 25), "debug_until": ("number", 0, None),
+    "redirect_port": ("int", 0, 65535), "proxy_log_requests": ("int", 0, 10000), "proxy_max_body_mb": ("int", 1, 1024),
+    "block_on_failure": ("bool",), "fleet": ("bool",),
+}
+HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")           # an HTTP field name (RFC 9110 token)
+
+
+def _kind(v):
+    return "a boolean" if isinstance(v, bool) else "a string" if isinstance(v, str) else "a number" if isinstance(v, (int, float)) \
+        else "null" if v is None else "a list" if isinstance(v, list) else "an object" if isinstance(v, dict) else type(v).__name__
+
+
+def config_problems(cfg, unknown=(), path="config.json"):
+    """Every way `cfg` (the defaults with the user's file on top) fails SCHEMA and the cross-field rules: [(key, message)]."""
+    out = []
+    if unknown:
+        hints = []
+        for k in sorted(unknown):
+            near = difflib.get_close_matches(k, list(DEFAULTS), n=1)
+            hints.append(k + (f" (did you mean {near[0]}?)" if near else ""))
+        out.append(("", f"unknown keys in {path}: {', '.join(hints)}"))
+    typed = set()                                                       # keys whose value has the right shape; the rest are not checked further
+    for key, spec in SCHEMA.items():
+        v, kind = cfg.get(key), spec[0]
+        if kind in ("str", "url", "choice", "header", "sentinel"):
+            if not isinstance(v, str):
+                out.append((key, f"{key} must be a string (got {_kind(v)})"))
+                continue
+        if kind == "choice" and v not in spec[1]:
+            out.append((key, f"{key} must be " + (" or ".join(spec[1]) if len(spec[1]) == 2 else ", ".join(spec[1][:-1]) + " or " + spec[1][-1])))
+            continue
+        if kind == "url" and v:
+            u = urllib.parse.urlsplit(v)
+            if u.scheme not in ("http", "https") or not u.netloc:
+                out.append((key, f"{key} must be an http:// or https:// URL with a host (got {v!r})"))
+                continue
+        if kind == "header" and not HEADER_NAME.match(v):
+            out.append((key, f"header must be an HTTP header name: letters, digits and !#$%&'*+-.^_`|~ (got {v!r})"))
+            continue
+        if kind == "sentinel":
+            if not v:
+                out.append((key, "sentinel must not be empty (an empty header can't be told apart from a missing one)"))
+                continue
+            if v != v.strip() or any(ord(c) < 32 or ord(c) == 127 for c in v):
+                out.append((key, "sentinel must not have control characters or leading or trailing spaces: it becomes a header value"))
+                continue
+        if kind == "bool" and not isinstance(v, bool):
+            out.append((key, f"{key} must be true or false (got {_kind(v)})"))
+            continue
+        if kind in ("int", "number"):
+            ok = not isinstance(v, bool) and (isinstance(v, int) if kind == "int" else isinstance(v, (int, float)))
+            lo, hi = spec[1], spec[2]
+            if not ok or v < lo or (hi is not None and v > hi):
+                what = "a whole number" if kind == "int" else "a number"
+                out.append((key, f"{key} must be {what} from {lo} to {hi}" if hi is not None else f"{key} must be {what} of {lo} or more"
+                            + ("" if ok else f" (got {_kind(v)})")))
+                continue
+        typed.add(key)
+    # cross-field rules
+    if "notify" in typed and not cfg["notify"]:
+        out.append(("notify", "notify must be auto, off or a command"))
+    if "proxy_listen" in typed:
+        try:
+            parse_listen(cfg["proxy_listen"])                           # refuses a non-loopback address, whatever the mode
+        except AuthError as e:
+            out.append(("proxy_listen", str(e)))
+    if "redirect_uri" in typed:
+        try:
+            shown = cfg["redirect_uri"].format(port=1)
+            u = urllib.parse.urlsplit(shown)
+            if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost", "::1"):
+                out.append(("redirect_uri", f"redirect_uri must be an http:// loopback address (127.0.0.1, localhost or [::1]): the sign-in listens there (got {cfg['redirect_uri']!r})"))
+            elif "{port}" not in cfg["redirect_uri"] and cfg.get("redirect_port") == 0:
+                out.append(("redirect_uri", "redirect_uri has no {port} but redirect_port is 0 (any free port): set redirect_port to the port in redirect_uri"))
+        except (KeyError, IndexError, ValueError):
+            out.append(("redirect_uri", "redirect_uri may only use {port} as a placeholder"))
+    if not cfg.get("token_command") and not cfg.get("client_id"):
+        out.append(("client_id", f"no token source configured: set client_id (and issuer) or token_command in {path}"))
+    elif not cfg.get("token_command") and not cfg.get("issuer") and not cfg.get("token_endpoint"):
+        out.append(("issuer", f"client_id needs issuer (or token_endpoint) in {path}: the client has to know where to sign in"))
+    return out
+
+
 def load_config(path):
     cfg = dict(DEFAULTS)
+    unknown = ()
     if path.exists():
         try:
             user = json.loads(path.read_text())
@@ -159,30 +268,10 @@ def load_config(path):
         if not isinstance(user, dict):
             raise AuthError(f"{path} must hold a JSON object")
         unknown = set(user) - set(DEFAULTS)
-        if unknown:
-            raise AuthError(f"unknown keys in {path}: {', '.join(sorted(unknown))}")
-        cfg.update(user)
-    if not cfg["token_command"] and not cfg["client_id"]:
-        raise AuthError(f"no token source configured: set client_id (and issuer) or token_command in {path}")
-    if cfg["idp_token"] not in ("access_token", "id_token"):
-        raise AuthError("idp_token must be access_token or id_token")
-    if cfg["hook_login"] not in ("auto", "device", "off"):
-        raise AuthError("hook_login must be auto, device or off")
-    if cfg["login_method"] not in ("auto",) + LOGIN_METHODS:
-        raise AuthError("login_method must be auto, " + ", ".join(LOGIN_METHODS))
-    if cfg["secret_store"] not in ("auto", "file"):
-        raise AuthError("secret_store must be auto or file")
-    if not cfg["sentinel"]:
-        raise AuthError("sentinel must not be empty (an empty header can't be told apart from a missing one)")
-    if cfg["mode"] not in ("file", "proxy"):
-        raise AuthError("mode must be file or proxy")
-    parse_listen(cfg["proxy_listen"])                   # refuses a non-loopback address, whatever the mode
-    if isinstance(cfg["proxy_log_requests"], bool) or not isinstance(cfg["proxy_log_requests"], int) or not 0 <= cfg["proxy_log_requests"] <= 10000:
-        raise AuthError("proxy_log_requests must be a whole number from 0 to 10000")
-    if isinstance(cfg["proxy_max_body_mb"], bool) or not isinstance(cfg["proxy_max_body_mb"], int) or not 1 <= cfg["proxy_max_body_mb"] <= 1024:
-        raise AuthError("proxy_max_body_mb must be a whole number from 1 to 1024")
-    if cfg["gateway_url"] and urllib.parse.urlsplit(str(cfg["gateway_url"])).scheme not in ("http", "https"):
-        raise AuthError("gateway_url must be an http:// or https:// URL")
+        cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
+    problems = config_problems(cfg, unknown, path)
+    if problems:
+        raise ConfigError(path, problems)
     return cfg
 
 
@@ -1020,7 +1109,6 @@ def sync(cfg, state, settings, force=False, idp=None):
 
 # --------------------------------------------------------------------------------------------- sign-in method selection
 
-LOGIN_METHODS = ("pkce", "pkce-print", "pkce-paste", "device")
 LOOPBACK_METHODS = ("pkce", "pkce-print", "pkce-paste")
 PENDING_SECONDS = 600           # a PKCE sign-in started by the hook is good for 10 minutes
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"

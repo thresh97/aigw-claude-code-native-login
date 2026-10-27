@@ -299,7 +299,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 - Every write is atomic (temp file, fsync, rename, mode 600).
 - A lock serializes the daemon and the hooks. The interactive part of `login` runs outside it, so a slow sign-in doesn't stall the hooks.
 
-**Config keys** (unknown keys are an error):
+**Config keys.** `config.json` is checked against one schema when it is loaded: unknown keys (with a "did you mean"), the JSON type of every value, ranges, URLs (`http://` or `https://` with a host), the header name, the sentinel, a loopback `redirect_uri`, and the cross-field rules (a `client_id` needs an `issuer` or `token_endpoint`; a `redirect_uri` without `{port}` needs a fixed `redirect_port`). Every problem is listed at once, and `doctor` shows the same list (finding `config-invalid`), so a hand-edit never turns into a `TypeError` in a daemon or a hook. Whether a value works (reachable URL, the IdP accepting the scope) is for `doctor` and the live checks, not the schema.
 
 | Key | Default | Meaning |
 |---|---|---|
