@@ -52,7 +52,7 @@ This is *not* "the gateway never sees the token": it passes the user's Anthropic
 
 ## What was observed
 
-- The app's Claude Code engine (user agent `claude-cli/2.1.308 (external, claude-desktop-3p, agent-sdk/0.3.308)`, app build `Claude/3.6556.2`) sent `POST /v1/messages` and `/v1/messages/count_tokens` through the proxy and the gateway to Anthropic with status 200.
+- The app's Claude Code engine (user agent `claude-cli/2.1.308 (external, claude-desktop-3p, agent-sdk/0.3.308)`, app build Claude for Mac 3.6556.2 (20c019), built 2026-10-22T22:38:18Z) sent `POST /v1/messages` and `/v1/messages/count_tokens` through the proxy and the gateway to Anthropic with status 200.
 - **The credential was identified, not assumed.** With the app pointed at a logging mock gateway, every request (the launch probe, the model list, the engine) carried one credential of class `sk-ant-oat`, and `sha256("Bearer " + token)` truncated to eight hex characters matched the token file. A deliberately wrong reference file printed no match, so the comparison discriminates. The same check on a mock is the way to rerun this: note the hash, point the app at any server that logs a hash of the `Authorization` header, send a prompt, compare. Never log the token itself.
 - The app also sends `anthropic-beta: oauth-2025-04-20` on its own probe and model-list calls, and the engine adds the Claude Code beta flags on real requests.
 
@@ -87,7 +87,7 @@ This is *not* "the gateway never sees the token": it passes the user's Anthropic
 
 ## Limits and what is not verified
 
-- One machine (macOS), one account (Pro), one app build. Windows, Linux, Team and Enterprise seats, other builds: not verified.
+- One machine (macOS), one account (Pro), one app build: Claude for Mac 3.6556.2 (20c019), built 2026-10-22T22:38:18Z. Windows, Linux, Team and Enterprise seats, other builds: not verified.
 - One user per machine: the proxy has one fixed port ([architecture](architecture.md)).
 - Signing out of the app: *not verified*. The documentation describes no user-facing sign-out in 3P mode; a session ends when the credential stops working. To cut a user off, revoke at the IdP (no new gateway JWT), at the gateway, and at Anthropic (the one-year token).
 - A one-year token is a long-lived credential. Where it lives is up to you: a credential store, or a secrets manager read by a helper script.
