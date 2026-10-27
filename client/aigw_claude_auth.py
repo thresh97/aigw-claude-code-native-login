@@ -19,14 +19,18 @@ keeps it fresh:
   install       add ANTHROPIC_BASE_URL and the two hooks to the settings file (or print them for managed settings)
   logout        forget the refresh token and put the sentinel into the settings
 
-Two modes (`mode` in the config). file (default): the JWT lives in Claude Code's settings, as above. proxy: a local
+Two client modes (`mode` in the config). file (default): the JWT lives in Claude Code's settings, as above. proxy: a local
 proxy on 127.0.0.1 adds the JWT to each request (Claude Code reaches it through ANTHROPIC_BASE_URL), keeps the JWT in
 memory only, answers a gateway refusal with 498 and streams responses through; `install` writes the proxy's address
-and a per-user secret instead of a JWT. See "Mode 2" below.
+and a per-user secret instead of a JWT. See the README, "Choose a mode". These are not Portkey's "Mode A" and "Mode B",
+which are about what the JWT carries (below).
 
 Where the JWT comes from (config file, see README):
-  * an OIDC IdP whose token the gateway accepts directly (Portkey "Mode B"), or
-  * an OIDC IdP token exchanged at a token broker for a gateway-signed JWT (Portkey "Mode A"), or
+  * an OIDC IdP token sent as it is (`broker_url` empty). In Portkey's terms that is "Mode A" when your IdP can add the
+    gateway's claims to its tokens (you control the issuer; Keycloak can), or "Mode B" when it is a standard IdP token you
+    cannot change (the gateway fills in organisation, workspace and limits from its own settings; hybrid gateway only), or
+  * an OIDC IdP token exchanged at a token broker (`broker_url`) for a gateway-signed JWT: the broker adds the Mode A
+    claims that an IdP such as Entra ID cannot, or
   * any command that prints a JWT (`token_command`).
 
 When no JWT can be had and the one in the settings is unusable, `sync` writes the sentinel value (`expired`) instead
@@ -3819,8 +3823,24 @@ def cmd_doctor(a, config_path, state, settings_path):
     return 1 if errors else 0
 
 
+HELP_EPILOG = """\
+Two client modes (`mode` in config.json):
+  file (default)  the JWT is written into Claude Code's settings.json; hooks and an optional daemon renew it
+  proxy           a local proxy on 127.0.0.1 adds the JWT to each request and keeps it in memory; `install` also sets up
+                  the daemon as a service (see `install --help`)
+
+What the JWT carries is a separate matter, Portkey's "Mode A" and "Mode B":
+  Mode A  you control the JWT issuer and add the gateway's claims (portkey_oid, portkey_workspace, defaults, limits):
+          from your IdP if it can add custom claims, or from a token broker (`broker_url`) if it cannot (Entra ID)
+  Mode B  a standard IdP token whose schema you cannot change (Okta, Auth0, Entra ID, Cognito): the gateway fills in
+          organisation, workspace and limits from its own settings (hybrid gateway only)
+https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt
+"""
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="aigw-claude-auth", description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(prog="aigw-claude-auth", description=__doc__.split("\n\n")[0], epilog=HELP_EPILOG,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, help="config file (default: <config dir>/config.json)")
     ap.add_argument("--state-dir", type=Path, help="where the refresh token lives (default: ~/.config/aigw-claude-auth, on Windows %%APPDATA%%\\aigw-claude-auth, or $AIGW_CLAUDE_AUTH_DIR)")
     ap.add_argument("--settings", type=Path, help="Claude Code settings file (default: $CLAUDE_CONFIG_DIR/settings.json or ~/.claude/settings.json)")

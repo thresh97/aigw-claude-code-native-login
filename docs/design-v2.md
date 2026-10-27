@@ -12,7 +12,7 @@ v2 extends the tested v1.1.1 client in [aigw-claude-code-native-login](https://g
 - Signs in once (PKCE in a browser, device code over ssh), stores the refresh token, and keeps a JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of the user's settings.
 - A background daemon renews 5 minutes before expiry; Claude Code picks up the rewritten file about 1 s later.
 - Two Claude Code hooks (`UserPromptSubmit` precheck, `StopFailure`) and a sentinel value stop a gateway 401 from triggering Claude Code's multi-minute Anthropic OAuth retry loop.
-- Optional token-broker exchange ("Mode A") for IdPs such as Entra ID that cannot emit the gateway's claims.
+- Optional token-broker exchange for IdPs such as Entra ID that cannot add the gateway's claims to their tokens, to reach Portkey's Mode A (you control the issuer and add the claims).
 
 **v2 goals**
 
@@ -122,7 +122,7 @@ v2 keeps v1.1.1's per-user config file and strict key set, and adds the ability 
 | `client_id` |  | IdP public client |
 | `scope` | `openid offline_access` | Add the gateway's or broker's scope |
 | `idp_token` | `access_token` | `access_token` or `id_token` |
-| `broker_url` |  | Token-exchange URL (Mode A via broker); empty means the IdP token is the JWT |
+| `broker_url` |  | Token-exchange URL: the broker adds the Mode A claims an IdP cannot; empty means the IdP token is the JWT |
 | `token_command` |  | A command that prints a JWT, instead of an IdP |
 | `header` | `x-portkey-api-key` | Header the gateway reads |
 | `sentinel` | `expired` | Written when no usable JWT exists; never empty; must match the LB rule |
@@ -227,9 +227,11 @@ The client gets an IdP token through one of three OIDC flows, optionally exchang
 
 **Token sources**
 
+Mode A and Mode B are Portkey's names for how much control you have over the JWT issuer ([JWT modes](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt)), not for whether a broker is used. In Mode A the token carries the gateway's claims, from the IdP or, for an IdP that cannot add them, from a broker. In Mode B it is a standard IdP token whose schema you cannot change, and the gateway fills in organisation, workspace and limits from its own settings.
+
 | Source | Config | Gateway mode | Status |
 | --- | --- | --- | --- |
-| IdP token through a broker | `broker_url` set; IdP token sent as `Authorization: Bearer`, response `token` or `access_token` is the JWT | Mode A (gateway's own claims: `portkey_oid`, `portkey_workspace`, nested `defaults`) | Tested with Entra ID |
+| IdP token through a broker | `broker_url` set; IdP token sent as `Authorization: Bearer`, response `token` or `access_token` is the JWT | Mode A (the broker adds the gateway's own claims: `portkey_oid`, `portkey_workspace`, nested `defaults`) | Tested with Entra ID |
 | IdP token directly | `broker_url` empty | Mode A from an IdP that emits nested claims, or Mode B (plain IdP token, hybrid gateway only) | Mode B untested |
 | External command | `token_command` | Any | Supported; `login` does not apply |
 
@@ -641,7 +643,7 @@ Where the tested repo and the earlier chat draft disagreed, the repo wins unless
 | Sentinel and LB guard | Not in design | `expired` sentinel, 498 from an L7 LB | Repo; mode 2 adds a no-LB equivalent |
 | Background mechanism | Scheduled job every few minutes | Persistent daemon, 60 s naps, backoff 30 s to 5 min | Repo; Windows starts the same daemon from Task Scheduler |
 | Refresh trigger | Fraction of lifetime (25%) | Fixed `refresh_before` 300 s | Repo |
-| Token sources | IdP only | IdP, IdP plus broker (Mode A), `token_command` | Repo |
+| Token sources | IdP only | IdP, IdP plus broker (the broker adds the Mode A claims), `token_command` | Repo |
 | Config | `MYTOOL_*` in managed `env` | Per-user `config.json`, strict keys | Repo, plus optional managed keys after spike S4 |
 | Refresh token at rest | OS credential store required | `state.json`, mode 600 | v2 adds the store, file as fallback |
 | JWT at rest | In settings, or proxy | In settings, mode 600 | Both: mode 1 (repo) and mode 2 (new) |

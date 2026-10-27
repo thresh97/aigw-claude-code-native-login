@@ -4,18 +4,20 @@ Claude Code users who sign in with their own Anthropic account (`claude login`, 
 
 This article ships a small client, `aigw-claude-auth` (one Python file, standard library only). It gets that JWT from your IdP, directly or through a token broker, and keeps it fresh in Claude Code's settings. It also makes gateway auth failures fail fast. Without that, a gateway 401 sends a logged-in Claude Code into its own Anthropic OAuth refresh-and-retry loop for several minutes.
 
+The client runs in one of two modes, set by `mode` in its config. **File mode** (the default) writes the JWT into Claude Code's `settings.json` and renews it from hooks and an optional background daemon. **Proxy mode** runs a small local proxy on `127.0.0.1` that adds the JWT to every request and keeps it in memory, so no token sits in a settings file; a background service keeps the proxy running. Pick one under "Choose a mode" in [1.3 Client, per user](#13-client-per-user). (These are not Portkey's "Mode A" and "Mode B", which describe what the JWT carries: see [What you need](#what-you-need).)
+
 Use it when the users' Anthropic plan stays the billing and policy anchor, and the gateway adds identity, logging and guardrails on top.
 
 > **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
 
 ![How it fits together: the client keeps a gateway JWT in Claude Code's settings; every request carries the user's Anthropic login and the JWT; the gateway checks the JWT and forwards the login to Anthropic](docs/flow.svg)
 
-Shown with Entra ID and a token broker (Mode A), as tested. Without a broker (Mode B, or Mode A from an IdP that can emit Portkey's claims), the client puts the IdP's own token into the header.
+Shown with Entra ID and a token broker, as tested: Entra ID can't add Portkey's claims to its tokens, so the broker exchanges the IdP token for a JWT that carries them (Mode A). If your IdP can add the claims itself (Mode A), or you use its standard token as it is (Mode B), there is no broker and the client puts the IdP's own token into the header. What "Mode A" and "Mode B" mean is under [What you need](#what-you-need).
 
 | Piece                                    | What it does                                                                                                                                     | Where                                                              |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
 | Gateway passthrough config               | Sends the request to Anthropic with the caller's own `Authorization` and `anthropic-beta` headers instead of a provider key                      | [gateway/passthrough-config.json](gateway/passthrough-config.json) |
-| Gateway JWT auth                         | The gateway accepts a JWT: "Mode A" carries Portkey's own claims, from your IdP or a broker; "Mode B" is a plain IdP token (hybrid gateway only) | Your gateway (prerequisite)                                        |
+| Gateway JWT auth                         | The gateway accepts a JWT in one of Portkey's [two ways](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt): "Mode A", where you control the issuer and add Portkey's claims (from your IdP, or through a broker); "Mode B", a standard IdP token you can't change (hybrid gateway only) | Your gateway (prerequisite)                                        |
 | `aigw-claude-auth`                       | Signs in to the IdP once, then keeps a valid JWT in `env.ANTHROPIC_CUSTOM_HEADERS` of Claude Code's settings                                     | [client/aigw_claude_auth.py](client/aigw_claude_auth.py)           |
 | Precheck hook (UserPromptSubmit)         | Before each prompt: renews an expired JWT and waits for Claude Code to reload it, or blocks the prompt with a sign-in message                    | `aigw-claude-auth hook precheck`                                   |
 | StopFailure hook                         | After a turn failed on a gateway auth error: renews the JWT and notifies the user, so the retry works                                            | `aigw-claude-auth hook stop-failure`                               |
@@ -58,8 +60,8 @@ So the client makes sure Claude Code seldom sends an unusable JWT, and turns "no
 ## What you need
 
 - **An AI Gateway that accepts a JWT** in `x-portkey-api-key` (for gateway API keys instead, see [Without a JWT](#without-a-jwt-gateway-api-keys)), in one of two ways:
-  - **"Mode A":** the JWT carries Portkey's own claims (`portkey_oid`, `portkey_workspace`, a nested `defaults` object) and is signed by a key the gateway trusts. Your IdP can issue it directly if it can emit nested JSON claims (Keycloak can, finding 18). IdPs that can't need a broker that exchanges the IdP token for one: Entra ID (see article `aigw-entra-jwt-broker`), and Okta for the nested `defaults` (its claim expressions can't nest; Portkey's [JWT authentication with Okta](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta#jwt-authentication-with-okta) adds `defaults` through a token inline hook instead; finding 21);
-  - **"Mode B":** your IdP's ordinary token; the gateway works out the organization and workspace from its own settings. Hybrid gateway only: the SaaS gateway takes Mode A only.
+  - **"Mode A": you control the JWT issuer** ([Portkey's JWT modes](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt)). The JWT carries Portkey's own claims (`portkey_oid`, `portkey_workspace`, a nested `defaults` object, and `usage_limits` / `rate_limits` if you want them per user) and is signed by a key the gateway trusts. Your IdP can issue it directly if it can add custom claims, including nested JSON (Keycloak can, finding 18). An IdP that can't gets them from a broker that exchanges the IdP token for a JWT that has them. A broker is a way to reach Mode A, not a mode of its own. It is needed for: Entra ID (see article `aigw-entra-jwt-broker`), and Okta for the nested `defaults` (its claim expressions can't nest; Portkey's [JWT authentication with Okta](https://portkey.ai/docs/aigw/product/enterprise-offering/org-management/jwt/okta#jwt-authentication-with-okta) adds `defaults` through a token inline hook instead; finding 21);
+  - **"Mode B": a standard IdP token whose schema you can't change** (Okta, Auth0, Entra ID, Cognito). The gateway fills in what the token lacks from its own settings: the organization (`ORGANISATIONS_TO_SYNC`, a single org), the workspace (a workspace allowlist or the org default), scopes (`JWT_LOCAL_AUTH_DEFAULT_SCOPES`, if the IdP doesn't issue them) and limits (workspace policies). It attributes the request to a user by `email_id`, `sub` or `uid`. Point the org's JWKS URL at the IdP. Hybrid gateway only: the SaaS gateway takes Mode A only, because it needs `portkey_oid` and `portkey_workspace` in the token.
 - **The passthrough config** ([gateway/passthrough-config.json](gateway/passthrough-config.json)), as the config the users' requests get. Either:
   - bind it to the credential: named in the JWT's claims, or bound to the service or user API key. Different users or groups in one workspace can then get different configs, and Claude Code's settings (or the MDM or Claude Enterprise policy that manages them) need to know nothing about configs or workspaces;
   - or make it the workspace default. That's simpler, but then everyone in the workspace who doesn't name a config gets that one.
@@ -109,7 +111,7 @@ With a plain ALB listener (no Kubernetes), create the same three rules with `aws
 mkdir -p ~/.local/bin ~/.config/aigw-claude-auth
 cp client/aigw_claude_auth.py ~/.local/bin/aigw-claude-auth && chmod +x ~/.local/bin/aigw-claude-auth
 
-# 2. Configure (see "Client reference" below; the example is Mode A with Entra ID and a broker).
+# 2. Configure (see "Client reference" below; the example is Entra ID through a broker, which supplies the Mode A claims).
 #    For proxy mode copy client/config.proxy.example.json instead: it has mode, proxy_listen and gateway_url set (see "Choose a mode").
 #    Desktop notifications are on by default ("notify": "auto"); set "notify" to "off" or a command to change that.
 cp client/config.example.json ~/.config/aigw-claude-auth/config.json && ${EDITOR:-vi} ~/.config/aigw-claude-auth/config.json
@@ -235,7 +237,7 @@ If the curl shows `Portkey Error: ...` (for example `Invalid API Key. Error Code
 | `errors` | How Claude Code treats 401 (gateway and Anthropic), 403, 407 and 498 with an env-token login | Claude Code |
 | `precheck` | Renew before the request; no-op while valid; why `hook_wait` matters; block when no JWT can be had (signed out, IdP hanging); the device code sign-in offered in the block message and the resent prompt going through; the LB guard path with blocking off | Claude Code |
 | `stopfailure` | Renew and notify after a refused JWT; Anthropic-side failures left alone | Claude Code |
-| `proxy` | The client's local proxy (`mode: proxy`, 1.4.0; [design-v2](docs/design-v2.md), Mode 2) in front of the mock: per-user secret header required and stripped, renew and retry once on a gateway 401, header injected, client value stripped, SSE streamed, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token fails closed; which Unix socket base URLs Claude Code accepts | Claude Code |
+| `proxy` | The client's local proxy (`mode: proxy`, 1.4.0; [design-v2](docs/design-v2.md)) in front of the mock: per-user secret header required and stripped, renew and retry once on a gateway 401, header injected, client value stripped, SSE streamed, a gateway 401 turned into 498 (one attempt), an Anthropic 401 passed through, no token fails closed; which Unix socket base URLs Claude Code accepts | Claude Code |
 | `stored_login` | Stored login against the mock: 498 fails once; a gateway 401 runs the OAuth loop | a stored login |
 | `stored_login_proxy` | Stored login through the client's proxy and the mock: a refused JWT fails in one attempt, no OAuth loop | a stored login |
 | `gateway` | The real gateway, request by request: which failures are the gateway's, and passthrough works | gateway, JWT |
@@ -298,7 +300,7 @@ Usage: `aigw-claude-auth <command>`. Global options: `--config FILE`, `--state-d
 | `client_id` | | The IdP public client |
 | `scope` | `openid offline_access` | Add the gateway's or broker's scope. `offline_access` is what gets a refresh token |
 | `idp_token` | `access_token` | Which IdP token to use: `access_token` or `id_token` |
-| `broker_url` | | Full exchange URL (Mode A through a broker). The IdP token is sent as `Authorization: Bearer`, and the response's `token` (or `access_token`) is the gateway JWT. Empty: the IdP token itself is the JWT (Mode B, or Mode A from an IdP that emits Portkey's claims) |
+| `broker_url` | | Full exchange URL. A broker turns an IdP token that can't carry Portkey's claims (Entra ID, for one) into a JWT that does (Mode A). The IdP token is sent as `Authorization: Bearer`, and the response's `token` (or `access_token`) is the gateway JWT. Empty: the IdP token itself is the JWT: Mode A if your IdP adds Portkey's claims itself, Mode B if it is a standard token the gateway handles with its own settings |
 | `token_command` | | Instead of an IdP: a command that prints a JWT, for example a corporate token tool. `login` doesn't apply then |
 | `header` | `x-portkey-api-key` | The header the gateway reads the JWT from |
 | `sentinel` | `expired` | Written when no usable JWT can be had. Must match the LB rule, and can't be empty |
