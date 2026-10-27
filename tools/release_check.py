@@ -296,7 +296,7 @@ def article_note(root, client):
 
 def markdown_files(root):
     out = {}
-    tracked = subprocess.run(["git", "ls-files", "*.md"], cwd=root, capture_output=True, text=True)
+    tracked = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.md"], cwd=root, capture_output=True, text=True)
     names = tracked.stdout.split() if tracked.returncode == 0 and tracked.stdout.strip() else \
         [p.relative_to(root).as_posix() for p in root.rglob("*.md") if ".git" not in p.parts]
     for n in names:

@@ -59,6 +59,19 @@ The fleet file's keys and what lands where on each OS are in [packaging/README.m
 4. Roll to one real user, then a few, watching `doctor` and `status` (`requests` in proxy mode shows what the proxy relayed).
 5. Check uninstall on a pilot machine before you need it.
 
+## Managed settings without the packages
+
+If you already have a way to deliver Claude Code's managed settings (an MDM, Intune, a configuration manager) and want to keep using the
+client as the user installs it, ship the hooks and the base URL yourself, without the packages:
+
+1. Print the snippet with `aigw-claude-auth install --print --base-url https://<gateway host> --hook-command /usr/local/bin/aigw-claude-auth`.
+2. For each user, run `aigw-claude-auth install --no-hooks`, which only writes the JWT.
+
+Constraints ([finding 11](evidence/findings.md#finding-11)):
+- Managed settings must **not** set `ANTHROPIC_CUSTOM_HEADERS`. A managed value replaces the user's whole value, so the JWT isn't sent. The JWT has to live in the user's settings file, which the client rewrites.
+- With `allowManagedHooksOnly`, user hooks don't run, so the hooks must come from managed settings.
+- The user's `settings.json` must stay writable for the user. A read-only mode (444) is fine, because the client replaces the file. An immutable flag (macOS `chflags uchg`) isn't: the client can't renew the JWT, and from 1.1.1 the precheck blocks the prompt with the error.
+
 ## Uninstall
 
 All three remove their files, the background entry and the drop-in. Per-user data (the refresh token, `~/.config/aigw-claude-auth`, the header
