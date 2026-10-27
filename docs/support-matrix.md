@@ -1,6 +1,6 @@
 # Support matrix and compatibility policy
 
-Last reviewed: 2026-10-26 · Current client: 1.9.0 (`client/aigw_claude_auth.py`, `VERSION`)
+Last reviewed: 2026-10-26 · Current client: 1.10.0 (`client/aigw_claude_auth.py`, `VERSION`)
 
 The client depends on Claude Code behavior that nobody promises to keep: how soon `settings.json` is re-read, what a hook may
 return, how managed and user settings merge, and which response statuses make Claude Code retry. This page says what has been run,
@@ -16,7 +16,8 @@ a fleet package on a disposable machine, no IdP sign-in. *Unit*: `client/test_ai
 
 | Client | Status | What is covered |
 |---|---|---|
-| `1.9.x` (current) | Unit and smoke tested; manual on macOS | Unit suite on macOS 26.6 (Python 3.13) and Ubuntu 26.04 LTS (Python 3.14, non-root). `packaging/linux/smoke-proxy-systemd.sh` on Ubuntu 26.04 with systemd as PID 1. Manual: this macOS machine's own Claude Code 2.1.308 session through the 1.9.0 proxy to the gateway (2026-10-26). **Not rerun on 1.9.x:** the live scenarios, the `managed` scenario, Windows. |
+| `1.10.x` (current) | Unit and smoke tested; configs checked by hand | Everything in 1.9.x, plus the config schema: `config.json` is validated against `SCHEMA` at load time (types, ranges, URLs, header and sentinel, loopback `redirect_uri`, a `client_id` needs an `issuer` or `token_endpoint`) and `doctor` shows the same problems. Unit suite on macOS 26.6 and Ubuntu 26.04 LTS; the systemd smoke test (50 checks). The two configs in real use (Entra ID and the broker on macOS; Okta, a fixed redirect port and a Lambda broker on Ubuntu) load and pass `doctor` with the new schema. **A stricter config can reject a file that 1.9.x accepted:** run `doctor` after upgrading. **Not rerun on 1.10.x:** the live scenarios, `managed`, Windows. |
+| `1.9.x` | Unit and smoke tested; manual on macOS | Unit suite on macOS 26.6 (Python 3.13) and Ubuntu 26.04 LTS (Python 3.14, non-root). `packaging/linux/smoke-proxy-systemd.sh` on Ubuntu 26.04 with systemd as PID 1. Manual: this macOS machine's own Claude Code 2.1.308 session through the 1.9.0 proxy to the gateway (2026-10-26). **Not rerun on 1.9.x:** the live scenarios, the `managed` scenario, Windows. |
 | `1.8.x` | Unit and smoke tested; Okta by hand | As 1.9.x. Manual, Ubuntu 26.04 container with an Okta Integrator org and a Lambda broker (2026-10-26): device code sign-in, the broker exchange, and a request through the proxy that the gateway accepted (it reached Anthropic, which rejected a deliberately invalid login). **No Claude Code prompt with Okta was recorded.** |
 | `1.5.x` to `1.7.x` | Unit and smoke tested; manual on Linux | Service install for the proxy (launchd, systemd, Task Scheduler), `--linger`, the request log. Manual (1.6.0): Claude Code 2.1.311 in an Ubuntu 26.04 container through the proxy with Entra ID and the broker; several prompts answered (2026-10-26). |
 | `1.4.x` | Offline and live | `mode: proxy` (1.4.0): `proxy` scenario on macOS and the Windows 11 VM, `stored_login_proxy` on macOS. Okta against the hybrid gateway: `gateway` and `client_live` (finding 22). Fleet packaging: emulated pilots on Linux, Windows and macOS, and one live fleet run on macOS (1.4.1). |
