@@ -2803,6 +2803,14 @@ class ProxyStatusCliTests(SettlesRecords, ProxyBase):
         self.assertRegex(out, r"proxy config\s+config.json changed but is not valid")
         self.assertRegex(out, r"jwt\s+len \d+")
 
+    def test_status_says_when_connections_without_the_secret_were_dropped(self):
+        self.renew()
+        self.ps.guard.expired, self.ps.guard.evicted = 3, 4
+        code, out, err = self.run_cli("status", "--offline")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"connections\s+dropped 7 connection\(s\) that never presented the secret")
+        self.assertIn("timed out 3, evicted 4, refused 0", out)
+
     def test_status_is_quiet_when_nothing_changed(self):
         self.renew()
         code, out, _ = self.run_cli("status", "--offline")
@@ -3021,6 +3029,239 @@ class ProxyConfigStateTests(unittest.TestCase):
                 got, text = A.proxy_config_state({"config": dict({"error": "", "restart_needed": [], "reloaded_at": 0, "signin_needed": False}, **cfg)}, None)
                 self.assertEqual(got, kind)
                 self.assertEqual(bool(text), kind != "ok")
+
+
+class FakeSocket:
+    def __init__(self):
+        self.shut = 0
+
+    def shutdown(self, how):
+        self.shut += 1
+
+
+class ConnectionGuardTests(unittest.TestCase):
+    def guard(self, total=6, untrusted=3, deadline=10):
+        self.now = 0.0
+        return A.ConnectionGuard(total, untrusted, deadline, clock=lambda: self.now)
+
+    def test_the_oldest_unauthenticated_connection_is_dropped_when_the_budget_is_full(self):
+        g = self.guard()
+        socks = [FakeSocket() for _ in range(4)]
+        for s in socks:
+            self.assertTrue(g.admit(s))
+        self.assertEqual([s.shut for s in socks], [1, 0, 0, 0])             # the 4th evicted the 1st
+        self.assertEqual(g.stats()["untrusted"], 3)
+        self.assertEqual(g.stats()["evicted"], 1)
+
+    def test_a_trusted_connection_is_never_evicted_and_does_not_count_against_the_budget(self):
+        g = self.guard()
+        first = FakeSocket()
+        g.admit(first)
+        g.trust(first)
+        others = [FakeSocket() for _ in range(5)]
+        for s in others:
+            g.admit(s)
+        self.assertEqual(first.shut, 0)
+        self.assertEqual(g.stats()["untrusted"], 3)
+
+    def test_a_new_connection_is_refused_only_when_every_slot_is_trusted(self):
+        g = self.guard(total=3, untrusted=3)
+        held = [FakeSocket() for _ in range(3)]
+        for s in held:
+            g.admit(s)
+            g.trust(s)
+        self.assertFalse(g.admit(FakeSocket()))
+        self.assertEqual(g.stats()["refused"], 1)
+        g.release(held[0])
+        self.assertTrue(g.admit(FakeSocket()))
+
+    def test_untrusted_connections_expire_and_trusted_ones_do_not(self):
+        g = self.guard(deadline=10)
+        slow, ok = FakeSocket(), FakeSocket()
+        g.admit(slow)
+        g.admit(ok)
+        g.trust(ok)
+        self.now = 9
+        self.assertEqual(g.reap(), 0)
+        self.now = 11
+        self.assertEqual(g.reap(), 1)
+        self.assertEqual((slow.shut, ok.shut, g.stats()["expired"]), (1, 0, 1))
+
+    def test_release_is_idempotent(self):
+        g = self.guard()
+        s = FakeSocket()
+        g.admit(s)
+        g.release(s)
+        g.release(s)
+        self.assertEqual(g.stats()["open"], 0)
+
+
+class NofileLimitTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "no resource module on Windows")
+    def test_the_soft_limit_is_raised_toward_the_target_but_never_past_the_hard_one(self):
+        import resource
+        calls = []
+        with mock.patch.object(resource, "getrlimit", return_value=(256, 10240)), \
+             mock.patch.object(resource, "setrlimit", side_effect=lambda k, v: calls.append(v)):
+            A.raise_nofile_limit(4096)
+            A.raise_nofile_limit(99999)
+        self.assertEqual(calls, [(4096, 10240), (10240, 10240)])
+        with mock.patch.object(resource, "getrlimit", return_value=(8192, 10240)), \
+             mock.patch.object(resource, "setrlimit", side_effect=lambda k, v: calls.append("changed")):
+            A.raise_nofile_limit(4096)
+        self.assertNotIn("changed", calls)                                   # already above the target: left alone
+
+    @unittest.skipIf(sys.platform == "win32", "no resource module on Windows")
+    def test_unlimited_means_no_cap(self):
+        import resource
+        with mock.patch.object(resource, "getrlimit", return_value=(resource.RLIM_INFINITY, resource.RLIM_INFINITY)):
+            self.assertIsNone(A.nofile_soft())
+
+    def test_proxy_max_body_mb_must_be_a_whole_number_in_range(self):
+        for bad in (0, 1025, "64", True, 1.5, -1):
+            with self.subTest(bad=bad):
+                p = Path(tempfile.mkdtemp(prefix="aigw-cfg-")) / "c.json"
+                self.addCleanup(shutil.rmtree, p.parent, ignore_errors=True)
+                p.write_text(json.dumps({"client_id": "c", "proxy_max_body_mb": bad}))
+                with self.assertRaises(A.AuthError):
+                    A.load_config(p)
+
+
+class ProxyConnectionLimitTests(SettlesRecords, ConfigEditing, ProxyBase):
+    """What a local process with no secret can do to the proxy, with the limits shrunk so the tests run in seconds."""
+
+    def setUp(self):
+        for k, v in (("HEADER_DEADLINE", 1.0), ("PREAUTH_MAX", 8), ("MAX_CONNECTIONS", 40), ("IDLE_TIMEOUT", 2)):
+            p = mock.patch.object(A.ProxyServer, k, v)
+            p.start()
+            self.addCleanup(p.stop)
+        super().setUp()
+
+    def half_open(self, n):
+        import socket
+        socks = []
+        for _ in range(n):
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+            s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\n")          # the headers are never finished
+            socks.append(s)
+            self.addCleanup(s.close)
+        return socks
+
+    @staticmethod
+    def closed_by_server(s):
+        import select
+        try:
+            return bool(select.select([s], [], [], 0)[0]) and s.recv(1) == b""
+        except OSError:
+            return True                                                       # reset
+
+    def raw(self, request):
+        """One request on a raw socket: its status line. Waits until the proxy has recorded it (it records after replying)."""
+        import socket
+        before = self.recorded()
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.addCleanup(s.close)
+        s.sendall(request)
+        line = s.recv(4096).split(b"\r\n", 1)[0].decode()
+        deadline = time.time() + 3
+        while self.recorded() <= before and time.time() < deadline:
+            time.sleep(0.01)
+        return line
+
+    def test_many_half_open_connections_do_not_lock_out_a_real_request(self):
+        self.renew()
+        before = threading.active_count()
+        self.half_open(30)
+        started = time.time()
+        status, _, _ = self.call("GET", "/_aigw/status", body=b"")
+        self.assertEqual(status, 200)
+        self.assertLess(time.time() - started, 2)
+        st = self.ps.guard.stats()
+        self.assertLessEqual(st["untrusted"], 8)
+        self.assertGreaterEqual(st["evicted"], 22)
+        self.assertLessEqual(threading.active_count() - before, 8 + 8, "threads must stay bounded")
+
+    def test_the_oldest_half_open_connection_goes_first(self):
+        socks = self.half_open(9)                                             # one more than the budget of 8
+        deadline = time.time() + 2
+        while not self.closed_by_server(socks[0]) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.closed_by_server(socks[0]))
+        self.assertFalse(self.closed_by_server(socks[-1]))
+
+    def test_unauthenticated_connections_time_out(self):
+        socks = self.half_open(3)
+        deadline = time.time() + 4
+        while not all(self.closed_by_server(s) for s in socks) and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(all(self.closed_by_server(s) for s in socks))
+        self.assertGreaterEqual(self.ps.guard.stats()["expired"], 3)
+
+    def test_an_authenticated_connection_outlives_the_deadline_and_closes_when_idle(self):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(c.close)
+        c.request("GET", "/_aigw/status", headers={A.LOCAL_HEADER: self.secret})
+        self.assertEqual(c.getresponse().read() and 200, 200)
+        time.sleep(1.6)                                                       # past HEADER_DEADLINE (1 s), inside IDLE_TIMEOUT (2 s)
+        c.request("GET", "/_aigw/status", headers={A.LOCAL_HEADER: self.secret})
+        self.assertEqual(c.getresponse().status, 200)
+        time.sleep(3)                                                         # past IDLE_TIMEOUT
+        with self.assertRaises((http.client.HTTPException, OSError)):
+            c.request("GET", "/_aigw/status", headers={A.LOCAL_HEADER: self.secret})
+            c.getresponse()
+
+    def test_a_body_over_the_cap_gets_413_before_it_is_read(self):
+        self.rewrite(proxy_max_body_mb=1)
+        self.ps.check_config()
+        head = f"POST /v1/messages HTTP/1.1\r\nHost: x\r\n{A.LOCAL_HEADER}: {self.secret}\r\nContent-Type: application/json\r\n"
+        started = time.time()
+        line = self.raw((head + f"Content-Length: {2 * 1024 * 1024}\r\n\r\n").encode())      # no body is sent at all
+        self.assertIn("413", line)
+        self.assertLess(time.time() - started, 2)
+        e = self.ps.recent_requests(5)[-1]
+        self.assertEqual((e["status"], e["note"]), (413, "body-too-large"))
+        line = self.raw((head + "Transfer-Encoding: chunked\r\n\r\n200000\r\n").encode())  # a chunk of 2 MiB announced, none sent
+        self.assertIn("413", line)
+
+    def test_a_body_at_the_cap_still_goes_through_and_the_cap_follows_config_json(self):
+        self.renew()
+        self.rewrite(proxy_max_body_mb=1)
+        self.ps.check_config()
+        ok = b'{"model":"m","pad":"' + b"x" * (900 * 1024) + b'"}'
+        self.assertEqual(self.call(body=ok)[0], 200)
+        self.assertEqual(self.call(body=b"y" * (1024 * 1024 + 1))[0], 413)
+        self.rewrite(proxy_max_body_mb=4)
+        self.ps.check_config()
+        self.assertEqual(self.call(body=b'{"pad":"' + b"y" * (2 * 1024 * 1024) + b'"}')[0], 200)
+
+    def test_a_negative_chunk_size_is_a_bad_request(self):
+        head = f"POST /v1/messages HTTP/1.1\r\nHost: x\r\n{A.LOCAL_HEADER}: {self.secret}\r\nTransfer-Encoding: chunked\r\n\r\n"
+        self.assertIn("498", self.raw((head + "-5\r\n").encode()))           # 498 is how the proxy reports "bad request"
+
+    def test_connections_cut_off_before_the_secret_are_not_requests(self):
+        self.renew()
+        self.half_open(30)                                                    # most of these are evicted mid-headers
+        time.sleep(1.5)
+        kept = self.ps.recent_requests(100)
+        self.assertEqual([e for e in kept if e["note"].startswith("client-error")], [])
+        self.assertEqual(self.ps.stats.get("0", 0), 0)
+
+    def test_a_flood_of_wrong_secret_requests_is_counted_but_only_a_burst_is_kept(self):
+        self.renew()
+        for _ in range(60):
+            self.assertEqual(self.call(secret="not-the-secret")[0], 498)
+        self.assertEqual(self.call()[0], 200)                                 # a real request still works, and is kept
+        kept = self.ps.recent_requests(100)
+        self.assertLessEqual(len([e for e in kept if e["note"] == "local-secret"]), A.ProxyServer.DENIED_BURST)
+        self.assertEqual(self.proxy_status()["connections"]["denied"], 60)
+        self.assertEqual(kept[-1]["status"], 200)
+
+    def test_a_request_without_the_secret_never_has_its_body_read(self):
+        started = time.time()
+        line = self.raw(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999\r\n\r\n")
+        self.assertIn("498", line)
+        self.assertLess(time.time() - started, 2)
 
 
 class ProxyConfigTests(Base):

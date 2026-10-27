@@ -68,6 +68,12 @@ One log line per request: `user=<10 hex of sha256 of the Okta user id> rule=<gro
 directly if you prefer. Keep it up in more than one place: a 3 s timeout means a cold start can lock users out
 (fail closed, which is the intent).
 
+**Do not expose the built-in server to networks you do not control.** It is the standard library's `ThreadingHTTPServer`: one thread per
+connection, no cap on connections, a 10 s socket timeout (`HANDLER_TIMEOUT`), and a 256 KiB body cap that is checked after the
+authentication header. Anyone who can reach it can hold connections open until it runs out of threads or file descriptors. That is
+why it listens on `127.0.0.1` by default and why the reverse proxy above should be the only thing that reaches it: let the proxy
+limit connections and request rates, and restrict it to the hook path.
+
 ## Okta Admin Console steps
 
 1. **Workflow > Inline Hooks > Add Inline Hook > Token.** Name it; URL `https://<hook host>/`; Authentication field

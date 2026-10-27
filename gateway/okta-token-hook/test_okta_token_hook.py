@@ -119,6 +119,29 @@ class Tests(Base):
         self.assertEqual(self.post([1, 2]), (200, {}))
         self.assertEqual(self.post({"data": "x"}), (200, {}))
 
+    def test_a_silent_client_is_dropped_after_the_handler_timeout(self):
+        import select
+        import socket
+        old = h.HANDLER_TIMEOUT
+        h.HANDLER_TIMEOUT = 0.5
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), h.make_handler(self.mapping, SECRET, "Authorization"))
+        finally:
+            h.HANDLER_TIMEOUT = old
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        s = socket.create_connection(("127.0.0.1", srv.server_port), timeout=3)
+        self.addCleanup(s.close)
+        s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n")                  # the headers are never finished
+        self.assertTrue(select.select([s], [], [], 3)[0], "the server should have closed the idle connection")
+        self.assertEqual(s.recv(1), b"")
+
+    def test_handler_timeout_is_set(self):
+        self.assertGreater(h.HANDLER_TIMEOUT, 0)
+        self.assertLess(h.HANDLER_TIMEOUT, 60)
+
     def test_size_cap(self):
         c = http.client.HTTPConnection("127.0.0.1", self.srv.server_port, timeout=5)
         c.request("POST", "/", "x", {"Authorization": SECRET, "Content-Length": str(h.MAX_BODY + 1)})

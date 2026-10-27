@@ -78,7 +78,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -109,6 +109,7 @@ DEFAULTS = {
     "proxy_listen": "127.0.0.1:18787", # proxy mode: loopback address and a fixed port (install writes ANTHROPIC_BASE_URL from it)
     "gateway_url": "",                 # proxy mode: the gateway the proxy forwards to (file mode keeps it in ANTHROPIC_BASE_URL)
     "proxy_log_requests": 100,         # proxy mode: how many recent requests the proxy keeps in memory for `requests` (0 = none)
+    "proxy_max_body_mb": 64,           # proxy mode: the largest request body the proxy takes (413 above; the API's own limit is 32 MB for Messages)
     "fleet": False,                    # set by the fleet packages (packaging/): the fleet's login entry moves a personal install aside
     "http_timeout": 30,
     "hook_http_timeout": 5,            # per request inside a hook: Claude Code gives up on a hook after HOOK_TIMEOUT s and
@@ -178,6 +179,8 @@ def load_config(path):
     parse_listen(cfg["proxy_listen"])                   # refuses a non-loopback address, whatever the mode
     if isinstance(cfg["proxy_log_requests"], bool) or not isinstance(cfg["proxy_log_requests"], int) or not 0 <= cfg["proxy_log_requests"] <= 10000:
         raise AuthError("proxy_log_requests must be a whole number from 0 to 10000")
+    if isinstance(cfg["proxy_max_body_mb"], bool) or not isinstance(cfg["proxy_max_body_mb"], int) or not 1 <= cfg["proxy_max_body_mb"] <= 1024:
+        raise AuthError("proxy_max_body_mb must be a whole number from 1 to 1024")
     if cfg["gateway_url"] and urllib.parse.urlsplit(str(cfg["gateway_url"])).scheme not in ("http", "https"):
         raise AuthError("gateway_url must be an http:// or https:// URL")
     return cfg
@@ -189,7 +192,7 @@ def load_config(path):
 RELOAD_SAFE = frozenset(("issuer", "token_endpoint", "device_authorization_endpoint", "authorization_endpoint", "client_id", "scope",
                          "idp_token", "broker_url", "token_command", "refresh_before", "hook_wait", "block_on_failure", "login_method",
                          "hook_login", "device_unavailable_ttl", "notify", "redirect_uri", "redirect_port", "debug_until", "http_timeout",
-                         "hook_http_timeout", "proxy_log_requests")) & frozenset(DEFAULTS)
+                         "hook_http_timeout", "proxy_log_requests", "proxy_max_body_mb")) & frozenset(DEFAULTS)
 
 
 def idp_identity(cfg):
@@ -1894,10 +1897,109 @@ class Upstream:
         return conn, lambda p: f"http://{self.netloc}{self.base}{p}"
 
 
+class BodyTooLarge(Exception):
+    """A request body over proxy_max_body_mb; the proxy answers 413 without reading the rest."""
+
+
+def nofile_soft():
+    """This process's soft limit on open files, or None when unlimited or unknown (Windows)."""
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        return None if soft == resource.RLIM_INFINITY else soft
+    except (ImportError, ValueError, OSError):
+        return None
+
+
+def raise_nofile_limit(target=4096):
+    """Every connection to the proxy costs a file descriptor, and a macOS launch agent starts with a soft limit of 256. Raise this
+    process's soft limit toward `target`, never above the hard limit."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+class ConnectionGuard:
+    """What a local process can do to the proxy without the secret, bounded. Every connection is tracked from accept to close. It
+    becomes trusted once a request on it carried the right secret. Until then it has `deadline` seconds, and there are at most
+    `max_untrusted` of them: when the budget (or `max_total`) is full the OLDEST untrusted connection is dropped, so a real client that
+    connects now always gets in (its request arrives in one packet; a half-open attacker is the oldest). Only when every slot holds a
+    trusted connection is a new one refused."""
+
+    def __init__(self, max_total, max_untrusted, deadline, clock=time.monotonic):
+        self.max_total, self.max_untrusted, self.deadline, self.clock = max_total, max_untrusted, deadline, clock
+        self.lock = threading.Lock()
+        self.conns = {}                                 # socket -> [accepted_at, trusted]; insertion order is accept order
+        self.evicted = self.expired = self.refused = 0
+
+    @staticmethod
+    def _shut(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)             # wakes the handler thread blocked on this socket; it closes the socket itself
+        except OSError:
+            pass
+
+    def _drop_oldest_untrusted(self, why):
+        for sock, (_, trusted) in self.conns.items():
+            if not trusted:
+                del self.conns[sock]
+                setattr(self, why, getattr(self, why) + 1)
+                self._shut(sock)
+                return True
+        return False
+
+    def admit(self, sock):
+        """Register a new connection. False: refuse it (every slot is a trusted connection)."""
+        with self.lock:
+            while sum(1 for r in self.conns.values() if not r[1]) >= self.max_untrusted:
+                if not self._drop_oldest_untrusted("evicted"):
+                    break
+            while len(self.conns) >= self.max_total:
+                if not self._drop_oldest_untrusted("evicted"):
+                    self.refused += 1
+                    return False
+            self.conns[sock] = [self.clock(), False]
+            return True
+
+    def trust(self, sock):
+        with self.lock:
+            if sock in self.conns:
+                self.conns[sock][1] = True
+
+    def release(self, sock):
+        with self.lock:
+            self.conns.pop(sock, None)
+
+    def reap(self):
+        """Drop untrusted connections past the deadline. Returns how many."""
+        now, n = self.clock(), 0
+        with self.lock:
+            for sock in [s for s, (t, trusted) in self.conns.items() if not trusted and now - t > self.deadline]:
+                del self.conns[sock]
+                self.expired += 1
+                self._shut(sock)
+                n += 1
+        return n
+
+    def stats(self):
+        with self.lock:
+            return {"open": len(self.conns), "untrusted": sum(1 for r in self.conns.values() if not r[1]),
+                    "evicted": self.evicted, "expired": self.expired, "refused": self.refused}
+
+
 class ProxyServer:
     """The Mode 2 proxy. start() binds and serves in a thread; stop() ends it."""
 
     CONFIG_POLL = 2.0                   # seconds between looks at config.json (tests shorten it)
+    HEADER_DEADLINE = 10.0              # a new connection must present the secret within this many seconds, or it is dropped
+    PREAUTH_MAX = 64                    # connections that have not presented the secret yet; over this the oldest is dropped
+    MAX_CONNECTIONS = 512               # all connections, clamped below the process's open-file limit
+    IDLE_TIMEOUT = 300                  # seconds an authenticated connection may sit silent (between requests, or mid-body) before it is closed
 
     def __init__(self, cfg, state, settings, access_log=None, renew_cooldown=10):
         if not cfg.get("gateway_url"):
@@ -1923,6 +2025,11 @@ class ProxyServer:
         self.config_path = cfg.get("_config_path")
         self.config_sig = file_digest(self.config_path)
         self.reload_lock, self.stopping = threading.Lock(), threading.Event()
+        raise_nofile_limit()
+        soft = nofile_soft()
+        cap = self.MAX_CONNECTIONS if soft is None else min(self.MAX_CONNECTIONS, soft - 64)
+        self.denied, self.denied_window = 0, [0.0, 0]
+        self.guard = ConnectionGuard(max(cap, 16), min(self.PREAUTH_MAX, max(cap, 16)), self.HEADER_DEADLINE)
         self.config_error, self.restart_needed, self.reloaded_at, self.signin_needed = "", [], 0.0, False
 
     # -- config.json changes
@@ -1959,6 +2066,10 @@ class ProxyServer:
             else:
                 log("config.json reloaded" + (f" (applied: {', '.join(safe)})" if safe else "") +
                     (f"; restart the proxy to apply: {', '.join(self.restart_needed)}" if self.restart_needed else ""))
+
+    def _reap_connections(self):
+        while not self.stopping.wait(max(0.05, min(1.0, self.HEADER_DEADLINE / 4))):
+            self.guard.reap()
 
     def _watch_config(self):
         while not self.stopping.wait(self.CONFIG_POLL):
@@ -2002,11 +2113,20 @@ class ProxyServer:
         return self.blocked
 
     # -- accounting
+    DENIED_BURST, DENIED_WINDOW = 20, 10.0      # wrong-secret requests kept in the log and the ring: this many per window
+
     def record(self, entry):
         with self.stats_lock:
             self.stats[str(entry["status"])] = self.stats.get(str(entry["status"]), 0) + 1
             if entry.get("outcome"):
                 self.last_outcome = entry["outcome"]
+            if entry["note"] == "local-secret":
+                self.denied += 1                                # always counted; past the burst they are not kept, so a flood cannot bury the log
+                if entry["t"] - self.denied_window[0] > self.DENIED_WINDOW:
+                    self.denied_window = [entry["t"], 0]
+                self.denied_window[1] += 1
+                if self.denied_window[1] > self.DENIED_BURST:
+                    return
             if self.recent is not None:
                 self.recent.append({k: v for k, v in entry.items() if k != "outcome"})
         if self.access_log:
@@ -2031,6 +2151,7 @@ class ProxyServer:
                 "renewed_at": self.holder.renewed_at, "last_error": self.holder.last_error, "last_outcome": self.last_outcome,
                 "blocked": self.blocked["id"] if self.blocked else "", "requests": dict(self.stats),
                 "kid": str(jwt_header(tok).get("kid", "")) if tok else "", "claims": status_claims(claims),
+                "connections": dict(self.guard.stats(), denied=self.denied),
                 "config": {"error": self.config_error, "restart_needed": list(self.restart_needed), "reloaded_at": int(self.reloaded_at),
                            "keys": config_fingerprint(self.cfg),
                            "signin_needed": self.signin_needed and self.holder.renewed_ts <= self.reloaded_at}}
@@ -2087,10 +2208,21 @@ class ProxyServer:
             def handle_error(self, request, client_address):    # Claude Code drops idle keep-alive connections
                 pass
 
+            def process_request(self, request, client_address):
+                if not ps.guard.admit(request):                 # every slot is a trusted connection
+                    super().shutdown_request(request)
+                    return
+                super().process_request(request, client_address)
+
+            def shutdown_request(self, request):
+                ps.guard.release(request)
+                super().shutdown_request(request)
+
         self.srv = Server(self.listen, self._handler())
         self.port = self.srv.server_address[1]
         write_private(self.state.dir / "proxy.json", json.dumps({"pid": os.getpid(), "host": self.listen[0], "port": self.port}) + "\n")
         threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
+        threading.Thread(target=self._reap_connections, daemon=True).start()
         if self.config_path:
             threading.Thread(target=self._watch_config, daemon=True).start()
         return self.port
@@ -2111,7 +2243,7 @@ class ProxyServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
-            timeout = 600
+            timeout = ps.IDLE_TIMEOUT
 
             def log_message(self, *a):
                 pass
@@ -2132,21 +2264,48 @@ class ProxyServer:
                 self.reply(498, {"type": "error", "error": {"type": kind, "message": message}})
                 return 498
 
+            def drain(self, limit=4 * 1024 * 1024, seconds=1.0):
+                """After refusing a body unread, swallow some of what the client is still sending (bounded). Closing a socket with unread
+                data resets the connection, and the reset can eat our reply before the client reads it."""
+                try:
+                    self.wfile.flush()
+                    self.connection.shutdown(socket.SHUT_WR)            # the reply is complete; say so
+                    self.connection.settimeout(0.2)
+                    end, n = time.time() + seconds, 0
+                    while n < limit and time.time() < end:
+                        try:
+                            chunk = self.connection.recv(65536)
+                        except socket.timeout:
+                            continue
+                        if not chunk:
+                            break
+                        n += len(chunk)
+                except OSError:
+                    pass
+
             # -- request body (Messages requests are JSON with a Content-Length; chunked is handled for completeness)
             def read_body(self):
+                cap = int(ps.cfg["proxy_max_body_mb"]) * 1024 * 1024        # checked before anything is read
                 if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                    parts = []
+                    parts, total = [], 0
                     while True:
                         size = int((self.rfile.readline(1024).split(b";")[0].strip() or b"0"), 16)
+                        if size < 0:
+                            raise ValueError("negative chunk size")
                         if size == 0:
                             while self.rfile.readline(1024).strip():     # trailers
                                 pass
                             return b"".join(parts)
+                        total += size
+                        if total > cap:
+                            raise BodyTooLarge()
                         parts.append(self.rfile.read(size))
                         self.rfile.readline(4)
                 n = self.headers.get("Content-Length")
                 if n is None:
                     return None
+                if int(n) > cap:
+                    raise BodyTooLarge()
                 return self.rfile.read(int(n)) if int(n) > 0 else b""
 
             # -- one request
@@ -2156,27 +2315,41 @@ class ProxyServer:
             def handle_any(self):
                 t0 = time.time()
                 token, note, outcome = None, "", ""
+                trusted, linger = False, False
                 self._up = {}                                   # the handler lives across keep-alive requests
                 try:
                     if not ps.authorized(self.headers.get(LOCAL_HEADER)):
                         self.close_connection = True            # the body is not read
                         status, note = self.refuse(LOCAL_DENIED, "proxy_auth_error"), "local-secret"
-                    elif self.path.startswith(CONTROL_PREFIX):
-                        code, obj = ps.control(self.command, self.path)
-                        self.reply(code, obj)
-                        return                                  # control calls are not requests to the gateway
                     else:
+                        ps.guard.trust(self.connection)         # it knows the secret: no longer on the clock for the unauthenticated
+                        trusted = True
+                        if self.path.startswith(CONTROL_PREFIX):
+                            code, obj = ps.control(self.command, self.path)
+                            self.reply(code, obj)
+                            return                              # control calls are not requests to the gateway
                         status, note, outcome, token = self.forward()
+                except BodyTooLarge:                            # answered before the body was read, so the connection cannot be reused
+                    self.close_connection = True
+                    limit = ps.cfg["proxy_max_body_mb"]
+                    self.reply(413, {"type": "error", "error": {"type": "request_too_large",
+                                                                 "message": f"AI gateway proxy: the request body is larger than proxy_max_body_mb ({limit} MB)"}})
+                    linger = True                                   # drain after the request is recorded
+                    status, note = 413, "body-too-large"
                 except ValueError:                              # an unreadable Content-Length or chunk size
                     self.close_connection = True
                     status, note = self.refuse("bad request", "invalid_request_error"), "bad-request"
                 except (BrokenPipeError, ConnectionError, socket.timeout) as e:
                     self.close_connection = True
+                    if not trusted:
+                        return                                      # a connection cut off before it ever presented the secret is not a request
                     status, note = 0, f"client-error:{type(e).__name__}"
                 ps.record({"t": round(t0, 3), "ms": round((time.time() - t0) * 1000), "method": self.command,
                            "path": self.path.split("?")[0], "status": status, "note": note, "token": short_fp(token), "outcome": outcome,
                            "in": log_headers(self.headers, ps.header), "out": {ps.header: mask_secret(token)} if token else {},
                            "up": self._up})
+                if linger:
+                    self.drain()
 
             def forward(self):
                 self._started = False
@@ -2507,6 +2680,12 @@ def cmd_status(a, cfg, state, settings):
             ck, ct = proxy_config_state(info, cfg.get("_config_path"), cfg)
             if ck != "ok":
                 rows.append(("config", ct))
+            cn = info.get("connections") or {}
+            dropped = sum(cn.get(k, 0) for k in ("expired", "evicted", "refused"))
+            if dropped:
+                rows.append(("connections", f"dropped {dropped} connection(s) that never presented the secret since the proxy started "
+                                            f"(timed out {cn.get('expired', 0)}, evicted {cn.get('evicted', 0)}, refused {cn.get('refused', 0)}): "
+                                            "something on this machine is holding connections open"))
         shown, kid = (info.get("claims", {}), info.get("kid", "")) if kind == "running" else ({}, "")
     else:
         rows.append(("jwt", fingerprint(settings.get()) if settings.get() != cfg["sentinel"] else "sentinel (no usable JWT)"))

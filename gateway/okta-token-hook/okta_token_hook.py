@@ -35,8 +35,9 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 MAX_BODY = 256 * 1024
+HANDLER_TIMEOUT = 10      # seconds a client may sit silent; Okta waits 3 s for the hook, so a real call is far inside it
 PATCH_TYPE = "com.okta.access.patch"
 # Claims the mapping may not set (JWT-standard or Okta identity): a typo must not
 # overwrite iss/sub/aud/exp. Okta's own reserved list is UNCONFIRMED; this is conservative.
@@ -143,6 +144,7 @@ def make_handler(mapping, secret, header):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "okta-token-hook"
+        timeout = HANDLER_TIMEOUT      # without it a client that stops sending holds its thread forever
 
         def log_message(self, *a):  # replaced by our own one-line log
             pass

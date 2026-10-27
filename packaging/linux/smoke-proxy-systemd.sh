@@ -5,7 +5,8 @@
 #   packaging/linux/smoke-proxy-systemd.sh --client client/aigw_claude_auth.py [--keep]
 # Checks: install in proxy mode writes and starts the systemd user unit; status shows the email claim and the JWKS rows;
 # a request through the proxy reaches the gateway with the JWT injected and the local secret stripped; `requests` lists it
-# with credentials partly masked; config.json edits while the proxy runs (reload, restart needed, invalid); systemd restarts the proxy after a kill; a plain install leaves lingering off, and
+# with credentials partly masked; config.json edits while the proxy runs (reload, restart needed, invalid); 600 half-open connections and a 100 MB body
+# cannot lock the proxy out; systemd restarts the proxy after a kill; a plain install leaves lingering off, and
 # `install --linger` either turns it on or, when polkit refuses the unprivileged user, warns and prints the sudo fallback; teardown.
 set -u
 CLIENT= KEEP=0 INSIDE=0
@@ -135,6 +136,44 @@ EOF
     CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/v1/messages -H "x-aigw-local: $SECRET" -d '{}'); [ "$CODE" = 200 ] && ok "requests still work with the old settings" || bad "requests still work with the old settings ($CODE)"
     cp /tmp/config.orig $CFG; chown $U:$U $CFG
     waitfor "^config +config.json reloaded" && ! cli status --offline 2>&1 | grep -q "not valid" && ok "fixing the file clears the error" || bad "fixing the file clears the error"
+
+    step "3c. connections that never present the secret cannot lock the proxy out"
+    PID=$(uctl show -p MainPID --value aigw-claude-auth)
+    SOFT=$(awk '/Max open files/ {print $4}' /proc/$PID/limits)
+    [ "${SOFT:-0}" -ge 4096 ] && ok "the proxy raised its own open-file limit ($SOFT)" || bad "the proxy raised its own open-file limit (${SOFT:-?})"
+    cat > /tmp/halfopen.py <<'PY'
+import http.client, os, select, socket, time
+port, secret = 18787, os.environ["SECRET"]
+def legit():
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("GET", "/_aigw/status", headers={"x-aigw-local": secret}); r = c.getresponse(); r.read(); c.close()
+    return r.status
+socks = []
+for _ in range(600):
+    s = socket.create_connection(("127.0.0.1", port), timeout=3)
+    s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\n")             # the headers are never finished
+    socks.append(s)
+t = time.time()
+print("during:", legit(), f"{time.time() - t:.2f}s")
+time.sleep(14)                                                          # past the 10 s deadline
+closed = 0
+for s in socks:
+    try:
+        if select.select([s], [], [], 0)[0] and s.recv(1) == b"":
+            closed += 1
+    except OSError:
+        closed += 1
+print("closed:", closed, "of", len(socks))
+print("after:", legit())
+PY
+    chmod 644 /tmp/halfopen.py
+    OUT=$(asuser env SECRET="$SECRET" python3 /tmp/halfopen.py 2>&1); echo "$OUT" | sed 's/^/   /'
+    echo "$OUT" | grep -q "^during: 200" && ok "a real request works while 600 half-open connections are held" || bad "a real request works while 600 half-open connections are held"
+    CLOSED=$(echo "$OUT" | awk '/^closed:/ {print $2}'); [ "${CLOSED:-0}" -ge 540 ] && ok "the half-open connections were dropped ($CLOSED of 600)" || bad "the half-open connections were dropped (${CLOSED:-?} of 600)"
+    echo "$OUT" | grep -q "^after: 200" && ok "the proxy answers normally afterwards" || bad "the proxy answers normally afterwards"
+    cli status --offline 2>&1 | grep -qE "^connections +dropped [0-9]+ connection" && ok "status reports the dropped connections" || bad "status reports the dropped connections"
+    BODY=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/v1/messages -H "x-aigw-local: $SECRET" -H "Content-Length: 104857600" -d 'x' --max-time 5)
+    [ "$BODY" = 413 ] && ok "a 100 MB request body is refused with 413 before it is read" || bad "a 100 MB request body is refused with 413 (got $BODY)"
 
     step "4. systemd restarts the proxy after it is killed"
     P1=$(uctl show -p MainPID --value aigw-claude-auth)

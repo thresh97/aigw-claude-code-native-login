@@ -7,5 +7,6 @@
   "mode": "file",
   "proxy_listen": "127.0.0.1:18787",
   "gateway_url": "",
-  "proxy_log_requests": 100
+  "proxy_log_requests": 100,
+  "proxy_max_body_mb": 64
 }
