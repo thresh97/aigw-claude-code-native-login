@@ -5,7 +5,7 @@
 #   packaging/linux/smoke-proxy-systemd.sh --client client/aigw_claude_auth.py [--keep]
 # Checks: install in proxy mode writes and starts the systemd user unit; status shows the email claim and the JWKS rows;
 # a request through the proxy reaches the gateway with the JWT injected and the local secret stripped; `requests` lists it
-# with credentials partly masked; systemd restarts the proxy after a kill; a plain install leaves lingering off, and
+# with credentials partly masked; config.json edits while the proxy runs (reload, restart needed, invalid); systemd restarts the proxy after a kill; a plain install leaves lingering off, and
 # `install --linger` either turns it on or, when polkit refuses the unprivileged user, warns and prints the sudo fallback; teardown.
 set -u
 CLIENT= KEEP=0 INSIDE=0
@@ -107,6 +107,28 @@ EOF
     grep -q "out x-portkey-api-key: eyJ" /tmp/requests.out && ok "injected x-portkey-api-key partly masked" || bad "injected x-portkey-api-key partly masked"
     grep -q "up  request-id: req_smoke" /tmp/requests.out && ok "the gateway's request-id is listed" || bad "the gateway's request-id is listed"
     if grep -qE "$BEARER|$SECRET|wrong-secret-value|[A-Za-z0-9_-]{40,}" /tmp/requests.out; then bad "no full credential in the output"; else ok "no full credential in the output"; fi
+
+    step "3b. config.json edits while the proxy runs: IdP keys reload by themselves, others say a restart is needed, a bad file is refused"
+    CFG=/home/$U/.config/aigw-claude-auth/config.json
+    cp $CFG /tmp/config.orig
+    editcfg() { asuser python3 -c "import json,sys; p='$CFG'; c=json.load(open(p)); c.update(json.loads(sys.argv[1])); json.dump(c, open(p,'w'))" "$1"; }
+    waitfor() { local pat=$1; for _ in $(seq 1 12); do cli status --offline 2>&1 | grep -qE "$pat" && return 0; sleep 1; done; return 1; }
+    editcfg '{"refresh_before": 200}'
+    waitfor "^config +config.json reloaded at .*no restart needed" && ok "a reload-safe key (refresh_before) is applied without a restart" || bad "a reload-safe key is applied without a restart"
+    editcfg '{"gateway_url": "http://127.0.0.1:19098"}'
+    waitfor "^config +config.json changed: restart the proxy to apply gateway_url" && ok "status says a changed gateway_url needs a restart" || bad "status says a changed gateway_url needs a restart"
+    cli doctor 2>&1 | grep -q "\[Warning\] proxy-config" && ok "doctor warns (proxy-config)" || bad "doctor warns (proxy-config)"
+    curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/v1/messages -H "x-aigw-local: $SECRET" -d '{}' | grep -q 200 && ok "the proxy still forwards to the old gateway_url (not applied)" || bad "the proxy still forwards to the old gateway_url"
+    cp /tmp/config.orig $CFG; chown $U:$U $CFG
+    waitfor "^config +config.json reloaded" && ! cli status --offline 2>&1 | grep -q "restart the proxy to apply" && ok "restoring gateway_url clears the restart notice" || bad "restoring gateway_url clears the restart notice"
+    printf '{ not json' > $CFG; chown $U:$U $CFG
+    # every CLI command loads config.json first, so `status` cannot run now (doctor can); ask the proxy itself and read its log
+    for _ in $(seq 1 12); do curl -s -H "x-aigw-local: $SECRET" http://127.0.0.1:18787/_aigw/status | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["config"]["error"] else 1)' 2>/dev/null && break; sleep 1; done
+    curl -s -H "x-aigw-local: $SECRET" http://127.0.0.1:18787/_aigw/status | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["config"]["error"] else 1)' && ok "the proxy refuses an invalid config.json and reports the error" || bad "the proxy refuses an invalid config.json and reports the error"
+    asuser journalctl --user -u aigw-claude-auth --no-pager -n 30 2>/dev/null | grep -q "not valid; keeping the old settings" && ok "the proxy log says it kept the old settings" || bad "the proxy log says it kept the old settings"
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/v1/messages -H "x-aigw-local: $SECRET" -d '{}'); [ "$CODE" = 200 ] && ok "requests still work with the old settings" || bad "requests still work with the old settings ($CODE)"
+    cp /tmp/config.orig $CFG; chown $U:$U $CFG
+    waitfor "^config +config.json reloaded" && ! cli status --offline 2>&1 | grep -q "not valid" && ok "fixing the file clears the error" || bad "fixing the file clears the error"
 
     step "4. systemd restarts the proxy after it is killed"
     P1=$(uctl show -p MainPID --value aigw-claude-auth)

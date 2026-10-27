@@ -2767,11 +2767,192 @@ class ProxyStatusCliTests(SettlesRecords, ProxyBase):
         self.assertRegex(out, r"up  request-id: req_test123")
         self.assertRegex(out, r"up  retry-after: 7")
 
+    def test_status_and_doctor_say_when_the_proxy_needs_a_restart(self):
+        self.renew()
+        self.configure(gateway_url="http://127.0.0.1:9")
+        t = time.time_ns() + 7_000_000_000
+        os.utime(self.config_path, ns=(t, t))
+        code, out, err = self.run_cli("status", "--offline")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"config\s+config.json changed: restart the proxy to apply gateway_url")
+        code, out, _ = self.run_cli("doctor", "--json")
+        found = {f["id"]: f for f in json.loads(out)["findings"]}
+        self.assertEqual(found["proxy-config"]["severity"], "Warning")
+        self.assertIn("restart the proxy", found["proxy-config"]["fix"])
+
+    def test_status_is_quiet_when_nothing_changed(self):
+        self.renew()
+        code, out, _ = self.run_cli("status", "--offline")
+        self.assertNotRegex(out, r"(?m)^config\s")
+
     def test_requests_in_file_mode_says_why_there_is_no_log(self):
         self.write_config(mode="file")
         code, _, err = self.run_cli("requests")
         self.assertEqual(code, 1)
         self.assertIn("mode is file", err)
+
+
+class IdpBindingTests(Base):
+    """A refresh token belongs to the IdP and client that issued it, and is never sent anywhere else."""
+
+    def state_and_cfg(self):
+        return A.State(self.state_dir), A.load_config(self.config_path)
+
+    def login(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        code, _, err = self.run_cli("login", "--device")
+        self.assertEqual(code, 0, err)
+
+    def test_sign_in_records_which_idp_issued_the_refresh_token(self):
+        self.login()
+        state, cfg = self.state_and_cfg()
+        self.assertEqual(state.load()["idp"], A.idp_identity(cfg))
+        self.assertEqual(A.idp_label(A.idp_identity(cfg)), urllib.parse.urlsplit(self.idp.url).netloc)
+
+    def test_a_refresh_token_is_not_sent_to_another_idp_and_is_not_deleted(self):
+        self.login()
+        self.write_config(client_id="another-client")
+        state, cfg = self.state_and_cfg()
+        before = len(self.idp.calls)
+        with self.assertRaises(A.AuthError) as cm:
+            A.TokenSource(cfg, state).refresh()
+        self.assertIn("belongs to", str(cm.exception))
+        self.assertIn("restart it", str(cm.exception))
+        self.assertIn("run `aigw-claude-auth login`", str(cm.exception))
+        self.assertEqual(len(self.idp.calls), before, "nothing may reach the IdP")
+        self.assertTrue(state.get_refresh_token(), "the token must survive")
+
+    def test_a_state_from_before_the_binding_is_adopted_on_the_next_refresh(self):
+        self.sign_in()
+        state, cfg = self.state_and_cfg()
+        self.assertNotIn("idp", state.load())                   # sign_in() writes a bare refresh token, like a state from before 1.8
+        A.TokenSource(cfg, state).refresh()
+        self.assertEqual(state.load()["idp"], A.idp_identity(cfg))
+
+
+class ConfigEditing:
+    """Rewrite config.json so that its signature surely changes, whatever the file system's timestamp resolution."""
+
+    def rewrite(self, **over):
+        self.configure(**over)
+        self._tick = getattr(self, "_tick", time.time_ns()) + 5_000_000_000
+        os.utime(self.config_path, ns=(self._tick, self._tick))
+
+    def proxy_status(self):
+        status, _, body = self.call("GET", "/_aigw/status", body=b"")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+
+class ProxyReloadTests(ConfigEditing, ProxyBase):
+    def test_idp_and_broker_keys_apply_in_place_without_a_restart(self):
+        self.rewrite(refresh_before=111, scope="openid offline_access other")
+        self.ps.check_config()
+        self.assertEqual((self.ps.cfg["refresh_before"], self.ps.cfg["scope"]), (111, "openid offline_access other"))
+        self.assertIs(self.ps.holder.cfg, self.ps.cfg, "the renewal loop must see the new values")
+        c = self.proxy_status()["config"]
+        self.assertEqual((c["restart_needed"], c["error"]), ([], ""))
+        self.assertGreater(c["reloaded_at"], 0)
+
+    def test_a_key_that_needs_a_restart_is_reported_and_not_applied(self):
+        old = self.ps.cfg["gateway_url"]
+        self.rewrite(gateway_url="http://127.0.0.1:9", refresh_before=222)
+        self.ps.check_config()
+        self.assertEqual(self.ps.cfg["gateway_url"], old)
+        self.assertEqual(self.ps.cfg["refresh_before"], 222)                 # the safe key in the same edit still applies
+        c = self.proxy_status()["config"]
+        self.assertEqual(c["restart_needed"], ["gateway_url"])
+        kind, text = A.proxy_config_state({"config": c}, self.config_path)
+        self.assertEqual(kind, "restart")
+        self.assertIn("gateway_url", text)
+        self.rewrite()                                                         # back to what the proxy runs with
+        self.ps.check_config()
+        self.assertEqual(self.proxy_status()["config"]["restart_needed"], [])
+
+    def test_a_file_that_does_not_load_changes_nothing_and_a_fix_clears_it(self):
+        before = dict(self.ps.cfg)
+        self.config_path.write_text("{ not json")
+        os.utime(self.config_path, ns=(time.time_ns() + 9_000_000_000,) * 2)
+        self.ps.check_config()
+        self.assertEqual(self.ps.cfg, before)
+        c = self.proxy_status()["config"]
+        self.assertTrue(c["error"])
+        self.assertEqual(A.proxy_config_state({"config": c}, self.config_path)[0], "invalid")
+        self.rewrite(refresh_before=333)
+        self.ps.check_config()
+        self.assertEqual((self.proxy_status()["config"]["error"], self.ps.cfg["refresh_before"]), ("", 333))
+
+    def test_it_notices_the_edit_by_itself(self):
+        with mock.patch.object(A.ProxyServer, "CONFIG_POLL", 0.05):
+            self.restart_proxy()
+        self.rewrite(refresh_before=444)
+        deadline = time.time() + 5
+        while self.ps.cfg["refresh_before"] != 444 and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.ps.cfg["refresh_before"], 444)
+
+    def test_the_control_channel_looks_at_the_file_first(self):
+        self.rewrite(refresh_before=555)                                       # the watcher polls every 2 s: not yet
+        self.assertGreater(self.proxy_status()["config"]["reloaded_at"], 0)
+        self.assertEqual(self.ps.cfg["refresh_before"], 555)
+
+    def test_the_request_log_is_resized_and_keeps_its_entries(self):
+        self.renew()
+        for i in range(3):
+            self.call(path=f"/v1/messages?i={i}")
+        self.rewrite(proxy_log_requests=2)
+        self.ps.check_config()
+        self.assertEqual(self.ps.recent.maxlen, 2)
+        self.assertLessEqual(len(self.ps.recent_requests(10)), 2)
+        self.rewrite(proxy_log_requests=0)
+        self.ps.check_config()
+        self.assertIsNone(self.ps.recent)
+
+    def test_changing_the_idp_then_signing_in_works_without_restarting_the_proxy(self):
+        """The failure this was built for: the proxy runs on one IdP, config.json moves to another, `login` follows."""
+        idp_b = FakeIdP()
+        self.addCleanup(idp_b.close)
+        self.renew()
+        self.rewrite(issuer=idp_b.url, broker_url=idp_b.url + "/exchange")
+        self.ps.check_config()
+        self.assertTrue(self.proxy_status()["config"]["signin_needed"])
+        self.assertEqual(A.proxy_config_state(self.proxy_status(), self.config_path)[0], "signin")
+        ok, _, msg = self.ps.holder.renew(force=True)                          # the old sign-in must not be sent to the new IdP
+        self.assertFalse(ok)
+        self.assertIn("belongs to", msg)
+        self.assertTrue(A.State(self.state_dir).get_refresh_token(), "the old token must survive")
+        self.assertEqual([c for c in idp_b.calls if c[0] == "POST"], [])
+        code, _, err = self.run_cli("login", "--device")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("expired", err)
+        self.assertTrue(self.ps.holder.usable(), err)
+        self.assertFalse(self.proxy_status()["config"]["signin_needed"])
+        self.assertEqual(A.State(self.state_dir).load()["idp"], A.idp_identity(self.ps.cfg))
+
+
+class ProxyConfigStateTests(unittest.TestCase):
+    def test_a_proxy_from_before_1_8_cannot_reload_so_a_newer_file_means_restart(self):
+        tmp = Path(tempfile.mkdtemp(prefix="aigw-cfgstate-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / "config.json"
+        path.write_text("{}")
+        started_10s_ago = {"uptime": 10}
+        os.utime(path, (time.time() + 60, time.time() + 60))                                # written after the proxy started
+        kind, text = A.proxy_config_state(started_10s_ago, path)
+        self.assertEqual(kind, "old")
+        self.assertIn("older than 1.8", text)
+        os.utime(path, (time.time() - 3600, time.time() - 3600))                            # written long before it started
+        self.assertEqual(A.proxy_config_state(started_10s_ago, path)[0], "ok")
+        self.assertEqual(A.proxy_config_state(started_10s_ago, tmp / "missing.json")[0], "ok")
+
+    def test_each_state_reads_as_a_sentence(self):
+        cases = {"invalid": {"error": "bad"}, "restart": {"restart_needed": ["proxy_listen"]}, "signin": {"signin_needed": True},
+                 "reloaded": {"reloaded_at": 1}, "ok": {}}
+        for kind, cfg in cases.items():
+            with self.subTest(kind=kind):
+                got, text = A.proxy_config_state({"config": dict({"error": "", "restart_needed": [], "reloaded_at": 0, "signin_needed": False}, **cfg)}, None)
+                self.assertEqual(got, kind)
+                self.assertEqual(bool(text), kind != "ok")
 
 
 class ProxyConfigTests(Base):
@@ -2805,9 +2986,21 @@ class ProxyConfigTests(Base):
         self.assertEqual(code, 1)
         self.assertIn("gateway_url", err)
 
-    def test_the_example_config_only_has_known_keys(self):
-        ex = json.loads((Path(A.__file__).resolve().parent / "config.example.json").read_text())
-        self.assertFalse(set(ex) - set(A.DEFAULTS))
+    def test_the_example_configs_only_have_known_keys(self):
+        for name in ("config.example.json", "config.proxy.example.json"):
+            with self.subTest(name=name):
+                ex = json.loads((Path(A.__file__).resolve().parent / name).read_text())
+                self.assertFalse(set(ex) - set(A.DEFAULTS))
+
+    def test_the_proxy_example_is_a_working_proxy_config_once_the_placeholders_are_filled_in(self):
+        ex = json.loads((Path(A.__file__).resolve().parent / "config.proxy.example.json").read_text())
+        self.assertEqual(ex["mode"], "proxy")
+        self.assertTrue(ex["gateway_url"] and ex["proxy_listen"])
+        filled = {k: (v.replace("<gateway host>", "gw.example.com") if k == "gateway_url" else v) for k, v in ex.items()}
+        self.config_path.write_text(json.dumps(filled))
+        cfg = A.load_config(self.config_path)
+        self.assertEqual((cfg["mode"], cfg["gateway_url"]), ("proxy", "https://gw.example.com"))
+        self.assertEqual(A.proxy_base_url(cfg), "http://127.0.0.1:18787")
 
 
 class ProxyUpstreamTests(unittest.TestCase):

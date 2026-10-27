@@ -74,7 +74,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -172,6 +172,63 @@ def load_config(path):
     if cfg["gateway_url"] and urllib.parse.urlsplit(str(cfg["gateway_url"])).scheme not in ("http", "https"):
         raise AuthError("gateway_url must be an http:// or https:// URL")
     return cfg
+
+
+# Config keys a running proxy applies in place when config.json changes: where the JWT comes from, not where the proxy listens
+# or forwards to. The rest (mode, proxy_listen, gateway_url, header, sentinel, secret_store) need a restart: a restart ends
+# the streaming responses of a live Claude Code session, so it is never done on its own.
+RELOAD_SAFE = frozenset(("issuer", "token_endpoint", "device_authorization_endpoint", "authorization_endpoint", "client_id", "scope",
+                         "idp_token", "broker_url", "token_command", "refresh_before", "hook_wait", "block_on_failure", "login_method",
+                         "hook_login", "device_unavailable_ttl", "notify", "redirect_uri", "redirect_port", "debug_until", "http_timeout",
+                         "hook_http_timeout", "proxy_log_requests")) & frozenset(DEFAULTS)
+
+
+def idp_identity(cfg):
+    """Which IdP and client a refresh token belongs to. A refresh token is useless (and rejected, then deleted) anywhere else."""
+    return f"{cfg['issuer'] or cfg['token_endpoint']}|{cfg['client_id']}"
+
+
+def idp_label(identity):
+    """The IdP part of an identity as a short host name for messages."""
+    where = identity.split("|", 1)[0]
+    return urllib.parse.urlsplit(where).netloc or where or "an unknown IdP"
+
+
+def file_sig(path):
+    """(mtime_ns, size) of a file, or None when it is not there."""
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except (OSError, TypeError):
+        return None
+
+
+def restart_hint():
+    if sys.platform == "darwin":
+        return "launchctl kickstart -k gui/$(id -u)/aigw-claude-auth"
+    if is_windows():
+        return "schtasks /End /TN aigw-claude-auth, then schtasks /Run /TN aigw-claude-auth"
+    return "systemctl --user restart aigw-claude-auth"
+
+
+def proxy_config_state(info, config_path):
+    """How a running proxy's settings relate to config.json, from its status answer: (kind, text). kind: ok, reloaded, restart,
+    invalid, signin or old. A proxy from before 1.8 reports nothing and cannot reload: compare its start with the file's mtime."""
+    c = info.get("config")
+    if c is None:
+        sig = file_sig(config_path)
+        if sig and sig[0] / 1e9 > time.time() - info.get("uptime", 0) + 1:
+            return "old", f"config.json changed after this proxy started, and a proxy older than 1.8 cannot reload it: restart it ({restart_hint()})"
+        return "ok", ""
+    if c.get("error"):
+        return "invalid", f"config.json changed but is not valid, so the proxy keeps its old settings: {c['error']}"
+    if c.get("restart_needed"):
+        return "restart", f"config.json changed: restart the proxy to apply {', '.join(c['restart_needed'])} ({restart_hint()})"
+    if c.get("signin_needed"):
+        return "signin", "the IdP settings changed, so the stored sign-in no longer fits: run `aigw-claude-auth login`"
+    if c.get("reloaded_at"):
+        return "reloaded", f"config.json reloaded at {time.strftime('%H:%M:%S', time.localtime(c['reloaded_at']))}, no restart needed"
+    return "ok", ""
 
 
 # --------------------------------------------------------------------------------------------- small helpers
@@ -782,6 +839,8 @@ class TokenSource:
             self.state.put_refresh_token(body["refresh_token"])     # store first; a rotation happens under sync's lock
         st = self.state.load()
         st["signed_in_at"] = st.get("signed_in_at") or int(time.time())
+        if self.got_refresh_token or "idp" not in st:
+            st["idp"] = idp_identity(self.cfg)                      # which IdP issued the refresh token that is stored now
         self.state.save(st)
         tok = body.get(self.cfg["idp_token"])
         if not tok:
@@ -792,6 +851,12 @@ class TokenSource:
         rt = self.state.get_refresh_token()
         if not rt:
             raise AuthError("not signed in to the gateway: run `aigw-claude-auth login`")
+        bound = self.state.load().get("idp")
+        if bound and bound != idp_identity(self.cfg):
+            # never send it to an IdP that did not issue it: that gets it rejected (invalid_grant) and then deleted
+            raise AuthError(f"the stored sign-in belongs to {idp_label(bound)}, but this process is configured for {idp_label(idp_identity(self.cfg))}. "
+                            f"If config.json changed after this process started, restart it ({restart_hint()}); "
+                            "if you moved to another IdP, run `aigw-claude-auth login`")
         status, body = self._token_request({"grant_type": "refresh_token", "refresh_token": rt, "scope": self.cfg["scope"]})
         if status == 200:
             return self._keep(body)
@@ -1667,6 +1732,7 @@ class JwtHolder:
         self.token = ""
         self.lock = threading.Lock()
         self.renewed_at = 0
+        self.renewed_ts = 0.0          # the same moment, not rounded to seconds: compared with the proxy's config reload
         self.last_error = ""
         self.retry_at = 0.0            # request path: no new attempt before this (monotonic), so an IdP outage costs one slow request
         self.last_forced = -1e9        # monotonic time of the last renewal forced by a refusal
@@ -1688,7 +1754,7 @@ class JwtHolder:
         left = seconds_left(new)
         if left < 60:
             return self._failed("refusing to use it: " + ("the new JWT has no exp claim" if left < 0 else f"the new JWT expires in {left}s"))
-        self.token, self.renewed_at, self.last_error = new, int(time.time()), ""
+        self.token, self.renewed_at, self.renewed_ts, self.last_error = new, int(time.time()), time.time(), ""
         try:
             debug_summary(self.cfg, self.state, new)
         except Exception:
@@ -1804,6 +1870,8 @@ class Upstream:
 class ProxyServer:
     """The Mode 2 proxy. start() binds and serves in a thread; stop() ends it."""
 
+    CONFIG_POLL = 2.0                   # seconds between looks at config.json (tests shorten it)
+
     def __init__(self, cfg, state, settings, access_log=None, renew_cooldown=10):
         if not cfg.get("gateway_url"):
             raise AuthError("proxy mode needs gateway_url in the config (the gateway the proxy forwards to)")
@@ -1825,6 +1893,52 @@ class ProxyServer:
         self.blocked_checked = 0.0
         self.signin_msg, self.signin_at = "", 0.0
         self.srv, self.port = None, 0
+        self.config_path = cfg.get("_config_path")
+        self.config_sig = file_sig(self.config_path)
+        self.reload_lock, self.stopping = threading.Lock(), threading.Event()
+        self.config_error, self.restart_needed, self.reloaded_at, self.signin_needed = "", [], 0.0, False
+
+    # -- config.json changes
+    def check_config(self):
+        """Look at config.json and, when it changed, apply the keys in RELOAD_SAFE in place. The others are only reported
+        (restart_needed). A file that does not load changes nothing: the old settings stay and config_error says why."""
+        if not self.config_path:
+            return
+        sig = file_sig(self.config_path)
+        with self.reload_lock:
+            if sig == self.config_sig:
+                return
+            self.config_sig = sig                               # also after a failure: one log line per change, not one per look
+            try:
+                new = load_config(Path(self.config_path))
+            except (AuthError, ValueError, OSError) as e:
+                self.config_error = str(e) or type(e).__name__
+                log(f"config.json changed but is not valid; keeping the old settings: {self.config_error}")
+                return
+            self.config_error = ""
+            before = idp_identity(self.cfg)
+            safe = [k for k in sorted(RELOAD_SAFE) if new.get(k) != self.cfg.get(k)]
+            for k in safe:
+                self.cfg[k] = new[k]
+            self.restart_needed = sorted(k for k in DEFAULTS if k not in RELOAD_SAFE and new.get(k) != self.cfg.get(k))
+            if "proxy_log_requests" in safe:
+                n = self.cfg["proxy_log_requests"]
+                with self.stats_lock:
+                    self.recent = collections.deque(self.recent or (), maxlen=n) if n > 0 else None
+            self.reloaded_at = time.time()
+            if idp_identity(self.cfg) != before:
+                self.signin_needed = True
+                log(f"config.json reloaded: the IdP is now {idp_label(idp_identity(self.cfg))}; sign in again with `aigw-claude-auth login`")
+            else:
+                log("config.json reloaded" + (f" (applied: {', '.join(safe)})" if safe else "") +
+                    (f"; restart the proxy to apply: {', '.join(self.restart_needed)}" if self.restart_needed else ""))
+
+    def _watch_config(self):
+        while not self.stopping.wait(self.CONFIG_POLL):
+            try:
+                self.check_config()
+            except Exception as e:                              # a bug here must not take the proxy down
+                log(f"config check failed: {type(e).__name__}: {e}")
 
     # -- local secret
     def authorized(self, given):
@@ -1889,7 +2003,9 @@ class ProxyServer:
                 "usable": self.holder.usable(), "seconds_left": seconds_left(tok) if tok else -1,
                 "renewed_at": self.holder.renewed_at, "last_error": self.holder.last_error, "last_outcome": self.last_outcome,
                 "blocked": self.blocked["id"] if self.blocked else "", "requests": dict(self.stats),
-                "kid": str(jwt_header(tok).get("kid", "")) if tok else "", "claims": status_claims(claims)}
+                "kid": str(jwt_header(tok).get("kid", "")) if tok else "", "claims": status_claims(claims),
+                "config": {"error": self.config_error, "restart_needed": list(self.restart_needed), "reloaded_at": int(self.reloaded_at),
+                           "signin_needed": self.signin_needed and self.holder.renewed_ts <= self.reloaded_at}}
 
     def inspect(self, show_claims=False):
         tok = self.holder.token
@@ -1904,6 +2020,7 @@ class ProxyServer:
         return {"rows": rows, "problems": problems}
 
     def control(self, method, path):
+        self.check_config()
         u = urllib.parse.urlsplit(path)
         name, q = u.path[len(CONTROL_PREFIX):], urllib.parse.parse_qs(u.query)
         if name == "status" and method == "GET":
@@ -1946,9 +2063,12 @@ class ProxyServer:
         self.port = self.srv.server_address[1]
         write_private(self.state.dir / "proxy.json", json.dumps({"pid": os.getpid(), "host": self.listen[0], "port": self.port}) + "\n")
         threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
+        if self.config_path:
+            threading.Thread(target=self._watch_config, daemon=True).start()
         return self.port
 
     def stop(self):
+        self.stopping.set()
         if self.srv:
             self.srv.shutdown()
             self.srv.server_close()
@@ -2356,6 +2476,9 @@ def cmd_status(a, cfg, state, settings):
                 rows.append(("last outcome", info["last_outcome"]))
             if info.get("last_error"):
                 rows.append(("last error", info["last_error"]))
+            ck, ct = proxy_config_state(info, cfg.get("_config_path"))
+            if ck != "ok":
+                rows.append(("config", ct))
         shown, kid = (info.get("claims", {}), info.get("kid", "")) if kind == "running" else ({}, "")
     else:
         rows.append(("jwt", fingerprint(settings.get()) if settings.get() != cfg["sentinel"] else "sentinel (no usable JWT)"))
@@ -3377,6 +3500,14 @@ def proxy_findings(ctx, url):
         out.append(finding("proxy-port-taken", "Error", f"something else is listening on {listen}: {info}", "free the port or set another proxy_listen (then run install)"))
     elif kind == "secret":
         out.append(finding("proxy-secret", "Error", info, "stop that proxy, or point proxy_listen at a free port"))
+    if kind == "running":
+        ck, ct = proxy_config_state(info, cfg.get("_config_path"))
+        if ck in ("restart", "old"):
+            out.append(finding("proxy-config", "Warning", ct, f"restart the proxy: {restart_hint()}"))
+        elif ck == "invalid":
+            out.append(finding("proxy-config", "Warning", ct, "fix config.json; the proxy picks the fix up by itself"))
+        elif ck == "signin":
+            out.append(finding("proxy-config", "Warning", ct, "aigw-claude-auth login"))
     if "ANTHROPIC_CUSTOM_HEADERS" not in ctx_env(ctx, "managed"):       # a managed value is the managed-custom-headers finding
         want, have = proxy_secret(state), ctx["settings"].get_line(LOCAL_HEADER, ctx["user"])
         if not have or (want and have != want):

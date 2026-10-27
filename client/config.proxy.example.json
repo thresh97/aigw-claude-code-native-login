@@ -1,0 +1,11 @@
+{
+  "issuer": "https://<idp issuer>",
+  "client_id": "<public client app id>",
+  "scope": "openid offline_access <broker or gateway scope>",
+  "idp_token": "access_token",
+  "broker_url": "https://<broker>/token/exchange",
+  "mode": "proxy",
+  "proxy_listen": "127.0.0.1:18787",
+  "gateway_url": "https://<gateway host>",
+  "proxy_log_requests": 100
+}
