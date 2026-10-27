@@ -121,10 +121,16 @@ EOF
     curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/v1/messages -H "x-aigw-local: $SECRET" -d '{}' | grep -q 200 && ok "the proxy still forwards to the old gateway_url (not applied)" || bad "the proxy still forwards to the old gateway_url"
     cp /tmp/config.orig $CFG; chown $U:$U $CFG
     waitfor "^config +config.json reloaded" && ! cli status --offline 2>&1 | grep -q "restart the proxy to apply" && ok "restoring gateway_url clears the restart notice" || bad "restoring gateway_url clears the restart notice"
+    # an edit that keeps size and timestamp (rsync -t, cp -p, touch -r): the content hash and the per-key fingerprints still see it
+    cp -p $CFG /tmp/cfg.stamp; sed -i 's/:19099/:19097/' $CFG; touch -r /tmp/cfg.stamp $CFG
+    [ "$(stat -c '%s %Y' $CFG)" = "$(stat -c '%s %Y' /tmp/cfg.stamp)" ] && ok "(the edit kept the file's size and mtime)" || bad "(the edit kept the file's size and mtime)"
+    waitfor "^config +config.json changed: restart the proxy to apply gateway_url" && ok "a same-size, same-mtime edit is still noticed" || bad "a same-size, same-mtime edit is still noticed"
+    cp /tmp/config.orig $CFG; chown $U:$U $CFG
+    waitfor "^config +config.json reloaded" && ! cli status --offline 2>&1 | grep -q "restart the proxy to apply" && ok "restoring it clears the notice" || bad "restoring it clears the notice"
     printf '{ not json' > $CFG; chown $U:$U $CFG
-    # every CLI command loads config.json first, so `status` cannot run now (doctor can); ask the proxy itself and read its log
-    for _ in $(seq 1 12); do curl -s -H "x-aigw-local: $SECRET" http://127.0.0.1:18787/_aigw/status | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["config"]["error"] else 1)' 2>/dev/null && break; sleep 1; done
-    curl -s -H "x-aigw-local: $SECRET" http://127.0.0.1:18787/_aigw/status | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["config"]["error"] else 1)' && ok "the proxy refuses an invalid config.json and reports the error" || bad "the proxy refuses an invalid config.json and reports the error"
+    waitfor "^config +.*does not load" && ok "status still runs when config.json does not load, and says so" || bad "status still runs when config.json does not load, and says so"
+    waitfor "^proxy +running on .*still on its old settings" && ok "status still reports the running proxy" || bad "status still reports the running proxy"
+    waitfor "^proxy config +config.json changed but is not valid" && ok "the proxy refuses an invalid config.json and says so" || bad "the proxy refuses an invalid config.json and says so"
     asuser journalctl --user -u aigw-claude-auth --no-pager -n 30 2>/dev/null | grep -q "not valid; keeping the old settings" && ok "the proxy log says it kept the old settings" || bad "the proxy log says it kept the old settings"
     CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/v1/messages -H "x-aigw-local: $SECRET" -d '{}'); [ "$CODE" = 200 ] && ok "requests still work with the old settings" || bad "requests still work with the old settings ($CODE)"
     cp /tmp/config.orig $CFG; chown $U:$U $CFG

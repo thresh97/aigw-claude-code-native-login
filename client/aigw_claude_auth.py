@@ -74,7 +74,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 MARKER = re.compile(r"aigw[-_]claude[-_]auth")   # identifies our hook entries in a settings file
 HOOK_TIMEOUT = 30   # written into our hook entries; Claude Code's default is also 30 s (observed with 2.1.286)
 
@@ -147,7 +147,12 @@ def default_settings_path():
 def load_config(path):
     cfg = dict(DEFAULTS)
     if path.exists():
-        user = json.loads(path.read_text())
+        try:
+            user = json.loads(path.read_text())
+        except ValueError as e:                                 # a hand-edited file: a message, not a traceback
+            raise AuthError(f"{path} is not valid JSON: {e}")
+        if not isinstance(user, dict):
+            raise AuthError(f"{path} must hold a JSON object")
         unknown = set(user) - set(DEFAULTS)
         if unknown:
             raise AuthError(f"unknown keys in {path}: {', '.join(sorted(unknown))}")
@@ -203,6 +208,21 @@ def file_sig(path):
         return None
 
 
+def file_digest(path):
+    """sha256 of a file's content, or None when it is not there. Change detection must not trust timestamps: rsync -t, cp -p, a
+    coarse file system clock or touch -r change the content and leave stat() as it was. The files are tiny."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except (OSError, TypeError):
+        return None
+
+
+def config_fingerprint(cfg):
+    """{key: short hash of its value} for every config key. Lets `status` compare a running proxy's settings with the file on
+    disk without the proxy sending any value (token_command may hold a secret)."""
+    return {k: hashlib.sha256(json.dumps(cfg.get(k), sort_keys=True, default=str).encode()).hexdigest()[:10] for k in DEFAULTS}
+
+
 def restart_hint():
     if sys.platform == "darwin":
         return "launchctl kickstart -k gui/$(id -u)/aigw-claude-auth"
@@ -211,9 +231,11 @@ def restart_hint():
     return "systemctl --user restart aigw-claude-auth"
 
 
-def proxy_config_state(info, config_path):
+def proxy_config_state(info, config_path, cfg=None):
     """How a running proxy's settings relate to config.json, from its status answer: (kind, text). kind: ok, reloaded, restart,
-    invalid, signin or old. A proxy from before 1.8 reports nothing and cannot reload: compare its start with the file's mtime."""
+    invalid, signin or old. With cfg (the file as this process just read it), the proxy's per-key fingerprints are compared with it,
+    so memory against disk is a direct comparison and no timestamp is involved. A proxy from before 1.8 reports nothing and cannot
+    reload: compare its start with the file's mtime."""
     c = info.get("config")
     if c is None:
         sig = file_sig(config_path)
@@ -222,8 +244,9 @@ def proxy_config_state(info, config_path):
         return "ok", ""
     if c.get("error"):
         return "invalid", f"config.json changed but is not valid, so the proxy keeps its old settings: {c['error']}"
-    if c.get("restart_needed"):
-        return "restart", f"config.json changed: restart the proxy to apply {', '.join(c['restart_needed'])} ({restart_hint()})"
+    differ = sorted(k for k, h in config_fingerprint(cfg).items() if c["keys"].get(k) != h) if cfg is not None and c.get("keys") else []
+    if differ or c.get("restart_needed"):
+        return "restart", f"config.json changed: restart the proxy to apply {', '.join(differ or c['restart_needed'])} ({restart_hint()})"
     if c.get("signin_needed"):
         return "signin", "the IdP settings changed, so the stored sign-in no longer fits: run `aigw-claude-auth login`"
     if c.get("reloaded_at"):
@@ -1894,7 +1917,7 @@ class ProxyServer:
         self.signin_msg, self.signin_at = "", 0.0
         self.srv, self.port = None, 0
         self.config_path = cfg.get("_config_path")
-        self.config_sig = file_sig(self.config_path)
+        self.config_sig = file_digest(self.config_path)
         self.reload_lock, self.stopping = threading.Lock(), threading.Event()
         self.config_error, self.restart_needed, self.reloaded_at, self.signin_needed = "", [], 0.0, False
 
@@ -1904,7 +1927,7 @@ class ProxyServer:
         (restart_needed). A file that does not load changes nothing: the old settings stay and config_error says why."""
         if not self.config_path:
             return
-        sig = file_sig(self.config_path)
+        sig = file_digest(self.config_path)
         with self.reload_lock:
             if sig == self.config_sig:
                 return
@@ -2005,6 +2028,7 @@ class ProxyServer:
                 "blocked": self.blocked["id"] if self.blocked else "", "requests": dict(self.stats),
                 "kid": str(jwt_header(tok).get("kid", "")) if tok else "", "claims": status_claims(claims),
                 "config": {"error": self.config_error, "restart_needed": list(self.restart_needed), "reloaded_at": int(self.reloaded_at),
+                           "keys": config_fingerprint(self.cfg),
                            "signin_needed": self.signin_needed and self.holder.renewed_ts <= self.reloaded_at}}
 
     def inspect(self, show_claims=False):
@@ -2476,7 +2500,7 @@ def cmd_status(a, cfg, state, settings):
                 rows.append(("last outcome", info["last_outcome"]))
             if info.get("last_error"):
                 rows.append(("last error", info["last_error"]))
-            ck, ct = proxy_config_state(info, cfg.get("_config_path"))
+            ck, ct = proxy_config_state(info, cfg.get("_config_path"), cfg)
             if ck != "ok":
                 rows.append(("config", ct))
         shown, kid = (info.get("claims", {}), info.get("kid", "")) if kind == "running" else ({}, "")
@@ -2493,6 +2517,30 @@ def cmd_status(a, cfg, state, settings):
     for k, v in rows:
         print(f"{k:12} {v}")
     return 0
+
+
+def cmd_status_unloadable(cdir, config_path, err):
+    """`status` when config.json does not load, like `doctor` it still has to work: say so, and still ask a running proxy what it
+    holds (it keeps running on its old settings). The proxy is found through proxy.json, which needs no config."""
+    rows = [("version", VERSION), ("config", f"{config_path} does not load: {err}")]
+    try:
+        where = json.loads((cdir / "proxy.json").read_text(encoding="utf-8"))
+        code, body = control_call(where["host"], int(where["port"]), proxy_secret(State(cdir)), "GET", CONTROL_PREFIX + "status", 3)
+    except (OSError, ValueError, KeyError, http.client.HTTPException):
+        code, body = 0, {}
+    if code == 200 and isinstance(body, dict) and body.get("mode") == "proxy":
+        rows.append(("proxy", f"running on {body.get('listen')}, pid {body.get('pid')}, up {body.get('uptime')}s, still on its old settings"))
+        rows.append(("jwt", (body.get("jwt") or "none") + " (in the proxy's memory)"))
+        for k, v in (body.get("claims") or {}).items():
+            rows.append((f"jwt {k}", str(v)))
+        ck, ct = proxy_config_state(body, config_path)
+        if ck != "ok":
+            rows.append(("proxy config", ct))
+    else:
+        rows.append(("proxy", "not reachable (no running proxy found through proxy.json)"))
+    for k, v in rows:
+        print(f"{k:12} {v}")
+    return 1
 
 
 def cmd_requests(a, cfg, state, settings):
@@ -3501,7 +3549,7 @@ def proxy_findings(ctx, url):
     elif kind == "secret":
         out.append(finding("proxy-secret", "Error", info, "stop that proxy, or point proxy_listen at a free port"))
     if kind == "running":
-        ck, ct = proxy_config_state(info, cfg.get("_config_path"))
+        ck, ct = proxy_config_state(info, cfg.get("_config_path"), cfg)
         if ck in ("restart", "old"):
             out.append(finding("proxy-config", "Warning", ct, f"restart the proxy: {restart_hint()}"))
         elif ck == "invalid":
@@ -3832,7 +3880,13 @@ def main(argv=None):
             return cmd_task(a, None, None, None)
         if a.cmd == "doctor":                                   # must work when the config itself is broken
             return cmd_doctor(a, a.config or cdir / "config.json", State(cdir), a.settings)
-        cfg = load_config(a.config or cdir / "config.json")
+        config_path = a.config or cdir / "config.json"
+        try:
+            cfg = load_config(config_path)
+        except (AuthError, ValueError) as e:
+            if a.cmd == "status":                               # like doctor, it has to work when the config itself is broken
+                return cmd_status_unloadable(cdir, config_path, e)
+            raise
         cfg["_config_path"] = str((a.config or cdir / "config.json").resolve())   # for the hook's background sign-in
         state = State(cdir)
         state.store = make_store(cfg, cdir)

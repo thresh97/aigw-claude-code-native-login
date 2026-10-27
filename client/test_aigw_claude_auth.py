@@ -2780,6 +2780,29 @@ class ProxyStatusCliTests(SettlesRecords, ProxyBase):
         self.assertEqual(found["proxy-config"]["severity"], "Warning")
         self.assertIn("restart the proxy", found["proxy-config"]["fix"])
 
+    def test_status_compares_the_proxy_with_the_file_whatever_the_timestamps_say(self):
+        self.renew()
+        before = os.stat(self.config_path)
+        port = self.gw.url.rsplit(":", 1)[1]
+        with mock.patch.object(self.ps, "check_config"):                      # the proxy has not noticed anything
+            self.config_path.write_text(self.config_path.read_text().replace(self.gw.url, "http://127.0.0.1:" + "9" * len(port)))
+            os.utime(self.config_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = os.stat(self.config_path)
+            self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+            code, out, err = self.run_cli("status", "--offline")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"config\s+config.json changed: restart the proxy to apply gateway_url")
+
+    def test_status_still_works_when_config_json_does_not_load(self):
+        self.renew()
+        self.config_path.write_text("{ not json")
+        code, out, err = self.run_cli("status")
+        self.assertEqual(code, 1, err)
+        self.assertRegex(out, r"config\s+.*does not load")
+        self.assertRegex(out, r"proxy\s+running on .*still on its old settings")
+        self.assertRegex(out, r"proxy config\s+config.json changed but is not valid")
+        self.assertRegex(out, r"jwt\s+len \d+")
+
     def test_status_is_quiet_when_nothing_changed(self):
         self.renew()
         code, out, _ = self.run_cli("status", "--offline")
@@ -2828,6 +2851,21 @@ class IdpBindingTests(Base):
         self.assertNotIn("idp", state.load())                   # sign_in() writes a bare refresh token, like a state from before 1.8
         A.TokenSource(cfg, state).refresh()
         self.assertEqual(state.load()["idp"], A.idp_identity(cfg))
+
+
+class StatusBrokenConfigTests(Base):
+    def test_without_a_proxy_status_still_says_what_is_wrong(self):
+        self.config_path.write_text("{ not json")
+        code, out, err = self.run_cli("status")
+        self.assertEqual(code, 1, err)
+        self.assertRegex(out, r"config\s+.*does not load")
+        self.assertRegex(out, r"proxy\s+not reachable")
+
+    def test_other_commands_still_fail_on_a_config_that_does_not_load(self):
+        self.config_path.write_text("{ not json")
+        code, _, err = self.run_cli("requests")
+        self.assertEqual(code, 1)
+        self.assertTrue(err.strip())
 
 
 class ConfigEditing:
@@ -2891,6 +2929,18 @@ class ProxyReloadTests(ConfigEditing, ProxyBase):
             time.sleep(0.05)
         self.assertEqual(self.ps.cfg["refresh_before"], 444)
 
+    def test_an_edit_that_keeps_size_and_timestamp_is_still_noticed(self):
+        """rsync -t, cp -p, a coarse file system clock or a deliberate touch -r: the content changed, stat() did not."""
+        self.configure(refresh_before=100)
+        self.restart_proxy()
+        before = os.stat(self.config_path)
+        self.config_path.write_text(self.config_path.read_text().replace('"refresh_before": 100', '"refresh_before": 200'))
+        os.utime(self.config_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = os.stat(self.config_path)
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.ps.check_config()
+        self.assertEqual(self.ps.cfg["refresh_before"], 200)
+
     def test_the_control_channel_looks_at_the_file_first(self):
         self.rewrite(refresh_before=555)                                       # the watcher polls every 2 s: not yet
         self.assertGreater(self.proxy_status()["config"]["reloaded_at"], 0)
@@ -2944,6 +2994,24 @@ class ProxyConfigStateTests(unittest.TestCase):
         os.utime(path, (time.time() - 3600, time.time() - 3600))                            # written long before it started
         self.assertEqual(A.proxy_config_state(started_10s_ago, path)[0], "ok")
         self.assertEqual(A.proxy_config_state(started_10s_ago, tmp / "missing.json")[0], "ok")
+
+    def test_fingerprints_follow_values_and_hold_none(self):
+        cfg = dict(A.DEFAULTS, token_command="echo super-secret-value", gateway_url="https://gw.example.com")
+        fp = A.config_fingerprint(cfg)
+        self.assertEqual(set(fp), set(A.DEFAULTS))
+        self.assertNotIn("super-secret", json.dumps(fp))
+        self.assertNotIn("gw.example.com", json.dumps(fp))
+        self.assertEqual(fp, A.config_fingerprint(dict(cfg)))
+        other = A.config_fingerprint(dict(cfg, gateway_url="https://other.example.com"))
+        self.assertEqual({k for k in fp if fp[k] != other[k]}, {"gateway_url"})
+
+    def test_the_proxys_fingerprints_are_compared_with_the_file_as_read(self):
+        mem = dict(A.DEFAULTS, gateway_url="https://old.example.com", proxy_listen="127.0.0.1:18787")
+        info = {"config": {"error": "", "restart_needed": [], "reloaded_at": 0, "signin_needed": False, "keys": A.config_fingerprint(mem)}}
+        self.assertEqual(A.proxy_config_state(info, None, dict(mem))[0], "ok")
+        kind, text = A.proxy_config_state(info, None, dict(mem, gateway_url="https://new.example.com", proxy_listen="127.0.0.1:18788"))
+        self.assertEqual(kind, "restart")
+        self.assertIn("gateway_url, proxy_listen", text)
 
     def test_each_state_reads_as_a_sentence(self):
         cases = {"invalid": {"error": "bad"}, "restart": {"restart_needed": ["proxy_listen"]}, "signin": {"signin_needed": True},
