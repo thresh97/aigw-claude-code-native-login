@@ -1,5 +1,7 @@
 # Roadmap (draft)
 
+> **Not a product, not official, no warranty, no support.** Art-of-the-possible example for learning and enablement, not endorsed by Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta or any other vendor named. Use at your own risk; see the [README](../README.md).
+
 **Status: planning notes, not commitments.** Written 2026-10-27. Nothing here is built; each claim about the gateway is either marked as
 read from a document or measured elsewhere, and is to be re-tested here before it goes into the [findings](evidence/findings.md).
 Everything about the gateway is verified by test and documented before it is relied on; until then it is a lead.

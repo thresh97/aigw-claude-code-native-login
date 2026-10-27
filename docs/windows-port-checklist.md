@@ -1,5 +1,7 @@
 # Windows port checklist (Phase 2 input)
 
+> **Not a product, not official, no warranty, no support.** Art-of-the-possible example for learning and enablement, not endorsed by Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta or any other vendor named. Use at your own risk; see the [README](../README.md).
+
 These POSIX-only or non-portable spots were found by reading the code while the S7 probe (`repro/winprobe.py`) was built
 on 2026-10-25. None of them has been tried on Windows yet. Line numbers are as of commit `218c030`.
 

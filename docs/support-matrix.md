@@ -1,5 +1,7 @@
 # Support matrix and compatibility policy
 
+> **Not a product, not official, no warranty, no support.** Art-of-the-possible example for learning and enablement, not endorsed by Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta or any other vendor named. Use at your own risk; see the [README](../README.md).
+
 Last reviewed: 2026-10-26 · Current client: 1.10.0 (`client/aigw_claude_auth.py`, `VERSION`)
 
 The client depends on Claude Code behavior that nobody promises to keep: how soon `settings.json` is re-read, what a hook may

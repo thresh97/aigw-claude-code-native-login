@@ -1,5 +1,7 @@
 # Fleet deployment (pilot / administrator preview)
 
+> **Not a product, not official, no warranty, no support.** Art-of-the-possible example for learning and enablement, not endorsed by Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta or any other vendor named. Use at your own risk; see the [README](../README.md).
+
 > **Status: pilot.** This is a way to try rolling `aigw-claude-auth` out to many machines. It is not the supported baseline: the
 > per-user install in the [README](../README.md) is. Nothing here has run on a real fleet, the packages are unsigned, and some paths are
 > untested. Read "What to expect" before you plan around it.

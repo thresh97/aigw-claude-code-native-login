@@ -1,5 +1,7 @@
 # Design: aigw-claude-auth v2 (gateway JWT for Claude Code)
 
+> **Not a product, not official, no warranty, no support.** Art-of-the-possible example for learning and enablement, not endorsed by Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta or any other vendor named. Use at your own risk; see the [README](../README.md).
+
 Oct 25, 2026 · @Matt Harms
 
 > **Historical document: the v2 design and decision record, not the current specification.** It was written on 2026-10-25, when the client was

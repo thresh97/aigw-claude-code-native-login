@@ -1,5 +1,9 @@
 # aigw-claude-code-native-login
 
+> **Read this first: not a product, not official, no warranty, no support.**
+> This repository is an art-of-the-possible example for learning and enablement. It is **not** a product, and it is **not** an official or endorsed project of Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta, or any other vendor or product named here. Those names are used only to describe what the example works with, and they belong to their owners.
+> It comes **as is, with no warranty and no support**, and it is not a recommended or supported production design. Test it yourself, and use it at your own risk, under the [MIT License](LICENSE).
+
 Claude Code CLI users who sign in with their own Anthropic account (`claude login`, for example a Claude Enterprise seat) can still go through an AI Gateway, so the gateway sees, logs, guards and attributes every request. **This is for organizations that want to govern Claude Code use without giving up the user's own Anthropic identity:** the users' Anthropic plan stays the billing and policy anchor, and the gateway adds identity, attribution, logging and guardrails on top, with no long-lived gateway API key handed to anyone.
 
 **Two credentials travel on every request.** Claude Code keeps sending the user's Anthropic login in `Authorization: Bearer`, and the gateway passes it through to Anthropic, which bills and limits the user as usual. The gateway identifies and attributes the person by a short-lived JWT in a second header, `x-portkey-api-key`, issued through your identity provider (IdP). That JWT is what the gateway authenticates. (A gateway API key in the same header is the alternative, with different trade-offs: [Without a JWT](#without-a-jwt-gateway-api-keys).)
@@ -17,8 +21,6 @@ Pick one under "Choose a mode" in [1.3 Client, per user](#13-client-per-user). (
 2. **Fleet (pilot / administrator preview).** Distribute the same model centrally, with managed settings and packages. Read [docs/fleet-deployment.md](docs/fleet-deployment.md) first: it says what is and isn't ready, including that proxy mode is one user per machine.
 
 How it works today: [docs/architecture.md](docs/architecture.md). What has been tested, on which versions: [docs/support-matrix.md](docs/support-matrix.md).
-
-> **Disclaimer:** This is a simple, art-of-the-possible example. It is **not** an official Palo Alto Networks, Portkey or Anthropic project, it is **not** a recommended or supported production design, and it comes with **no support**. Use it at your own risk, under the [MIT License](LICENSE).
 
 **File mode.** The JWT sits in Claude Code's settings; an optional load balancer rule answers a missing JWT with a 498.
 

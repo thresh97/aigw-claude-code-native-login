@@ -1,5 +1,7 @@
 # Architecture (current)
 
+> **Not a product, not official, no warranty, no support.** Art-of-the-possible example for learning and enablement, not endorsed by Palo Alto Networks, Portkey, Anthropic, Microsoft, Okta or any other vendor named. Use at your own risk; see the [README](../README.md).
+
 This is the source of truth for how the client works today: the two credentials, the two client modes, the defaults, the platforms
 and what lives in this repository. For the reasoning behind the design see [design-v2.md](design-v2.md) (a historical record, not a
 specification). For the evidence behind a claim see [evidence](evidence/README.md); for what has been run on which versions, the
