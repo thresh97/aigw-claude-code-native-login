@@ -96,6 +96,7 @@ This repository keeps only a short [Okta page](../gateway/okta.md) and the porta
 | Set it up for one user, or understand the commands and config | [README](../README.md) |
 | Roll it out to a fleet | [fleet-deployment.md](fleet-deployment.md) |
 | Know what was tested, and on what | [support-matrix.md](support-matrix.md) |
+| Put the Claude desktop app behind the gateway with the user's own token (observed on one machine), and troubleshoot it | [desktop.md](desktop.md) |
 | Check a claim, or rerun the evidence | [evidence/](evidence/README.md) |
 | Understand why it is built this way | [design-v2.md](design-v2.md) (history) |
 | Change the code or release | [AGENTS.md](../AGENTS.md), `tools/release_check.py` |
