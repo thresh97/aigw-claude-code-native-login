@@ -77,15 +77,15 @@ unit on Linux and a Task Scheduler task on Windows.
 | Path | What | Status |
 |---|---|---|
 | `client/` | `aigw_claude_auth.py` and its tests, example configs, service templates | Supported core |
-| `gateway/` | The passthrough config and the load balancer rules (file mode) | Examples |
+| `gateway/` | The passthrough config, the load balancer rules (file mode) and a short Okta page | Examples |
 | `repro/` | The reproducibility harness: fake IdP, mock gateway, scenarios, `WINDOWS.md` | Test kit |
 | `packaging/` | Fleet packages (macOS `.pkg`, `.deb`, `.rpm`, a Windows installer), the Linux systemd smoke test | Pilot / administrator preview: see the [fleet guide](fleet-deployment.md) |
 | `docs/` | This page, the support matrix, the evidence, the fleet guide, the historical design | Documentation |
 | `tools/` | The release gate | Maintainer tool |
 
-Two things that used to live here are separate services with their own lifecycle: the Okta token inline hook
-(`idp-okta-webhook-custom-claims`) and the Azure Windows test VM (`azure-win-vm-ssh`). Until that move is merged they are still under
-`gateway/okta-token-hook/` and `infra/windows-test-vm/`; in either case this repository only links to them.
+Two things that used to live here are separate, independently owned repositories with their own lifecycle: the Okta token inline hook
+([idp-okta-webhook-custom-claims](https://github.com/thresh97/idp-okta-webhook-custom-claims)) and the Azure Windows test VM ([azure-win-vm-ssh](https://github.com/thresh97/azure-win-vm-ssh)).
+This repository keeps only a short [Okta page](../gateway/okta.md) and the portable Windows test protocol (`repro/WINDOWS.md`), and links to them.
 
 ## Where to read next
 

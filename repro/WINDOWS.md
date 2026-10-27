@@ -65,7 +65,7 @@ Read `hook_<form>_as_intended=no` with the `_argv` next to it: for `back\slash` 
 `backslash` means a POSIX-style shell (Git Bash) ate it; for `%WINPROBE_VAR%` a literal `%WINPROBE_VAR%` means no cmd.exe
 expansion, and `$WINPROBE_VAR` expanding means a POSIX shell or PowerShell.
 
-To build the VM with Terraform on Azure, see `infra/windows-test-vm/README.md`.
+A throwaway Azure VM for this protocol (Terraform, SSH and RDP) is kept in its own repository, [azure-win-vm-ssh](https://github.com/thresh97/azure-win-vm-ssh). It is one optional place to run the protocol; any Windows 11 machine with the steps above will do.
 
 ## Running the offline scenarios: `run.py`
 
