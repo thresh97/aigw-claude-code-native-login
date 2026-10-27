@@ -4,12 +4,17 @@ Claude Code CLI users who sign in with their own Anthropic account (`claude logi
 
 **Two credentials travel on every request.** Claude Code keeps sending the user's Anthropic login in `Authorization: Bearer`, and the gateway passes it through to Anthropic, which bills and limits the user as usual. The gateway identifies and attributes the person by a short-lived JWT in a second header, `x-portkey-api-key`, issued through your identity provider (IdP). That JWT is what the gateway authenticates. (A gateway API key in the same header is the alternative, with different trade-offs: [Without a JWT](#without-a-jwt-gateway-api-keys).)
 
-This repository ships a small client, `aigw-claude-auth` (one Python file, standard library only), that gets that JWT from your IdP, directly or through a token broker, and keeps it fresh. It also makes gateway auth failures fail fast: without it, a gateway 401 sends a logged-in Claude Code into its own Anthropic OAuth refresh-and-retry loop for several minutes. It runs in one of two modes, set by `mode` in its config. **File mode** (the default) writes the JWT into Claude Code's `settings.json` and renews it from hooks and an optional background daemon. **Proxy mode** runs a small local proxy on `127.0.0.1` that adds the JWT to every request and keeps it in memory, so no token sits in a settings file; a background service keeps the proxy running. Pick one under "Choose a mode" in [1.3 Client, per user](#13-client-per-user). (These are not Portkey's "Mode A" and "Mode B", which describe what the JWT carries: see [What you need](#what-you-need).)
+**Two client modes.** This repository ships a small client, `aigw-claude-auth` (one Python file, standard library only). It gets the JWT from your IdP, directly or through a token broker, keeps it fresh, and makes gateway auth failures fail fast: without it, a gateway 401 sends a logged-in Claude Code into its own Anthropic OAuth refresh-and-retry loop for several minutes. It does that in one of two ways, set by `mode` in its config:
 
-**Two ways to deploy it, from the same model.**
+1. **File mode (the default).** The JWT is written into Claude Code's `settings.json`. Hooks renew it before a prompt that needs it, and an optional background daemon renews it ahead of expiry. It needs no local service to be correct, and several users on one machine work on macOS and Linux (untested on Windows). An optional load balancer rule can answer "no usable JWT" with a 498.
+2. **Proxy mode.** A small local proxy on `127.0.0.1` adds the JWT to every request and keeps it in memory, so no token sits in a settings file. It answers 498 itself when it has no JWT or the gateway refuses it, so it needs no load balancer rule. It needs a background service (`install` sets it up) and supports one user per machine.
+
+Pick one under "Choose a mode" in [1.3 Client, per user](#13-client-per-user). (These are not Portkey's "Mode A" and "Mode B", which describe what the JWT carries: see [What you need](#what-you-need).)
+
+**Two ways to deploy it, from the same model.** Either client mode works in either path.
 
 1. **Pilot or per-user (the supported baseline).** Set up the gateway, register an IdP app, install the client for each user, who signs in once. Start at [What you need](#what-you-need), then [1. Build](#1-build).
-2. **Fleet (pilot / administrator preview).** Distribute the same model centrally, with managed settings and packages. Read [docs/fleet-deployment.md](docs/fleet-deployment.md) first: it says what is and isn't ready.
+2. **Fleet (pilot / administrator preview).** Distribute the same model centrally, with managed settings and packages. Read [docs/fleet-deployment.md](docs/fleet-deployment.md) first: it says what is and isn't ready, including that proxy mode is one user per machine.
 
 How it works today: [docs/architecture.md](docs/architecture.md). What has been tested, on which versions: [docs/support-matrix.md](docs/support-matrix.md).
 
