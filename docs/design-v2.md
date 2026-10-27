@@ -554,7 +554,7 @@ The repo answered three of the original seven spikes; the remaining ones, plus t
 | S7 | Native Windows: hook shell and quoting, settings file locking by Claude Code, toast delivery from a hook | Answered: hooks run under Git Bash when Git for Windows is installed and under Windows PowerShell 5.1 when it isn't, so hook commands must parse in both (`powershell -NoProfile -Command "& '...'"` or `py -3 "..."`; today's `shlex.quote` form fails under PowerShell). Claude Code doesn't hold `settings.json` open: no PermissionError in 60 replacements, pickup 1.3 to 1.8 s. A PowerShell 5.1 WinRT toast from a hook appears in about 1 s (README finding 17) | `winprobe`; then the Windows port of the offline scenarios |
 | S8 | SaaS gateway: Mode A only, `config_id`, hooks-only behavior | Open (reported, untested) | Run `gateway` and `live_login` scenarios against SaaS |
 | S9 | Mode B (plain IdP token, hybrid only) | Open | `client_live` with an empty `broker_url` |
-| S10 | Okta, Keycloak and Ping profiles, including Mode A claims straight from the IdP | Open | `client_live` per IdP; Keycloak in Docker for CI |
+| S10 | Okta, Keycloak and Ping profiles, including Mode A claims straight from the IdP | Open | `client_live` per IdP; Keycloak in Docker |
 | S11 | Mode 2 proxy: can Claude Code use a socket base URL? Does a proxy 498 behave like the LB's? | Answered: no socket base URL form works (`unix://`, `http+unix://`, `http://unix:...:/`); the undocumented `ANTHROPIC_UNIX_SOCKET` env var works from the process environment (not from `settings.json` `env`) but is meant for sessions with `CLAUDE_CODE_OAUTH_TOKEN`, so stay on loopback TCP. A proxy 498 behaves like the LB's: 1 attempt, shown at once, with an env-token login and with a stored login, which is left untouched (README findings 12 to 14) | `proxy`, `stored_login_proxy` |
 | S12 | 403 and 407 with a stored login | Open | `stored_login` |
 | S13 | macOS live scenarios, `claude -p` while signed out, device code expiry | Open | Run by hand |
@@ -583,7 +583,7 @@ Phases are ordered, not dated; dates need an owner and staffing. The Windows por
    - Gate: all offline scenarios pass on Windows. **Passed 2026-10-26** (client 1.2.0, Windows 11 24H2, Claude Code 2.1.310, `repro/run.py`): `unit headers errors precheck stopfailure proxy` all PASS; the proxy's 7 Unix-socket checks are SKIP (no `AF_UNIX`). Hooks are written in exec form on Windows (finding 17).
 3. **Credential store, sign-in method selection, `doctor`, `inspect`.** Refresh token out of `state.json`; `login_method` precedence, remembered method, in-session PKCE and `--paste`, learned `device_unavailable`; managed-settings findings; full JWT interpretation.
    - Gate: one passing `managed` case per `doctor` finding; sign-in matrix tests pass with the device grant disabled; no secrets in any output. **Passed 2026-10-26 with client 1.3.0, with one gap:** `managed` PASS (77 observations, 19 cases; README finding 19); the sign-in matrix and the FakeIdP runs with the device grant disabled pass on macOS and Windows; tests assert no token in `status`, `inspect` and `doctor` output. The gap: 8 findings have a `managed` case; the rest can't be set up through a managed file (for example an unparseable one stops Claude Code) and have unit tests only.
-4. **More IdP profiles.** Keycloak in CI first (no tenant needed); Okta and Ping once dev tenants exist, including a fixed `redirect_port` and Mode A claims straight from the IdP; Mode B.
+4. **More IdP profiles.** Keycloak in Docker first (no tenant needed); Okta and Ping once dev tenants exist, including a fixed `redirect_port` and Mode A claims straight from the IdP; Mode B.
    - Gate: `client_live` passes per IdP. **Keycloak done 2026-10-26** with the new `keycloak` scenario (local Keycloak 26.4.7, mock gateway, Mode A from the IdP and Mode B; README finding 18). Okta by hand on 2026-10-26 (README finding 21); its scenario is next. Ping waits for a dev tenant.
 5. **Mode 2 local proxy.** JWT in memory; gateway 401 translated to 498; Anthropic 401 passed through; SSE pass-through; fail closed.
    - Gate: a refused JWT through the proxy fails in one attempt with a stored login. **Built 2026-10-26 (client 1.4.0):** `mode: proxy` with `proxy_listen` `127.0.0.1:18787`, per-user secret header `x-aigw-local`, renew-and-retry once, 498 on gateway refusals, Anthropic 401 passed through, fail closed with an in-session sign-in, `inspect --live`, `doctor` proxy findings. Offline `proxy` scenario PASS on macOS (79) and Windows (72, 7 Unix-socket SKIP). **Gate passed 2026-10-26:** `stored_login_proxy` PASS (15 observations) with a stored login on macOS: a refused JWT and a missing JWT each fail in one attempt, the login is neither rotated nor invalidated.
@@ -615,7 +615,7 @@ The repo's `repro/run.sh` is the regression suite: it runs the real Claude Code 
 | --- | --- | --- |
 | Windows port | All offline scenarios through a non-bash runner; lock, process check, detached worker, rename retry, toast, hook quoting | Windows 11 plus a locked-down corporate image |
 | Credential store | Round trip, migration from `state.json`, missing store fallback, rotation under the lock | Each OS |
-| Providers | `client_live` per IdP; Keycloak in Docker in CI with rotation, `invalid_grant`, device and PKCE | Keycloak in CI; Okta, Ping tenants by hand |
+| Providers | `client_live` per IdP; Keycloak in Docker with rotation, `invalid_grant`, device and PKCE | Keycloak in Docker (the `keycloak` scenario, run locally); Okta, Ping tenants by hand |
 | `doctor` | One `managed` case per finding; predictions compared with `/status` and observed headers | Each OS |
 | `inspect` | Claim interpretation, redaction, fingerprint format, debug expiry | Unit |
 | Mode 2 proxy | SSE and chunked pass-through; gateway 401 to 498 translation; Anthropic 401 passed through; renew-and-retry once; fail closed; concurrent requests; not reachable off loopback; `stored_login` with the proxy shows no OAuth loop | Mock gateway, then live |
@@ -650,7 +650,7 @@ Where the tested repo and the earlier chat draft disagreed, the repo wins unless
 | Platforms | Windows first | macOS and Linux; Windows listed as not covered with a port checklist | v2 ports to Windows |
 | Conflict detection | `doctor` with predicted findings | Fixes at write time; `managed` scenario proves behavior | v2 adds `doctor`, using repo findings as ground truth |
 | Debug view | `inspect` with redaction | `status` with fingerprint and three claims | v2 extends `status` into `inspect` |
-| Tests | Keycloak in Docker, unit, manual tenants | `repro/run.sh`: real Claude Code, mock gateway, fake IdP, live scenarios | Repo suite is the base; Keycloak CI added |
+| Tests | Keycloak in Docker, unit, manual tenants | `repro/run.sh`: real Claude Code, mock gateway, fake IdP, live scenarios | Repo suite is the base; the Keycloak scenario runs in Docker locally (a CI workflow was added and removed before it ever ran) |
 
 **Constraints to keep while changing the code (from `AGENTS.md`)**
 
